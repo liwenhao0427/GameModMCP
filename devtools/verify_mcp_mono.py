@@ -222,8 +222,9 @@ if sc.get("handle"):
     check("read_query_result 可用", pg.get("ok") is True, pg.get("error", ""))
     check("翻页取回数据", len(pg.get("items") or []) > 0,
           f"{len(pg.get('items') or [])} 条")
-    sq = S.search_query_result(sc["handle"], pattern="a")
-    check("search_query_result 可用", sq.get("ok") is True, sq.get("error", ""))
+    sq = S.read_query_result(sc["handle"], pattern="a")
+    check("read_query_result 的结果内过滤可用", sq.get("ok") is True,
+          sq.get("error", ""))
     print(f"     结果内过滤命中 {sq.get('total')}")
 
 bad = S.read_query_result("不存在的句柄-abc")

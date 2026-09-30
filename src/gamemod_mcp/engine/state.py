@@ -67,13 +67,18 @@ class SessionState:
     def has_index(self) -> bool:
         return self._index is not None
 
-    def close_index(self) -> None:
-        if self._index is not None:
-            try:
-                self._index.close()
-            except Exception as exc:
-                warn(f"关闭索引失败：{exc}")
-            self._index = None
+    def close_index(self) -> dict:
+        """关闭索引。**返回结果**（以前只 warn，失败对上层不可见）。"""
+        if self._index is None:
+            return {"ok": True, "already_closed": True}
+        try:
+            self._index.close()
+        except Exception as exc:
+            warn(f"关闭索引失败：{exc}")
+            # 失败时不摘引用，便于重试；同时把原因交给上层
+            return {"ok": False, "error": f"关闭索引失败：{exc}"}
+        self._index = None
+        return {"ok": True}
 
     # ------------------------------------------------ 运行时
 
@@ -84,12 +89,18 @@ class SessionState:
         if self.runtime is None:
             return {"ok": True, "already_closed": True}
         try:
-            return self.runtime.close()
+            res = self.runtime.close()
         except Exception as exc:
             warn(f"关闭运行时会话失败：{exc}")
+            # 失败时**保留** self.runtime：会话可能只是没 detach 干净，
+            # 保留引用调用方才能重试。以前这里用 finally 无条件清空，
+            # 于是「关闭失败」之后连重试的入口都没有了。
             return {"ok": False, "error": str(exc)}
-        finally:
+        if res.get("ok"):
             self.runtime = None
+        else:
+            warn(f"运行时会话未完全关闭：{res.get('error')}")
+        return res
 
     # ------------------------------------------------ 概要
 

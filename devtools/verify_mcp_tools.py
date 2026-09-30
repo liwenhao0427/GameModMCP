@@ -173,6 +173,24 @@ check("list_images pattern 无命中时如实返回 0",
       li_none.get("ok") and li_none.get("total") == 0
       and not (li_none.get("items") or []),
       f"total={li_none.get('total')}")
+# 契约第 5 条：limit 截断必须如实标注，且要能翻页。
+# 以前只给 total/returned，既无 has_more 也无 offset ——
+# Agent 既无法确认被截断，也无法拿到后面的程序集。
+li_p1 = S.list_images(limit=3, offset=0)
+li_p2 = S.list_images(limit=3, offset=3)
+check("list_images 如实标注 has_more",
+      li_p1.get("has_more") is True and li_p1.get("offset") == 0
+      and li_p1.get("limit") == 3,
+      f"has_more={li_p1.get('has_more')} offset={li_p1.get('offset')}")
+check("list_images 翻页两页不重叠",
+      not ({i["image"] for i in li_p1["items"]}
+           & {i["image"] for i in li_p2["items"]}),
+      f"p1={len(li_p1['items'])} p2={len(li_p2['items'])}")
+check("list_images 末页 has_more 为 False",
+      S.list_images(limit=3, offset=(li.get("total") or 1) - 1)
+      .get("has_more") is False)
+check("list_images 过滤零命中时给出说明",
+      bool(li_none.get("note")), str(li_none.get("note"))[:60])
 
 # ---- search_fields / search_methods：total 真值、offset 翻页、owner 消歧 ----
 # 这三项都是本轮修复的真实缺陷，断言要点是「对得上真值」，不是「没报错」。
@@ -392,6 +410,68 @@ for _nm in ("TeamTapas.ProjectR.UserDatas.UserData",
 _absent = S.class_detail(full_name="这个类不存在Xyz")
 check("不存在的类仍明确报错", _absent.get("ok") is False,
       str(_absent.get("error"))[:60])
+
+# ---- class_hierarchy(down) 的 depth/parent 必须是**真实**的直接继承关系 ----
+# 这是审计发现的「数据本身出错」最严重的一条：早期实现把 meta.find_derived
+# （传递式，返回全部后代）当成「直接子类」用，于是根节点的第一层被塞进任意
+# 深度的后代，全部标 depth=1、parent=根，而真实的直接子类大量缺席。
+# 实测：真值直接子类 428 个，工具报了 500 个 depth=1，其中 319 个不是直接子类，
+# 247 个真实直接子类根本没出现。Agent 用 down 摸继承树会得到完全错误的结构。
+# 真值用 adapt.parent_name 独立重算（不经过被测的 _direct_children）。
+show("5e. class_hierarchy(down) —— depth/parent 必须是真的直接继承关系")
+
+from gamemod_mcp.engine import adapt as _adapt   # noqa: E402
+
+_mb = "UnityEngine.MonoBehaviour"
+_mbm = S.class_hierarchy(full_name=_mb, direction="down", depth=1)
+check("class_hierarchy(down) 返回 ok", _mbm.get("ok") is True,
+      str(_mbm.get("error"))[:60])
+_idx_meta = state.state().index.meta
+_mb_root = _idx_meta.type_by_name(_mb)
+# 真值：直接子类 = adapt.parent_name 恰好等于根名
+_truth_direct = {t.index for t in _idx_meta.types
+                 if _adapt.parent_name(_idx_meta, t) == _mb_root.nested_name}
+_idx_by_name = {t.nested_name: t.index for t in _idx_meta.types}
+_d1 = [x for x in (_mbm.get("down") or []) if x.get("depth") == 1]
+_d1_idx = {_idx_by_name[x["name"]] for x in _d1 if x["name"] in _idx_by_name}
+print(f"     真值直接子类={len(_truth_direct)}  报告 depth=1={len(_d1)}  "
+      f"假={len(_d1_idx - _truth_direct)}  缺失={len(_truth_direct - _d1_idx)}")
+check("depth=1 条目数 == 真值直接子类数（不混入间接后代）",
+      len(_d1) == len(_truth_direct),
+      f"{len(_d1)} vs {len(_truth_direct)}")
+check("depth=1 里没有一条是编造的（parent 写错）",
+      not (_d1_idx - _truth_direct),
+      f"假={len(_d1_idx - _truth_direct)}")
+check("没有真实直接子类被漏掉",
+      not (_truth_direct - _d1_idx),
+      f"缺失={len(_truth_direct - _d1_idx)}")
+check("如实给出 down_has_more 以暴露 _CHILD_CAP 截断",
+      "down_has_more" in _mbm,
+      f"down_has_more={_mbm.get('down_has_more')}")
+
+# 深层同样要对：depth=2 的每一条，其 parent 必须是它**真实**的父类
+_mbm2 = S.class_hierarchy(full_name=_mb, direction="down", depth=2)
+_d2 = [x for x in (_mbm2.get("down") or []) if x.get("depth") == 2]
+_bad_par = [x for x in _d2 if x["name"] in _idx_by_name
+            and _adapt.parent_name(_idx_meta,
+                                   _idx_meta.types[_idx_by_name[x["name"]]])
+            != x["parent"]]
+print(f"     depth=2 条目={len(_d2)}  其 parent 与真实父类不一致={len(_bad_par)}")
+check("depth=2 的 parent 与真实父类一致", not _bad_par,
+      f"不一致={len(_bad_par)}")
+
+# 500 条上限被触发时必须如实标注（System.Object 有 6449 个直接子类）
+_so = S.class_hierarchy(full_name="System.Object", direction="down", depth=1)
+if _so.get("ok") and (_so.get("down_count") or 0) >= 500:
+    check("触发 _CHILD_CAP 时如实标注 down_has_more",
+          _so.get("down_has_more") is True
+          and bool(_so.get("down_truncated_levels"))
+          and bool(_so.get("note")),
+          f"has_more={_so.get('down_has_more')} "
+          f"levels={_so.get('down_truncated_levels')}")
+else:
+    print("     ⚠ System.Object 未触发上限，跳过截断断言")
+
 check("报错信息里保留请求的类名（可读性）",
       "这个类不存在Xyz" in str(_absent.get("error")),
       str(_absent.get("error"))[:60])
@@ -474,7 +554,7 @@ if _sf_h:
           _sf2.get("ok") is True, f"回灌 {_sf_sug!r} -> {_sf2.get('ok')}")
 
 # ================================================================ 6. 句柄翻页
-show("6. read_query_result / search_query_result —— 结果句柄")
+show("6. read_query_result —— 结果句柄翻页 + 结果内过滤")
 h = sc.get("handle")
 if h:
     p1 = S.read_query_result(h, offset=0, limit=2)
@@ -482,8 +562,22 @@ if h:
     if p1.get("ok"):
         check("翻页返回 2 条", p1.get("returned") == 2,
               f"实际={p1.get('returned')}")
-    sq = S.search_query_result(h, pattern="User")
-    check("结果内过滤成功", sq.get("ok"), sq.get("error", ""))
+    sq = S.read_query_result(h, pattern="User")
+    check("结果内过滤成功（pattern 参数，已合并原 search_query_result）",
+          sq.get("ok"), sq.get("error", ""))
+    # 回归：pattern="" 与不传 pattern 必须完全等价（这是合并的前提）
+    _no_pat = S.read_query_result(h, offset=0, limit=5)
+    _empty_pat = S.read_query_result(h, offset=0, limit=5, pattern="")
+    check("pattern='' 与不传 pattern 的行为一致",
+          (_no_pat.get("items") or []) == (_empty_pat.get("items") or [])
+          and _no_pat.get("total") == _empty_pat.get("total"),
+          f"items {len(_no_pat.get('items') or [])} vs "
+          f"{len(_empty_pat.get('items') or [])}")
+    # 过滤零命中要说清是「过滤没中」而非「句柄为空」
+    _zero = S.read_query_result(h, pattern="绝对不可能命中的子串Xyzzy")
+    check("结果内过滤零命中时给出说明",
+          _zero.get("ok") is True and bool(_zero.get("note")),
+          f"note={str(_zero.get('note'))[:50]}")
     bad = S.read_query_result("不存在的句柄-xyz")
     check("无效句柄被正确拒绝", bad.get("ok") is False, bad.get("error", "")[:40])
 
@@ -782,6 +876,92 @@ if pid:
     show("14. close_session —— 收尾并还原游戏状态")
     cs = S.close_session()
     check("close_session 返回 ok", cs.get("ok"), cs.get("error", ""))
+    check("close_session 如实给出 restored", "restored" in cs,
+          f"restored={cs.get('restored')}")
+    check("close_session 回报索引已关闭",
+          (cs.get("index") or {}).get("ok") is True,
+          f"index={cs.get('index')}")
+
+# ---- 假成功回归：close 失败时不许报 restored:True ----
+# 审计发现的最危险一条：早期 RuntimeSession.close() 把卸载 Hook / unload /
+# detach 三步各包一个 `except Exception: pass`，然后无条件返回 restored:True。
+# 实测三步全抛异常时依然报成功 —— 而 close_session 的语义就是「游戏已恢复原状」，
+# Agent 会带着仍被篡改的进程收工。这里用桩对象复现，不依赖真的注入。
+show("14b. teardown 不许假成功（桩对象复现）")
+
+from gamemod_mcp.runtime import session as _sess_mod   # noqa: E402
+
+
+def _stub_session(pid: int) -> Any:
+    s = _sess_mod.RuntimeSession.__new__(_sess_mod.RuntimeSession)
+    s.pid = pid
+    s.name = "stub"
+    s._alive = True
+    return s
+
+
+class _Boom:
+    """任何属性访问都返回一个必抛异常的 callable。"""
+    def __getattr__(self, _n):
+        def _f(*_a, **_k):
+            raise RuntimeError(f"{_n} 被拒绝（模拟）")
+        return _f
+
+
+_s_all_bad = _stub_session(99999)
+_s_all_bad._script = _Boom()
+_s_all_bad._session = _Boom()
+_s_all_bad.hook_status = lambda: (_ for _ in ()).throw(
+    RuntimeError("hook_status 被拒绝（模拟）"))
+_s_all_bad.unhook_all = lambda: (_ for _ in ()).throw(
+    RuntimeError("unhook 被拒绝（模拟）"))
+_r_bad = _s_all_bad.close()
+print(f"     三步全失败 -> ok={_r_bad.get('ok')} "
+      f"restored={_r_bad.get('restored')} steps={_r_bad.get('steps')}")
+check("三步全失败时 ok 为 False（不许假成功）",
+      _r_bad.get("ok") is False, f"ok={_r_bad.get('ok')}")
+check("三步全失败时 restored 为 False",
+      _r_bad.get("restored") is False)
+check("失败时给出 error", bool(_r_bad.get("error")))
+check("失败时逐步如实标注哪一步没成",
+      _r_bad.get("steps") == {"hooks_removed": False,
+                              "script_unloaded": False,
+                              "detached": False},
+      f"steps={_r_bad.get('steps')}")
+check("失败时会话保持可重试（_alive 仍为 True）",
+      _s_all_bad._alive is True)
+
+_s_all_ok = _stub_session(99998)
+_s_all_ok.hook_status = lambda: {"count": 3}
+_s_all_ok.unhook_all = lambda: None
+_s_all_ok._script = type("X", (), {"unload": lambda self: None})()
+_s_all_ok._session = type("Y", (), {"detach": lambda self: None})()
+_r_ok = _s_all_ok.close()
+check("全部成功时才报 restored:True",
+      _r_ok.get("ok") is True and _r_ok.get("restored") is True
+      and _r_ok.get("hooks_removed") == 3,
+      f"ok={_r_ok.get('ok')} restored={_r_ok.get('restored')}")
+
+# close_session 顶层 ok 必须反映子步骤失败（以前埋进 runtime 子对象里）
+_st_now = state.state()
+
+
+class _BadRT:
+    def close(self):
+        raise RuntimeError("detach 被拒绝（模拟）")
+
+
+_st_now.runtime = _BadRT()
+_cs_bad = S.close_session(close_runtime=True, close_index=False)
+print(f"     子步骤失败 -> 顶层 ok={_cs_bad.get('ok')} "
+      f"error={str(_cs_bad.get('error'))[:40]}")
+check("子步骤失败时顶层 ok 为 False",
+      _cs_bad.get("ok") is False, f"ok={_cs_bad.get('ok')}")
+check("子步骤失败时顶层带 error", bool(_cs_bad.get("error")))
+check("子步骤失败时 restored 为 False",
+      _cs_bad.get("restored") is False)
+check("关闭失败时保留 runtime 以便重试", _st_now.runtime is not None)
+_st_now.runtime = None
 
 # ================================================================ 结果
 show("端到端结果汇总（通过 MCP 工具层）")

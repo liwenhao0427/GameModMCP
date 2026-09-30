@@ -207,10 +207,17 @@ for sp in SAMPLES:
         continue
     total = le.get("total")
     print(f"     kind={le.get('kind')} 条目总数={total} "
-          f"本页={le.get('count')}")
+          f"本页={le.get('returned')} has_more={le.get('has_more')}")
     check(f"{sp['name']}：解析出条目", (total or 0) > 0, f"total={total}")
+    # 字段名统一为 returned（以前叫 count，与其它列表工具不一致）
     check(f"{sp['name']}：翻页生效（只回 limit 条）",
-          le.get("count") == 10, f"count={le.get('count')}")
+          le.get("returned") == 10, f"returned={le.get('returned')}")
+    check(f"{sp['name']}：如实标注 has_more",
+          le.get("has_more") is True and "has_more" in le,
+          f"has_more={le.get('has_more')}")
+    check(f"{sp['name']}：同时给出 offset/limit",
+          le.get("offset") == 0 and le.get("limit") == 10,
+          f"offset={le.get('offset')} limit={le.get('limit')}")
     for e in (le.get("entries") or [])[:3]:
         p = e.get("path") if isinstance(e, dict) else e
         print(f"       · {str(p)[:100]}")
@@ -244,14 +251,30 @@ for sp in SAMPLES:
     if (total or 0) > 105:
         check(f"{sp['name']}：offset 翻页可用",
               off.get("ok") is True and off.get("offset") == 100,
-              f"offset={off.get('offset')} count={off.get('count')}")
+              f"offset={off.get('offset')} returned={off.get('returned')}")
         # 翻过头要说清楚，不能静默给空页
         far = S.ue_list_entries(container=target, limit=5,
                                offset=(total or 0) + 1000)
         check(f"{sp['name']}：offset 超出总数时给出说明",
-              far.get("ok") is True and far.get("count") == 0
+              far.get("ok") is True and far.get("returned") == 0
               and bool(far.get("note")),
               f"note={str(far.get('note'))[:60]}")
+
+        # 回归：offset 越过的是**过滤后**的 matched，不是 total。
+        # 曾经判的是 offset >= total，于是「matched=1511 而 offset=6000
+        # （6000 < 21439）」时既无说明也无 has_more，空 entries 毫无解释。
+        if sample_path:
+            frag2 = "." + sample_path.rsplit(".", 1)[-1]
+            fl2 = S.ue_list_entries(container=target, pattern=frag2, limit=5)
+            m2 = fl2.get("matched") or 0
+            if 0 < m2 < (total or 0):
+                mid = S.ue_list_entries(container=target, pattern=frag2, limit=5,
+                                       offset=m2 + 1)
+                check(f"{sp['name']}：offset 越过 matched 但未超 total 时也给说明",
+                      mid.get("ok") is True and mid.get("returned") == 0
+                      and bool(mid.get("note")),
+                      f"matched={m2} total={total} "
+                      f"note={str(mid.get('note'))[:50]}")
 
 # 容器不存在
 bad2 = S.ue_list_entries(container=r"C:\不存在.pak")

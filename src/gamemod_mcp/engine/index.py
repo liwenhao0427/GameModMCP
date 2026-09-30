@@ -10,15 +10,16 @@
     1. **持久化缓存**：以元数据文件的 sha256 为键，建一次 SQLite，之后秒开。
     2. **进程内缓存**：同一个 session 内复用已打开的连接。
 
-关于 `read_query_result` / `search_query_result`
+关于 `read_query_result`
 --------------------------------------------------
-AiMod 的这两个工具本质上解决同一个问题：**工具返回值不能太大**。
+AiMod 的同类工具本质上解决同一个问题：**工具返回值不能太大**。
 Agent 的上下文有限，一次返回 13 万个方法会把上下文炸掉。
 本项目的做法与之等价但更简单：
     所有列表类查询都返回 `{items, total, offset, limit, has_more}`，
     并且把完整结果写进一个 **查询结果句柄表**，
-    之后可用 `read_query_result(handle, offset, limit)` 翻页，
-    或用 `search_query_result(handle, pattern)` 在结果内部再过滤。
+    之后可用 `read_query_result(handle, offset, limit, pattern="")` 翻页；
+    给 `pattern` 即在同一结果内部再过滤（原先独立的
+    `search_query_result` 就是它在 `pattern=""` 时的特例，已按契约第 3 条合并）。
 这样既保证单次返回精简，又保证信息不丢失。
 """
 
@@ -79,34 +80,26 @@ class QueryResult:
     total: int
     items: list[dict[str, Any]]
 
-    def page(self, offset: int, limit: int) -> dict[str, Any]:
-        """按偏移取一页。"""
-        offset = max(0, offset)
-        limit = max(1, min(limit, 2000))
-        chunk = self.items[offset : offset + limit]
-        return {
-            "handle": self.handle,
-            "kind": self.kind,
-            "offset": offset,
-            "limit": limit,
-            "returned": len(chunk),
-            "total": self.total,
-            "has_more": offset + len(chunk) < self.total,
-            "items": chunk,
-        }
+    def page(self, offset: int, limit: int,
+             pattern: str = "") -> dict[str, Any]:
+        """取一页；给了 pattern 就在结果内部先按子串过滤。
 
-    def search(self, pattern: str, offset: int = 0, limit: int = 50) -> dict[str, Any]:
-        """在已有结果内部按子串过滤（大小写不敏感）。"""
-        needle = pattern.lower()
-        hits = [
-            it for it in self.items
-            if needle in " ".join(str(v) for v in it.values()).lower()
-        ]
+        合并了原来的 page / search 两个方法（契约第 3 条：一个是另一个的
+        特例就合成一个，用参数区分）。`pattern=""` 时不过滤，即纯翻页。
+        """
+        hits = self.items
+        if pattern:
+            needle = pattern.lower()
+            hits = [
+                it for it in hits
+                if needle in " ".join(str(v) for v in it.values()).lower()
+            ]
         offset = max(0, offset)
         limit = max(1, min(limit, 2000))
         chunk = hits[offset : offset + limit]
         return {
             "handle": self.handle,
+            "kind": self.kind,
             "pattern": pattern,
             "offset": offset,
             "limit": limit,
@@ -158,17 +151,34 @@ class Index:
     """
 
     def __init__(self, meta: Any, db_path: Path):
-        self.meta = meta
-        self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
-        self.results = ResultStore()
+        self._attach(meta, db_path)
         # 这个索引是「复用既有缓存」还是「刚刚全量重建」——
         # 只有 open() 知道，所以由它赋值，默认按「新建」算。
         # 之前 index_info 里硬编码 True，导致重建一次（几秒到几十秒）
         # 也会报 cache_hit=true，Agent 据此以为走了快路径，无法察觉异常。
         self.cache_hit = False
         self._build()
+
+    def _attach(self, meta: Any, db_path: Path) -> None:
+        """设置一个索引实例的**全部**共享字段（不解构建）。
+
+        单独抽出来是因为 `open()` 的「命中缓存」快路径走 `cls.__new__(cls)`，
+        以前它在原地重复了一遍字段赋值 —— 于是任何人往 `__init__` 里加字段，
+        缓存命中路径都会静默缺这个字段，而且**只在命中缓存时**才犯病。
+        这个缺陷真实发生过：新增 `_child_map` 后，重建索引正常，复用缓存
+        却报 `AttributeError: 'Index' object has no attribute '_child_map'`。
+
+        现在字段只在这里列一次，两条路径都走它，不可能再漂移。
+        """
+        self.meta = meta
+        self.db_path = db_path
+        self.conn = sqlite3.connect(str(db_path))
+        self.conn.row_factory = sqlite3.Row
+        self.results = ResultStore()
+        # 「父类名 -> 直接子类」映射的惰性缓存（见 _direct_children）。
+        # 构建一次约 6 ms（IL2CPP 20,072 类型），元数据本身是只读的，
+        # 所以不需要失效逻辑。
+        self._child_map: dict[str, list[Any]] | None = None
 
     # ------------------------------------------------------ 生命周期
 
@@ -239,11 +249,8 @@ class Index:
         if db_path.is_file() and not force_rebuild and cls._is_valid(db_path):
             progress(f"复用索引缓存 {db_path.name}")
             idx = cls.__new__(cls)
-            idx.meta = meta
-            idx.db_path = db_path
-            idx.conn = sqlite3.connect(str(db_path))
-            idx.conn.row_factory = sqlite3.Row
-            idx.results = ResultStore()
+            # 走与 __init__ 相同的字段初始化，杜绝「只在命中缓存时缺字段」
+            idx._attach(meta, db_path)
             idx.cache_hit = True          # ← 真的复用了缓存
             return idx
 
@@ -1128,11 +1135,46 @@ class Index:
 
     # ------------------------------------------------------ 查询：层级 / 依赖
 
+    # 每层最多展开多少个直接子类；超出的部分如实计入 *_has_more。
+    _CHILD_CAP = 500
+
+    def _direct_children(self) -> dict[str, list[Any]]:
+        """父类名 -> **直接**子类列表（惰性构建一次，之后复用）。
+
+        为什么需要它：`meta.find_derived()` 是**传递式**查询（返回全部后代，
+        含间接）。`class_hierarchy` 早期直接拿它当「直接子类」用，于是
+        每个中间层的 `depth` 与 `parent` 都是编造的 —— 实测
+        `class_hierarchy("UnityEngine.MonoBehaviour", direction="down", depth=1)`：
+        真值直接子类 428 个，工具却报了 500 个 `depth=1`，其中 **319 个不是
+        直接子类**（`parent` 被写成 MonoBehaviour），同时 **247 个真实直接
+        子类根本没出现**。
+
+        这比「少给几条」严重得多：Agent 用 down 的核心目的就是逐层摸清继承树，
+        错误的 `parent` 会让它把不存在的父子关系写进 Hook 方案。
+
+        键用 `adapt.parent_name` 的返回值（与 `TypeDef.nested_name` 同形），
+        这样跨引擎都是一套逻辑 —— 引擎差异只出现在 `adapt` 里（见 AGENTS.md §3）。
+        构建成本实测：IL2CPP 20,072 类型 6 ms，Mono 1,387 类型 1 ms，
+        所以惰性构建一次即可，不做增量失效。
+        """
+        if self._child_map is not None:
+            return self._child_map
+        kids: dict[str, list[Any]] = {}
+        for t in self.meta.types:
+            pn = adapt.parent_name(self.meta, t)
+            if pn:
+                kids.setdefault(pn, []).append(t)
+        self._child_map = kids
+        return kids
+
     def class_hierarchy(self, full_name: str, direction: str = "both", depth: int = 6,
                        assembly: str = "") -> dict[str, Any]:
         """类的继承层级树。
 
         direction: up（基类）/ down（子类）/ both
+
+        `down` 是**逐层**的：每个条目给的是它所属层的 `depth`，`parent` 是它
+        在**上一层**的真实父类。层与层之间靠「直接子类」推进，不走传递式查询。
         """
         m = self.meta
         # 与 class_detail 同一套解析：继承树挂到别的同名类上同样是无提示的错误。
@@ -1147,14 +1189,20 @@ class Index:
             result["up"] = [c.nested_name for c in m.base_chain(t, limit=depth)]
 
         if direction in ("down", "both"):
+            kids = self._direct_children()
             tree: list[dict[str, Any]] = []
             frontier = [(t, 0)]
             seen = {t.index}
+            truncated_levels: set[int] = set()
             while frontier:
                 cur, lvl = frontier.pop(0)
                 if lvl >= depth:
                     continue
-                for d in m.find_derived(cur.nested_name, limit=500):
+                children = kids.get(cur.nested_name, [])
+                # 超出上限时如实标注，而不是让 Agent 以为这层就这么多
+                if len(children) > self._CHILD_CAP:
+                    truncated_levels.add(lvl + 1)
+                for d in children[: self._CHILD_CAP]:
                     if d.index in seen:
                         continue
                     seen.add(d.index)
@@ -1163,6 +1211,19 @@ class Index:
                     frontier.append((d, lvl + 1))
             result["down"] = tree
             result["down_count"] = len(tree)
+            result["depth"] = depth
+            # 是否有任何一层被 _CHILD_CAP 截断 —— 没有这个字段，Agent 无法
+            # 察觉「500 条」其实是上限而不是全部（实测 500 正是这么来的）。
+            # 注意：depth 是一开始就指定的参数，按它收尾不算「截断」；
+            # 这里只如实反映 _CHILD_CAP 造成的丢失。
+            result["down_has_more"] = bool(truncated_levels)
+            result["down_is_direct_only"] = True
+            if truncated_levels:
+                result["down_truncated_levels"] = sorted(truncated_levels)
+                result["note"] = (
+                    f"第 {sorted(truncated_levels)} 层的子类数超过上限 "
+                    f"{self._CHILD_CAP}，已截断；用 find_derived_classes 拿全量。"
+                )
 
         return result
 
@@ -1282,37 +1343,35 @@ class Index:
                 bump(pt)
         bump(adapt.parent_name(m, t))
 
+        ordered = sorted(
+            ({"type": k, "count": v} for k, v in referenced.items()),
+            key=lambda x: -x["count"],
+        )
+        _REF_CAP = 100
         return {
             "found": True,
             "class": t.nested_name,
             "parent": self._resolve_parent(t.index),
-            "referenced_types": sorted(
-                ({"type": k, "count": v} for k, v in referenced.items()),
-                key=lambda x: -x["count"],
-            )[:100],
-            "referenced_count": len(referenced),
+            "referenced_types": ordered[:_REF_CAP],
+            "referenced_count": len(ordered),
+            # 与 class_detail 的 derived_has_more 保持一致：截断了就如实说，
+            # 否则 Agent 会把「前 100 个」当成全部引用。实测本样本最大引用数
+            # 只有 75，触不到上限 —— 但样本触不到不等于逻辑可以省。
+            "referenced_returned": min(len(ordered), _REF_CAP),
+            "referenced_has_more": len(ordered) > _REF_CAP,
             "note": "基于字段/方法签名的近似依赖，非精确调用图",
         }
 
     # ------------------------------------------------------ 结果句柄
 
-    def read_query_result(self, handle: str, offset: int = 0, limit: int = 50) -> dict[str, Any]:
-        """翻页读取之前某次查询的完整结果。"""
-        qr = self.results.get(handle)
-        if qr is None:
-            return {
-                "found": False,
-                "handle": handle,
-                "available_handles": self.results.handles(),
-            }
-        out = qr.page(offset, limit)
-        out["found"] = True
-        return out
+    def read_query_result(self, handle: str, offset: int = 0, limit: int = 50,
+                          pattern: str = "") -> dict[str, Any]:
+        """翻页读取之前某次查询的完整结果；给了 pattern 就在结果内部再过滤。
 
-    def search_query_result(
-        self, handle: str, pattern: str, offset: int = 0, limit: int = 50
-    ) -> dict[str, Any]:
-        """在之前某次查询的结果内部再过滤。"""
+        这一个方法取代了原先的 read_query_result + search_query_result 两个工具
+        —— 契约第 3 条：`search_query_result` 就是 `read_query_result(pattern="")`
+        的特例，分开留两个只会让 Agent 猜该用哪个。
+        """
         qr = self.results.get(handle)
         if qr is None:
             return {
@@ -1320,6 +1379,6 @@ class Index:
                 "handle": handle,
                 "available_handles": self.results.handles(),
             }
-        out = qr.search(pattern, offset, limit)
+        out = qr.page(offset, limit, pattern=pattern)
         out["found"] = True
         return out

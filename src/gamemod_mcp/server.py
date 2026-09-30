@@ -23,7 +23,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
     3. 静态查询层  : search_classes / class_detail / search_fields /
                      search_methods / class_hierarchy / find_derived_classes /
                      analyze_dependency / list_images / decompile
-    4. 结果句柄层  : read_query_result / search_query_result
+    4. 结果句柄层  : read_query_result
     5. 运行时层    : inject_process / launch_game / runtime_info /
                      runtime_class_info / find_hook_target / hook_method /
                      hook_address / unhook / hook_status / drain_events /
@@ -296,14 +296,29 @@ def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
     """关闭当前会话：卸载所有 Hook、断开注入、关闭索引。
 
     做完了就调用它，把游戏恢复原状（卸载 Hook 后游戏行为回到未修改状态）。
+
+    **只有真的恢复成功才返回 `ok: True`。** 卸载 Hook / 卸载脚本 / detach
+    任何一步失败都会 `ok: False` + `error`，并保留会话以便重试 ——
+    这是有意为之：本工具的语义是「游戏已恢复原状」，
+    一个假成功会让 Agent 带着仍被篡改的游戏进程收工。
     """
     st = state.state()
     out: dict[str, Any] = {}
+    failures: list[str] = []
     if close_runtime:
-        out["runtime"] = st.close_runtime()
+        rt = st.close_runtime()
+        out["runtime"] = rt
+        if not rt.get("ok"):
+            failures.append(str(rt.get("error") or "运行时会话关闭失败"))
     if close_index:
-        st.close_index()
-        out["index_closed"] = True
+        ix = st.close_index()
+        out["index"] = ix
+        if not ix.get("ok"):
+            failures.append(str(ix.get("error") or "索引关闭失败"))
+    if failures:
+        out["restored"] = False
+        return _err("；".join(failures), **out)
+    out["restored"] = True
     return _ok(**out)
 
 
@@ -325,7 +340,7 @@ def search_classes(
     """搜索游戏里的类、结构体、枚举 —— Mod 开发最主要的入口。
 
     返回结果里带 `handle`，结果集较大时可用 read_query_result 翻页，
-    用 search_query_result 在结果内再过滤。
+    并可用它的 `pattern` 参数在结果内再过滤。
 
     Args:
         pattern:    名称子串（大小写不敏感）。空表示不过滤。
@@ -612,29 +627,42 @@ def analyze_dependency(full_name: str, assembly: str = "") -> dict:
 
 
 @mcp.tool(annotations={"title": "列出程序集", "readOnlyHint": True})
-def list_images(pattern: str = "", limit: int = 200) -> dict:
+def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
     """列出游戏里的程序集（dll）及各自的类型数量。
 
     用来判断「游戏逻辑主要在哪个 dll」，从而缩小搜索范围。
 
     Args:
         pattern: 名称子串过滤（如 "TeamTapas"）。
+        offset:  从第几条开始（翻页用）。
+        limit:   本页最多几条。被截断时 `has_more` 为 true。
     """
     idx, err = _need_index()
     if err:
         return err
     try:
-        rows = idx.conn.execute(
-            "SELECT image, COUNT(*) AS n FROM types "
-            "WHERE image LIKE ? GROUP BY image ORDER BY n DESC LIMIT ?",
-            (f"%{pattern}%", max(1, min(limit, 2000))),
-        )
-        items = [{"image": r["image"], "type_count": r["n"]} for r in rows]
+        offset = max(0, offset)
+        limit = max(1, min(limit, 2000))
+        # total 用 COUNT(DISTINCT ...) 单独算，是真值；
+        # items 才受 limit/offset 限制。以前只给 total 与 returned、
+        # 不给 has_more 也没有 offset，调用方既无法确认被截断，也无法翻页。
         total = idx.conn.execute(
             "SELECT COUNT(DISTINCT image) FROM types WHERE image LIKE ?",
             (f"%{pattern}%",),
         ).fetchone()[0]
-        return _ok(total=total, returned=len(items), items=items)
+        rows = idx.conn.execute(
+            "SELECT image, COUNT(*) AS n FROM types "
+            "WHERE image LIKE ? GROUP BY image ORDER BY n DESC LIMIT ? OFFSET ?",
+            (f"%{pattern}%", limit, offset),
+        )
+        items = [{"image": r["image"], "type_count": r["n"]} for r in rows]
+        out = _ok(total=total, offset=offset, limit=limit,
+                  returned=len(items), has_more=offset + len(items) < total,
+                  items=items)
+        if pattern and total == 0:
+            out["note"] = (f"没有任何程序集名匹配 {pattern!r}；"
+                           f"去掉 pattern 可看全部程序集。")
+        return out
     except Exception as exc:
         return _err(f"查询失败：{exc}")
 
@@ -719,23 +747,33 @@ def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "翻页读取查询结果", "readOnlyHint": True})
-def read_query_result(handle: str, offset: int = 0, limit: int = 50) -> dict:
-    """按句柄翻页读取之前某次查询的完整结果。
+@mcp.tool(annotations={"title": "翻页/过滤读取查询结果", "readOnlyHint": True})
+def read_query_result(handle: str, offset: int = 0, limit: int = 50,
+                      pattern: str = "") -> dict:
+    """按句柄翻页读取之前某次查询的完整结果；给了 `pattern` 就在结果内再过滤。
 
     列表类工具单次只返回一页，但完整结果留在句柄里。
-    需要看第 500~550 条就用这个。
+    两个用途共用本工具：
+
+    - 只看第 500~550 条 → 只给 `offset`/`limit`；
+    - 在这一批结果里再找含某子串的 → 再加 `pattern`（大小写不敏感）。
+
+    > 原先另有一个 `search_query_result`，实测它在 `pattern=""` 时与本工具
+    > 输出完全相同 —— 它就是本工具的特例。按契约第 3 条（单一职责：
+    > 一个是另一个的特例就合并）已删除，并入 `pattern` 参数。
 
     Args:
-        handle: search_classes 等返回的 handle。
-        offset: 起始位置。
-        limit:  本页条数（上限 2000）。
+        handle:  search_classes 等返回的 handle。
+        offset:  起始位置。
+        limit:   本页条数（上限 2000）。
+        pattern: 在结果集内二次过滤的子串；留空表示不过滤（纯翻页）。
     """
     idx, err = _need_index()
     if err:
         return err
     try:
-        res = idx.read_query_result(handle, offset=offset, limit=limit)
+        res = idx.read_query_result(handle, offset=offset, limit=limit,
+                                    pattern=pattern)
     except Exception as exc:
         return _err(f"读取失败：{exc}")
     if not res or not res.get("found", True):
@@ -744,34 +782,13 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50) -> dict:
             available_handles=(res or {}).get("available_handles", []),
             hint="句柄在会话内有效；切换游戏或重建索引后会失效",
         )
-    return _ok(**res)
-
-
-@mcp.tool(annotations={"title": "在查询结果内再过滤", "readOnlyHint": True})
-def search_query_result(handle: str, pattern: str,
-                        offset: int = 0, limit: int = 50) -> dict:
-    """在某个查询句柄的结果集内部再做一次子串过滤。
-
-    比重新查一遍库更省事，也避免丢掉原有上下文。
-
-    Args:
-        handle:  查询句柄。
-        pattern: 过滤子串（大小写不敏感）。
-    """
-    idx, err = _need_index()
-    if err:
-        return err
-    try:
-        res = idx.search_query_result(handle, pattern=pattern,
-                                      offset=offset, limit=limit)
-    except Exception as exc:
-        return _err(f"过滤失败：{exc}")
-    if not res or not res.get("found", True):
-        return _err(
-            f"句柄不存在或已过期：{handle}",
-            available_handles=(res or {}).get("available_handles", []),
-        )
-    return _ok(**res)
+    out = _ok(**res)
+    if pattern and not (res.get("items") or []):
+        # 过滤零命中必须说清是「过滤没中」还是「句柄本身是空的」
+        out["note"] = (f"句柄内共 {res.get('total', 0)} 条，但过滤条件 "
+                       f"{pattern!r} 没有命中（或该页已越界）；"
+                       f"去掉 pattern 可看全部。")
+    return out
 
 
 # ================================================================
@@ -1486,17 +1503,27 @@ def ue_list_entries(container: str, kind: str = "auto",
         ]
 
     matched = len(filtered_entries)
-    page = filtered_entries[offset:offset + max(1, limit)]
+    limit = max(1, limit)
+    page = filtered_entries[offset:offset + limit]
+    # `returned` 与全项目其它列表工具（_paged / list_images / find_derived_classes）
+    # 统一；以前这里叫 `count`，Agent 按惯例读 returned 只会拿到 None。
     out = _ok(container=str(p), kind=k, total=total,
-              matched=matched, offset=offset, count=len(page), entries=page)
+              matched=matched, offset=offset, limit=limit,
+              returned=len(page),
+              has_more=offset + len(page) < matched, entries=page)
     if not page and total:
-        # 容器有内容但这一页是空的：说清是「过滤没命中」还是「翻页翻过头了」
+        # 容器有内容但这一页是空的：说清到底是哪种「空」
         if pattern and matched == 0:
             out["note"] = (f"容器解析成功（共 {total} 条），但过滤条件 "
                            f"{pattern!r} 没有命中任何条目")
-        elif offset >= total:
-            out["note"] = (f"offset={offset} 已超出总数 {total}，"
-                           f"这一页为空。请用 offset<{total} 翻页。")
+        elif offset >= matched:
+            # 关键分支：offset 越过的是**过滤后的**条数，不是总条数。
+            # 以前判的是 offset >= total，于是 matched=1511 而 offset=6000
+            # （6000 < 21439）时既不空说明也不给 has_more，
+            # 调用方拿到空 entries 却毫无解释。
+            out["note"] = (f"offset={offset} 已超出匹配到的 {matched} 条"
+                           f"（容器共 {total} 条），这一页为空。"
+                           f"请用 offset<{matched} 翻页。")
     elif total == 0:
         out["note"] = "容器解析成功，但里面确实没有任何条目。"
     return out
@@ -1536,12 +1563,20 @@ def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
         "这些是 exe 内的字符串证据，不是反射元数据；"
         "父类链与属性偏移无法由此获得。",
     )
+    # 契约第 1 条：失败必须带 error。底层 ue.py 用的是 reason，
+    # 这里转成约定的 error 字段（并保留 reason，不丢信息），
+    # 否则按契约只读 error 的调用方会把失败当成正常返回。
+    if not out.get("ok", True):
+        reason = out.get("reason") or "未能在 exe 中提取到 /Script/ 对象"
+        payload = {k: v for k, v in out.items() if k not in ("ok", "reason")}
+        payload["reason"] = reason
+        return _err(reason, **payload)
     return _ok(**out)
 
 
 @mcp.tool(annotations={"title": "读取 Unreal 打包清单", "readOnlyHint": True})
 def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
-                limit: int = 200) -> dict:
+                offset: int = 0, limit: int = 200) -> dict:
     """读取 UE 的打包清单 Manifest_UFSFiles_*.txt。
 
     清单是打包时生成的「应该有哪些文件」的真值，
@@ -1551,7 +1586,8 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
         path:     清单文件路径。留空则自动在 game_dir 里找。
         game_dir: 游戏安装目录（path 留空时用）。
         pattern:  路径子串过滤。
-        limit:    最多返回多少条。
+        offset:   从第几条开始（翻页用）。
+        limit:    本页最多多少条。被截断时 `has_more` 为 true。
     """
     from .engine import ue as ue_mod
 
@@ -1587,7 +1623,19 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
     res["total"] = total
     res["matched"] = len(entries)
     key = "files" if "files" in res else "entries"
-    res[key] = entries[:max(1, limit)]
+    offset = max(0, offset)
+    limit = max(1, limit)
+    page = entries[offset:offset + limit]
+    res["offset"] = offset
+    res["limit"] = limit
+    res["returned"] = len(page)
+    # 如实标注截断：以前只把列表切一刀，Agent 无从判断是否还有后续
+    res["has_more"] = offset + len(page) < len(entries)
+    res[key] = page
+    if pattern and not entries:
+        # 过滤零命中必须给说明，不能只给一个空列表
+        res["note"] = (f"清单解析成功（共 {total} 条），但过滤条件 {pattern!r} "
+                       f"没有命中任何条目；去掉 pattern 可看全部。")
     return _ok(**res)
 
 

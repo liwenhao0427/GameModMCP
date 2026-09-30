@@ -155,9 +155,10 @@ print(f"    第2页: {[x['name'] for x in p2['items']]} has_more={p2['has_more']
 
 print()
 print("=" * 74)
-print("12. search_query_result：结果内再过滤")
+print("12. read_query_result(pattern=...)：结果内再过滤")
 print("=" * 74)
-s = idx.search_query_result(r["handle"], "UserData", limit=5)
+# 原 search_query_result 已按契约第 3 条合并进 read_query_result 的 pattern 参数
+s = idx.read_query_result(r["handle"], limit=5, pattern="UserData")
 print(f"  在 {r['total']} 条结果里筛 'UserData' → {s['total']} 条")
 for it in s["items"][:5]:
     print(f"    {it['full_name']}")

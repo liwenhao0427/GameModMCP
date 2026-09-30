@@ -1163,24 +1163,6 @@
                     return { address: b.ptr.toString(), size: b.size };
                 })
             };
-        },
-
-        /** 立刻取一份当前线程回溯，用于确认调用来源。 */
-        backtraceHere: function () {
-            try {
-                var bt = Thread.backtrace(this.context || null, Backtracer.ACCURATE);
-                return {
-                    ok: true,
-                    frames: bt.map(function (a) {
-                        var d = describeAddress(a);
-                        return d ? (d.module ? (d.module + '!' + d.rva_hex) : d.address)
-                                 : String(a);
-                    })
-                };
-            } catch (e) {
-                return fail('回溯失败：' + e.message +
-                            '（本接口需在 Frida 回调上下文中调用）');
-            }
         }
     };
 

@@ -183,6 +183,10 @@ close_session()        # 卸载 Hook + 断开注入 + 关索引
 
 **务必收尾**。卸载 Hook 后游戏恢复正常行为；注入状态下游戏会一直带着探针运行。
 
+> `close_session` **只有真的恢复原状才返回 `ok=true`**。卸载 Hook / 卸载脚本 /
+> detach 任一步失败都会 `ok=false` + `error`，并保留会话让你能重试 ——
+> 这时游戏可能仍带着探针，**不要**直接宣称收尾完成，先按 `error` 排查再重试。
+
 ---
 
 ## 各引擎的差异
@@ -303,6 +307,14 @@ search_methods(pattern="Update", owner="PlayerController")
 > 20,072 个类型里有 585 个短名是这种情况）。这时返回
 > `ok: false` + `candidates`（含各自程序集），补 `assembly=` 消歧即可：
 > `class_detail(full_name="Player", assembly="Assembly-CSharp")`。
+> 返回里的 `hint` 是**验证过能用**的写法（通常是一条候选的限定名），
+> 照抄即可；若候选全在同一个程序集里，错误信息会明说 `assembly=` 帮不上忙。
+
+> **想逐层看继承树用 `class_hierarchy(direction="down")`。**
+> 它给的是**直接**继承关系：每条的 `parent` 是它真实的直接父类，
+> `depth` 是它所在的层。`find_derived_classes` 则是**传递式**的
+> （含间接继承，适合一次捞全所有脚本），两者用途不同，别混用。
+> 某一层超过 500 条时 `down_has_more=true`，这时改用 `find_derived_classes` 拿全量。
 > 这样做是因为「拿错类」比「报错」危险得多 —— 拿到的是**另一个类的整份字段表**，
 > 据此算出的偏移必然错，而且要到运行时才暴露。
 
@@ -354,9 +366,12 @@ hook_method(name="BodyPart", method="Visualize", param_count=1)
 r = search_classes(pattern="Player", limit=50)
 r["total"]        # 总共 697 个（**匹配总数**，不受 limit 影响）
 r["handle"]       # "classes-1"
-read_query_result(r["handle"], offset=500, limit=50)
-search_query_result(r["handle"], pattern="Controller")   # 在结果内再过滤
+read_query_result(r["handle"], offset=500, limit=50)      # 翻页
+read_query_result(r["handle"], pattern="Controller")      # 在结果内再过滤
 ```
+
+> 翻页与「结果内再过滤」是**同一个工具**的两种用法：`read_query_result`
+> 的 `pattern` 留空就是纯翻页（两者原先各是一个工具，按契约第 3 条已合并）。
 
 **`total` 与 `returned` 不是一回事，`has_more` 才是截断标志**：
 

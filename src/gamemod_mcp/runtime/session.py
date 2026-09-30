@@ -213,7 +213,6 @@ class RuntimeSession:
         # Hook 事件队列：容量放大，满时丢最旧，绝不阻塞游戏线程
         self._events: queue.Queue = queue.Queue(maxsize=20000)
         self._dropped = 0
-        self._console: list[str] = []
         self._init_result: dict | None = None
         self._created_at = time.time()
 
@@ -244,11 +243,16 @@ class RuntimeSession:
                     "fileName": message.get("fileName"),
                 })
             elif mtype == "log":
-                level = message.get("level", "info")
-                text = message.get("payload")
-                self._console.append(f"[{level}] {text}")
-                if len(self._console) > 2000:
-                    del self._console[:1000]
+                # 探针侧的 console.log。以前只往 self._console 里塞，
+                # 而那个列表**没有任何读取方**（唯一的 console_output() 也没有
+                # MCP 出口），于是探针日志写进去就消失 —— 排查注入问题时
+                # 最想看的东西恰好看不到。
+                # 现改为入事件队列，drain_events 就能取到（契约 §3：能力必须有出口）。
+                self._push_event({
+                    "type": "log",
+                    "level": message.get("level", "info"),
+                    "payload": message.get("payload"),
+                })
         except Exception as exc:  # 回调里绝不能抛，否则会污染 Frida 线程
             warn(f"处理探针消息失败：{exc}")
 
@@ -539,6 +543,12 @@ class RuntimeSession:
         }
 
     def clear_events(self) -> dict:
+        """清空事件队列（丢弃未读取的事件）。
+
+        供 `drain_events` 之外需要「从现在开始只看新事件」的场景；
+        `verify_il2cpp_runtime.py` / `verify_runtime.py` 用它保证两段
+        观测互不串味。
+        """
         n = 0
         while True:
             try:
@@ -548,39 +558,71 @@ class RuntimeSession:
                 break
         return {"ok": True, "cleared": n}
 
-    def console_output(self, limit: int = 200) -> dict:
-        """取探针侧 console.log 输出。"""
-        lines = self._console[-limit:]
-        return {"ok": True, "lines": lines, "total": len(self._console)}
-
     # -------------------------------------------------- 关闭
 
     def close(self) -> dict:
-        """卸载脚本并断开。Hook 会被一并卸掉（进程恢复原状）。"""
+        """卸载脚本并断开。Hook 会被一并卸掉（进程恢复原状）。
+
+        **不许假成功**：早期实现把卸载 Hook / `script.unload()` / `session.detach()`
+        三步各包一个 `except Exception: pass`，然后无论如何都返回
+        `restored: True`。实测三步**全部**抛异常时，返回值依然是
+        `{"ok": True, "restored": True}` —— 而 `close_session` 的语义就是
+        「把游戏恢复原状」，Agent 会据此结束任务并宣称收尾干净，
+        实际上 Hook 可能仍挂在进程里（游戏行为仍被篡改）。
+
+        更糟的是失败后还会 `_alive = False` 并把自己从 `_sessions` 摘掉，
+        于是**再也无法补救**（后续 unhook / close_session 都报「没有已注入的运行时会话」）。
+
+        所以现在逐步收集失败原因：任一步失败就 `ok: False` + `restored: False`，
+        并把已经做到哪一步如实列出，让调用方知道还剩什么没收拾。
+        """
         if not self._alive:
             return {"ok": True, "already_closed": True, "pid": self.pid}
         removed = 0
+        errors: list[str] = []
+        steps: dict[str, bool] = {}
         try:
             st = self.hook_status()
             removed = st.get("count", 0)
             self.unhook_all()
-        except Exception:
-            pass
+            steps["hooks_removed"] = True
+        except Exception as exc:
+            steps["hooks_removed"] = False
+            errors.append(f"卸载 Hook 失败：{exc}")
         try:
             self._script.unload()
-        except Exception:
-            pass
+            steps["script_unloaded"] = True
+        except Exception as exc:
+            steps["script_unloaded"] = False
+            errors.append(f"卸载脚本失败：{exc}")
         try:
             self._session.detach()
-        except Exception:
-            pass
-        self._alive = False
-        with _sessions_lock:
-            if _sessions.get(self.pid) is self:
-                del _sessions[self.pid]
-        progress(f"已关闭运行时会话 pid={self.pid}（卸载 Hook {removed} 个）")
-        return {"ok": True, "pid": self.pid, "hooks_removed": removed,
-                "restored": True}
+            steps["detached"] = True
+        except Exception as exc:
+            steps["detached"] = False
+            errors.append(f"断开会话失败：{exc}")
+
+        restored = not errors
+
+        if restored:
+            # 只有全部成功才注销会话：失败时保留注册，调用方还能重试
+            self._alive = False
+            with _sessions_lock:
+                if _sessions.get(self.pid) is self:
+                    del _sessions[self.pid]
+            progress(f"已关闭运行时会话 pid={self.pid}（卸载 Hook {removed} 个）")
+            return {"ok": True, "pid": self.pid, "hooks_removed": removed,
+                    "restored": True, "steps": steps}
+
+        warn(f"关闭运行时会话 pid={self.pid} 未完全成功：{'；'.join(errors)}")
+        return {
+            "ok": False,
+            "pid": self.pid,
+            "hooks_removed": removed,
+            "restored": False,
+            "error": "；".join(errors) + "；游戏可能未恢复原状，可重试 close_session。",
+            "steps": steps,
+        }
 
     def __repr__(self) -> str:
         state = "alive" if self._alive else "dead"

@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，39 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，38 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -103,7 +103,7 @@ Agent 会自动：
 
 ---
 
-## 工具一览（39 个）
+## 工具一览（38 个）
 
 > 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐：
 > 数量或名字对不上就会非零退出。改工具请同步这张表。
@@ -120,7 +120,7 @@ Agent 会自动：
 |---|---|
 | `open_game` | 选定游戏并建索引（**跨引擎自动识别**） |
 | `get_session` | 查看当前会话状态（排查问题先看这个） |
-| `close_session` | 卸载 Hook、断开注入、关闭索引 |
+| `close_session` | 卸载 Hook、断开注入、关闭索引。**只有真的恢复原状才 `ok=true`**；任一步失败会 `ok=false` + `error` 并保留会话以便重试 |
 
 ### 静态查询层（**不需要游戏在运行**）
 | 工具 | 作用 |
@@ -129,26 +129,25 @@ Agent 会自动：
 | `class_detail` | 类的字段、方法、参数、继承链；给 `method_name` 可只看某方法的重载 |
 | `search_fields` | 按字段名搜（定位「金币」「血量」这类目标）。`total` 是真实匹配总数，配合 `offset`/`limit` 翻页。`owner` 限定单个类，同名类跨程序集时会**拒绝并给候选**，可用 `assembly=` 消歧 |
 | `search_methods` | 按方法名搜，返回 token。`owner` 语义与 `search_fields` 一致 |
-| `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类） |
+| `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类）。`direction="down"` 是**逐层**的：每条给的 `depth` 是它所在层、`parent` 是它**真实**的直接父类（早期版本把传递式后代当成直接子类，`depth`/`parent` 是错的）。单层超 500 条时 `down_has_more=true` |
 | `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
-| `analyze_dependency` | 类型依赖概览（近似，非精确调用图） |
-| `list_images` | 列出所有程序集/映像 |
+| `analyze_dependency` | 类型依赖概览（近似，非精确调用图）。`referenced_count` 是真实总数，`referenced_types` 最多 100 条并带 `referenced_has_more` |
+| `list_images` | 列出所有程序集/映像，支持 `offset`/`limit` 翻页并如实给 `has_more` |
 | `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir` 反编译整个程序集（只落盘 + 返回文件清单，不内联源码）。**只支持 Mono**，IL2CPP 会明确报错。依赖可选，见 `get_diagnostics` 的 `decompiler.available` |
 
 ### 结果句柄（大结果集翻页）
 | 工具 | 作用 |
 |---|---|
-| `read_query_result` | 按句柄翻页读取上次查询的结果 |
-| `search_query_result` | 在结果集内二次过滤 |
+| `read_query_result` | 按句柄翻页读取上次查询的结果；给 `pattern` 即在结果集内二次过滤（原先独立的 `search_query_result` 已按契约第 3 条合并进来） |
 
 ### Unreal 引擎层
 | 工具 | 作用 |
 |---|---|
 | `detect_ue` | 判断一个 exe 是不是 UE 游戏（带证据与置信度） |
 | `ue_profile` | UE 游戏概况：容器、清单、脚本模块 |
-| `ue_list_entries` | **列出 .pak/.utoc 里打包了哪些资产**（可按名字过滤、翻页） |
-| `ue_script_objects` | exe 内的 `/Script/` 模块与对象路径 |
-| `ue_manifest` | 读取打包清单 `Manifest_*Files*.txt` |
+| `ue_list_entries` | **列出 .pak/.utoc 里打包了哪些资产**（可按名字过滤、翻页）。返回 `returned`/`has_more`；翻页空页会说明是哪一种「空」 |
+| `ue_script_objects` | exe 内的 `/Script/` 模块与对象路径。失败时按契约给 `ok=false` + `error` |
+| `ue_manifest` | 读取打包清单 `Manifest_*Files*.txt`，支持 `offset`/`limit` 并有 `has_more` |
 
 ### 运行时层（需要注入游戏）
 | 工具 | 作用 |
@@ -185,7 +184,7 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（39 个工具）
+│   ├── server.py                MCP 服务器（38 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器

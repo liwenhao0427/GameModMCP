@@ -78,6 +78,7 @@ REMOVED_TOOLS = {
     "find_monobehaviours": "合并进 find_derived_classes(assembly=...)",
     "get_method_source":  "合并进 class_detail(method_name=...)",
     "unhook_all":         "从未存在过（README 的历史笔误），卸载全部用 unhook()",
+    "search_query_result": "合并进 read_query_result(pattern=...)（前者是后者在 pattern='' 时的特例）",
 }
 
 # 分层列表里的「层名」等非工具词，解析时需要排除。
