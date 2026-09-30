@@ -32,6 +32,7 @@ python devtools\verify_mcp_tools.py    # ← MCP 工具层端到端（IL2CPP，�
 python devtools\verify_mcp_mono.py     # ← MCP 工具层端到端（Mono，需游戏）
 python devtools\verify_mcp_ue.py       # ← MCP 工具层端到端（UE，静态即可）
 python devtools\verify_mcp_extra.py    # ← 补全工具覆盖（需游戏）
+python devtools\verify_mcp_decompile.py # ← 反编译（薄封装 ilspycmd，需 Mono 样本）
 python devtools\verify_il2cpp_runtime.py   # 静态↔运行时 token 交叉验证（需游戏）
 python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
@@ -59,13 +60,18 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 异常原样抛出。它记录每次调用的 `ok`、`error` 与返回体字节数，
 因此还能顺带暴露「哪个工具在返回超大结果」（对应契约 §3.1 第 5 条）。
 
-当前实测：**38 / 38 全部在 MCP 层真实调用过**。
+当前实测：**39 / 39 全部在 MCP 层真实调用过**。
 
 > 这个门禁不是摆设：曾把 `inject_process` 注入失败放宽成警告后，
 > 覆盖率立刻掉到 **35/38**（`hook_address` / `read_field_value` /
 > `gc_control` 因整段跳过而再没被调用）——静态检查完全看不出来。
 > 现在这三个工具在注入失败时会改走**负路径**（验「无会话必须报错」），
 > 保证仍被真实调用，并在输出里注明这比正路径的结论弱。
+>
+> 另一个佐证：新增 `decompile` 后，覆盖率一度停在 38/39 ——
+> 正是因为只有 engine 层被调用、工具层没人调（`decompile` 当时的
+> **唯一**调用者绕过了工具层）。补上 `verify_mcp_decompile.py` 才回到 39/39。
+> 这印证了 §5.1 的结论：**静态检查看不出的「没接上」，动态门禁会立刻发现**。
 
 不需要 `$env:PYTHONPATH`：每个脚本都通过 `samples.add_src_to_path()`
 从自身位置推导 `src`。

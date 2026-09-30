@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，38 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，39 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -103,7 +103,7 @@ Agent 会自动：
 
 ---
 
-## 工具一览（38 个）
+## 工具一览（39 个）
 
 > 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐：
 > 数量或名字对不上就会非零退出。改工具请同步这张表。
@@ -133,6 +133,7 @@ Agent 会自动：
 | `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
 | `analyze_dependency` | 类型依赖概览（近似，非精确调用图） |
 | `list_images` | 列出所有程序集/映像 |
+| `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir` 反编译整个程序集（只落盘 + 返回文件清单，不内联源码）。**只支持 Mono**，IL2CPP 会明确报错。依赖可选，见 `get_diagnostics` 的 `decompiler.available` |
 
 ### 结果句柄（大结果集翻页）
 | 工具 | 作用 |
@@ -184,15 +185,16 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（38 个工具）
+│   ├── server.py                MCP 服务器（39 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
-│   │   ├── discovery.py         进程枚举 / Steam 扫描 / 引擎识别
+│   │   ├── discovery.py         进程枚举 / 引擎识别（不再做全机 Steam 扫描）
 │   │   ├── il2cpp_meta.py       IL2CPP global-metadata.dat 解析器
 │   │   ├── mono_meta.py         ECMA-335 元数据解析器（45 张表）
 │   │   ├── ue.py                Unreal 提取器（pak / utoc / 清单 / 脚本对象）
 │   │   ├── adapt.py             **引擎适配层**（让索引层不关心引擎差异）
+│   │   ├── decompile.py         Mono 反编译薄封装（可选外部依赖 ilspycmd）
 │   │   ├── index.py             SQLite 索引 + 结果句柄
 │   │   └── state.py             会话状态（发现→索引→运行时的粘合层）
 │   └── runtime/                 动态分析层

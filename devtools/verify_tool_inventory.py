@@ -65,6 +65,7 @@ NON_TOOL_IDENTIFIERS = {
     "type_confidence", "field_count", "method_count", "type_count",
     "install_dir", "appid", "output_path", "include_entries",
     "exclude_compiler_generated", "subtype_of", "only_enums",
+    "output_dir", "split_files", "assembly", "type_name", "source",
     "has_more", "cache_hit", "readOnlyHint", "destructiveHint",
     "image_count", "rva_hex", "hex_data", "module", "offset",
     # 非本项目的标识符（引擎/框架 API）

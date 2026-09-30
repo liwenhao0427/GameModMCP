@@ -571,6 +571,17 @@ def diagnostics(scan_processes: bool = False) -> dict:
         "session": _state.summary(),
     }
 
+    # 反编译是**可选**能力（外部 ilspycmd，不是运行期依赖）。
+    # 必须显式报告可用性：缺了它 Agent 应改走元数据索引，而不是反复试错。
+    try:
+        from . import decompile
+        info["decompiler"] = decompile.available()
+    except Exception as exc:
+        info["decompiler"] = {
+            "available": False, "tool": "", "version": "",
+            "hint": f"反编译模块加载失败：{exc}",
+        }
+
     # 探测本机可用的游戏 —— 仅在显式要求时做（默认关闭，见 docstring）
     if scan_processes:
         try:

@@ -15,13 +15,23 @@ from gamemod_mcp.engine.index import Index, default_cache_dir
 _GAME = samples.find_il2cpp()
 META = (_GAME / "Garden of Witches_Data" / "il2cpp_data"
         / "Metadata" / "global-metadata.dat") if _GAME else None
-CACHE = str(samples.CACHE_TEST)
+# 用**本脚本专属**的子目录，不要清空共享的 .cache-test。
+#
+# 历史教训：这里原本是 `shutil.rmtree(samples.CACHE_TEST)`，
+# 而 CACHE_TEST 是所有脚本共用的目录 —— 后果有二：
+#   1. 会删掉别的脚本放在那里的文件（实测删掉过一个待用的脚本）；
+#   2. 动态覆盖率的日志 `.cache-test/tool_calls.jsonl` 也在里面，
+#      本脚本一跑就把**之前**的记录清空了。当前恰好没有「只被
+#      更早脚本覆盖」的工具，所以 39/39 仍能通过，把问题掩盖了 ——
+#      但只要有那样一个工具，就会变成「明明跑过却报未覆盖」的假红。
+# 清自己的临时目录同样能达到「强制走完整构建」的目的。
+CACHE = str(samples.CACHE_TEST / "verify_index")
 
 # 样本不可用时记为「无法验证」并跳过（跳过不算失败）
 if not samples.require(META, "IL2CPP 元数据 Garden of Witches"):
     sys.exit(0)
 
-# 清掉旧缓存，强制走完整构建路径
+# 清掉旧缓存，强制走完整构建路径（只清自己的目录）
 shutil.rmtree(CACHE, ignore_errors=True)
 
 print("=" * 74)

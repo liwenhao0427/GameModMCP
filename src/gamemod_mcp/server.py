@@ -22,7 +22,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
     2. 会话层      : open_game / get_session / close_session
     3. 静态查询层  : search_classes / class_detail / search_fields /
                      search_methods / class_hierarchy / find_derived_classes /
-                     analyze_dependency / list_images
+                     analyze_dependency / list_images / decompile
     4. 结果句柄层  : read_query_result / search_query_result
     5. 运行时层    : inject_process / launch_game / runtime_info /
                      runtime_class_info / find_hook_target / hook_method /
@@ -590,6 +590,81 @@ def list_images(pattern: str = "", limit: int = 200) -> dict:
         return _ok(total=total, returned=len(items), items=items)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
+
+
+@mcp.tool(annotations={"title": "反编译 Mono 程序集", "readOnlyHint": True})
+def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
+              split_files: bool = True) -> dict:
+    """反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（外部工具 ilspycmd）。
+
+    为什么需要它：静态元数据只能给出「有哪些类/字段/方法、签名如何」，
+    但给不出**方法体逻辑**。想知道「这个方法到底怎么算伤害的」，
+    就要反编译看源码 —— 这是元数据索引与运行时 Hook 都替代不了的一环。
+
+    **只支持 Mono/.NET**。IL2CPP 的 GameAssembly.dll 里没有托管元数据，
+    传进来会明确报错（IL2CPP 的 C# 反编译需要先造 DummyDll，本项目暂未实现）。
+
+    两种粒度，用参数区分（故意只做一个工具，避免让你猜该用哪个）：
+
+        · 反编译**一个类型**：给 type_name（可选 output_dir）
+          源码小于 20 万字符时直接内联在 `source` 里返回。
+        · 反编译**整个程序集**：只给 output_dir
+          产物可能上万文件，因此只落盘 + 返回文件清单统计，**不内联源码**。
+
+    Args:
+        assembly:   程序集路径（.dll / .exe）。Mono 游戏通常是
+                    `<游戏目录>/<游戏名>_Data/Managed/Assembly-CSharp.dll`。
+                    留空则用当前会话识别出的那个（Mono 游戏可直接用）。
+        type_name:  类型名，支持 `Namespace.Type`。传空表示反编译整个程序集。
+                    嵌套类型可传 `Outer.Inner` 或 `Outer+Inner`：
+                    由于 ilspycmd 无法单独定位嵌套类型，会自动改为反编译其
+                    外层类型，并在 `nested_note` 里说明（`declared_types`
+                    已核对，内层类型的声明确实在这份产物里）。
+        output_dir: 输出目录。给了就落盘（整程序集模式**必填**）。
+        split_files: 整程序集模式下是否一个类型一个文件（默认 True）。
+                    True 出 800+ 个小文件（实测 3.5 秒），便于按需读取；
+                    False 出单个大文件（实测 11.5 秒），便于整体搜索。
+    """
+    from .engine import decompile as dc
+
+    probe = dc.available()
+    if not probe["available"]:
+        return _err(probe["hint"])
+
+    # 程序集留空 → 用当前会话识别出的那个（Mono 会话里就是 Assembly-CSharp.dll）
+    asm = assembly
+    if not asm:
+        sess = state.state().summary()
+        asm = (sess.get("metadata_path") or "")
+        if not asm:
+            return _err(
+                "未指定 assembly，且当前会话也没有已打开的程序集。"
+                "请传 assembly 路径，或先调用 open_game 选定游戏。"
+            )
+        if not str(asm).lower().endswith((".dll", ".exe")):
+            return _err(
+                f"当前会话的元数据不是 .NET 程序集（{asm}），无法反编译。"
+                "decompile 只支持 Mono/.NET；IL2CPP 需要先造 DummyDll。"
+            )
+
+    try:
+        if type_name:
+            res = dc.decompile_type(asm, type_name, output_dir)
+        elif output_dir:
+            res = dc.decompile_assembly(asm, output_dir, split_files)
+        else:
+            return _err(
+                "必须指定 type_name（反编译单个类型）或 output_dir"
+                "（反编译整个程序集），两者至少要有一个。"
+            )
+    except Exception as exc:
+        return _err(f"反编译失败：{exc}")
+
+    if not res.get("ok"):
+        return _err(res.get("error") or "反编译失败", **{
+            k: v for k, v in res.items() if k not in ("ok", "error")
+        })
+    return _ok(**{k: v for k, v in res.items() if k != "ok"})
 
 
 # ================================================================

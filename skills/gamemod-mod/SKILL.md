@@ -73,6 +73,7 @@ get_diagnostics()
 务必先看这个。它会告诉你：
 - Frida 装没装（没有的话**所有运行时工具都不能用**，只能做静态分析）
 - Mono / UE 解析器是否就绪
+- **`decompiler.available`** —— 反编译能力（可选的外部 `ilspycmd`）是否可用
 - 缓存目录在哪、当前会话状态
 
 > 它**默认不扫本机进程**（那一步实测要 2.7 秒，且与 `find_game_processes` 重复）。
@@ -122,6 +123,25 @@ class_detail("TeamTapas.ProjectR.UserDatas.Service.UserData_Service")
 
 **关键**：静态元数据里的字段**没有偏移**（偏移是运行时才定的），方法**只有 token 没有地址**。
 要拿到能用的落点，必须进入运行时。
+
+**如果元数据不够用，就去读源码（仅 Mono）**：元数据只能告诉你「有哪些类/字段/方法、签名如何」，
+给不出**方法体逻辑**。想知道「这个方法到底怎么算伤害的」，对 Mono 游戏可以直接反编译：
+
+```python
+decompile(assembly=r"D:\...\_Data\Managed\Assembly-CSharp.dll", type_name="SpellEffect")
+# → source: 67 行真正的 C# 源码；declared_types 是产物里声明的类型
+
+decompile(type_name="FlyingWormConsole3.LiteNetLib.NetManager")   # 留空 assembly 用当前会话的程序集
+# → 嵌套类型可传 "Outer.Inner"，会自动退让到外层并在 nested_note 里说明
+
+decompile(output_dir=r"D:\out\full")     # 只给 output_dir = 反编译整个程序集
+# → 落盘 800+ 个文件，只返回 file_count / sample_files，**不内联源码**
+```
+
+- **只支持 Mono/.NET**。IL2CPP 的 `GameAssembly.dll` 没有托管元数据，传进去会明确报错。
+- 依赖是**可选**的（外部 `ilspycmd`）。先看 `get_diagnostics` 的 `decompiler.available`；
+  为 false 时会返回安装指引而不是抛异常。
+- 产物大时一定用 `output_dir` 落盘，别指望内联返回。
 
 ### 第 4 步：注入运行时
 
@@ -180,7 +200,11 @@ close_session()        # 卸载 Hook + 断开注入 + 关索引
 - 程序集在 `<游戏>_Data/Managed/*.dll`，是标准 .NET DLL
 - 主逻辑在 `Assembly-CSharp.dll`
 - 运行时里 `mono-2.0-*.dll` 是标志
-- 可以直接用 .NET 反编译工具（ILSpy/dnSpy）读源码——**比 IL2CPP 好搞得多**
+- 可以直接用 `decompile` 工具读源码（薄封装 ILSpy）——**比 IL2CPP 好搞得多**
+  ```python
+  decompile(type_name="SpellEffect")   # 单个类型，源码内联在 source 里
+  ```
+  反编译是 Mono 独有的能力：IL2CPP 没有托管元数据，必须先造 DummyDll（本工具集暂未实现）。
 - 本工具集提供静态解析；运行时 Hook 需要走 Mono 的 `mono_*` API
 
 ### Unreal
