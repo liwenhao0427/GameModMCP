@@ -1,0 +1,42 @@
+# ============================================================
+# GameModMCP 版本控制规则
+#
+# 入库的是「源码 / 文档 / 测试脚本」。
+# 不入库的是「本机跑出来的缓存与构建产物」—— 体积大且每次运行都在变。
+# ============================================================
+
+# ---- 元数据索引缓存（实测单个 25 MB，且每次解析都会重新生成） ----
+.cache/
+.cache-test/
+.cache-adapt-test/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+
+# ---- Python 字节码与打包产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# ---- .NET 构建产物（devtools/groundtruth） ----
+bin/
+obj/
+
+# ---- 测试残留 ----
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器 / 操作系统杂项 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+*.tmp
+*~

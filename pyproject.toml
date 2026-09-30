@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gamemod-mcp"
+version = "1.0.0"
+description = "游戏 Mod 开发 MCP 服务器：元数据优先定位 Hook 落点，支持 IL2CPP / Mono / Unreal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "game-mod", "il2cpp", "mono", "unreal", "frida", "reverse-engineering"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Software Development :: Debuggers",
+]
+
+# 只依赖 MCP 协议库与 Frida。
+# 引擎解析（PE / IL2CPP / Mono / UE）全部手写，只用标准库，不引入 pefile / lief。
+dependencies = [
+    "mcp>=1.0.0",
+    "frida>=16.0.0",
+]
+
+[project.optional-dependencies]
+# 反汇编能力（可选）：需要看机器码时用
+disasm = ["capstone>=5.0.0"]
+dev = ["pytest>=7.0.0"]
+
+[project.scripts]
+gamemod-mcp = "gamemod_mcp.server:main"
+
+[project.urls]
+Documentation = "https://github.com/example/gamemod-mcp"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# agent.js 是运行时探针，必须打进包（server 会读它）
+[tool.setuptools.package-data]
+gamemod_mcp = ["runtime/*.js"]

@@ -1,0 +1,13 @@
+# GameMod MCP 运行依赖
+#
+# 只装这两个就能跑。引擎解析器（PE / IL2CPP / Mono / UE）全部手写，
+# 只用 Python 标准库，不依赖 pefile / lief / 反编译框架。
+#
+#   pip install -r requirements.txt
+
+mcp>=1.0.0
+frida>=16.0.0
+
+# ---- 可选 ----
+# 需要看机器码时再装（本工具集默认不需要，元数据优先）
+# capstone>=5.0.0
