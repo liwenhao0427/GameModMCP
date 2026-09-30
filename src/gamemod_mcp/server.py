@@ -417,8 +417,9 @@ def class_detail(full_name: str, include_inherited: bool = False,
                     out.setdefault(k, hits[0][k])
         else:
             out["note"] = (
-                f"{method_name} 有 {len(hits)} 个重载，请按 parameter_count "
-                f"选定目标；hook_method 的 args_type 也要与此对应。"
+                f"{method_name} 有 {len(hits)} 个重载，请按 token 选定目标"
+                f"（把对应 token 传给 hook_method 的 token 参数）；"
+                f"hook_method 的 args_type 也要与所选重载的参数对应。"
             )
         return out
 
@@ -848,11 +849,19 @@ def hook_method(
     label: str = "",
     max_calls: int = 200,
     backtrace: bool = False,
+    token: str = "",
+    param_count: int = -1,
 ) -> dict:
     """在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。
 
     **风险**：Hook 会改变游戏运行行为，且错误的参数类型可能崩溃游戏。
     建议先用 find_hook_target 确认落点与 token。
+
+    **重载**：同名方法可能有多个重载，token 各不相同。若目标方法有多个
+    重载而你又没给 `token` / `param_count`，本工具会**拒绝猜测**并返回
+    候选清单（`ok: false`）。这是故意的：盲挂到错误的重载上，
+    Hook 照样会成功，错误要到很久以后才以「数据不对」的形式暴露。
+    最可靠的做法是从静态元数据取目标重载的 token 传进来。
 
     Args:
         name:      类名。
@@ -865,9 +874,15 @@ def hook_method(
         label:     自定义标签，便于在事件里识别（默认 "类名.方法名"）。
         max_calls: 最多记录多少次调用（防止高频方法刷爆事件队列）。
         backtrace: 是否记录调用栈（较慢，排障时用）。
+        token:     目标重载的 token（如 "0x06000A3D"）。**选重载首选这个**，
+                   静态元数据的 class_detail / get_method_source 里就有。
+        param_count: 目标重载的参数个数（-1 表示不指定）。仅在拿不到 token
+                   且各重载参数个数不同时可用。
 
     Returns:
-        {ok, hook_id, class, method, chosen: {pointer, rva_hex, token}}
+        {ok, hook_id, class, method, chosen: {pointer, rva_hex, token},
+         candidate_count, usable_count}
+        失败时 {ok: false, error, candidates: [...]}。
     """
     st = state.state()
     if not st.has_runtime():
@@ -878,6 +893,7 @@ def hook_method(
         res = st.runtime.hook_method(
             namespace=namespace, name=name, method=method, image=image,
             args=specs, label=label, max_calls=max_calls, backtrace=backtrace,
+            token=token, param_count=param_count,
         )
         return res if res.get("ok") else _err(res.get("error", "Hook 失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")

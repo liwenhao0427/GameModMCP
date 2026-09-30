@@ -105,6 +105,92 @@ def agent_source() -> str:
     return _agent_source
 
 
+# ---------------------------------------------------------------- 重载选择
+
+
+def _norm_token(tok: Any) -> str:
+    """把 token 归一化成 8 位小写十六进制，便于跨表示比较。
+
+    静态元数据给的是 `0x06000A3D` / `"0x06000a3d"`，运行时给的是
+    `"0x06000a3d"`，而探针在拿不到 token 时会给 `None`。
+    这里统一成 `"06000a3d"`，避免因大小写或 0x 前缀差异误判「不是同一个方法」。
+    """
+    if tok is None:
+        return ""
+    s = str(tok).strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if not s or s in ("none", "null", "0"):
+        return ""
+    return s.rjust(8, "0")
+
+
+def _select_overload(usable: list[dict], *, token: str, param_count: int,
+                     name: str, method: str) -> tuple[dict | None, dict | None]:
+    """从多个可 Hook 的候选中挑出唯一一个。
+
+    返回 `(选中的候选, 错误字典)`，两者恰有一个非 None。
+
+    为什么不允许「拿不准就取第一个」：同名重载的 token 不同、语义也不同。
+    盲选会挂到错误的方法上，而 Hook 本身会成功 ——
+    于是错误以「数据看起来不对」的形式在很久之后才暴露，极难排查。
+    宁可明确失败并给出候选清单，让调用方按 token 决定。
+    """
+    if token:
+        want = _norm_token(token)
+        matched = [c for c in usable if _norm_token(c.get("token")) == want]
+        if not matched:
+            avail = [c.get("token") for c in usable]
+            return None, {
+                "ok": False,
+                "error": f"{name}.{method} 的候选中没有 token={token} 的方法"
+                         f"（可用：{avail}）",
+                "candidates": usable,
+            }
+        if len(matched) > 1:
+            # token 唯一标识方法，理论上不会重；真出现说明探针数据异常，
+            # 这种情况不猜，直接报出来。
+            return None, {
+                "ok": False,
+                "error": f"{name}.{method} 有 {len(matched)} 个候选 token 都是 {token}",
+                "candidates": matched,
+            }
+        return matched[0], None
+
+    if param_count is not None and param_count >= 0:
+        matched = [c for c in usable if c.get("param_count") == param_count]
+        if not matched:
+            avail = [c.get("param_count") for c in usable]
+            return None, {
+                "ok": False,
+                "error": f"{name}.{method} 的候选中没有 {param_count} 个参数的重载"
+                         f"（可用参数个数：{avail}）",
+                "candidates": usable,
+            }
+        if len(matched) > 1:
+            return None, {
+                "ok": False,
+                "error": f"{name}.{method} 有 {len(matched)} 个重载都是 "
+                         f"{param_count} 个参数，无法凭参数个数区分；"
+                         "请改用 token 指定",
+                "candidates": matched,
+            }
+        return matched[0], None
+
+    if len(usable) == 1:
+        return usable[0], None
+
+    # 多个候选、又没给选择依据 —— 拒绝静默猜测
+    return None, {
+        "ok": False,
+        "error": f"{name}.{method} 有 {len(usable)} 个重载，必须指定 token "
+                 "或 param_count 才能挂对。请先用 find_hook_target 看清候选，"
+                 "再从静态元数据里取目标重载的 token。",
+        "candidates": usable,
+        "hint": "hook_method(token=\"0x06000a3d\") 或 hook_method(param_count=1)",
+    }
+
+
 # ---------------------------------------------------------------- 会话
 
 # 进程 pid → RuntimeSession；配合锁保证同一进程只注入一次
@@ -324,11 +410,21 @@ class RuntimeSession:
     def hook_method(self, namespace: str, name: str, method: str,
                     image: str = "", args: list[str] | None = None,
                     label: str = "", max_calls: int = 200,
-                    backtrace: bool = False, preferred_module: str = "") -> dict:
+                    backtrace: bool = False, preferred_module: str = "",
+                    token: str = "", param_count: int = -1) -> dict:
         """便捷入口：按 类+方法名 直接 Hook。
 
         这是「元数据优先」工作流的收口：Agent 用静态元数据查到目标方法，
         这里用运行时把类实体化并拿到真实地址，直接装 Hook。
+
+        **重载选择**：同名方法可能有多个重载（token 各不相同）。以前这里
+        盲取第一个候选（`usable[0]`），会在不知情的情况下挂到错误的重载上。
+        现在必须显式选：
+
+        - 给了 `token`：按 token 精确匹配（最可靠，静态元数据里就有）。
+        - 给了 `param_count`：按参数个数匹配；若仍有多个，返回歧义错误。
+        - 都没给且候选唯一：直接挂（保持简单场景好用）。
+        - 都没给且候选多个：**拒绝猜测**，返回 `ok: False` + 候选清单。
         """
         tgt = self.method_target(namespace, name, method, image=image,
                                  preferred_module=preferred_module)
@@ -344,7 +440,13 @@ class RuntimeSession:
                          "（可能是抽象/泛型定义或纯转发）",
                 "candidates": cands,
             }
-        chosen = usable[0]
+
+        selected, err = _select_overload(usable, token=token,
+                                        param_count=param_count,
+                                        name=name, method=method)
+        if err is not None:
+            return err
+        chosen = selected
         out = self.hook(chosen["pointer"], args=args, label=label or f"{name}.{method}",
                         max_calls=max_calls, backtrace=backtrace,
                         preferred_module=preferred_module)
@@ -357,6 +459,7 @@ class RuntimeSession:
                 "token": chosen.get("token"),
             }
             out["candidate_count"] = len(cands)
+            out["usable_count"] = len(usable)
         return out
 
     def unhook(self, hook_id: str) -> dict:

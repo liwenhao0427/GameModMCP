@@ -371,6 +371,114 @@ if pid:
         check("卸载后不再捕获事件", len(after_enters) == 0,
               f"仍有 {len(after_enters)} 条")
 
+    # ============================================================ 11b. 重载选择
+    show("11b. hook_method 的重载选择 —— 不许盲选第一个候选")
+    # 回归用例：曾经 `usable[0]` 盲取第一个候选，会在不知情时挂到错误重载上。
+    #
+    # 选 System.String.Concat 当靶子（实测运行时已加载、6 个重载且全部可挂）：
+    #   token=0x0600026a param=3 / 0x0600026b param=1 / 0x0600026c param=2
+    #   token=0x0600026d param=3 / 0x0600026e param=4 / 0x0600026f param=1
+    # 它天然覆盖两种情形：param=4 唯一可区分，param=3 与 param=1 各有 2 个
+    # → 正好用来验证「能区分时按参数选、不能区分时报歧义」。
+    #
+    # 教训：最初选了 BodyPart.Visualize（静态元数据里确实有 2 个重载），
+    # 但它**运行时没被加载** → find_hook_target 返回「未找到类」。
+    # 选靶子必须挑「运行时确实存在」的类，否则测的是环境不是产品。
+    OVL_NS, OVL_CLS, OVL_M = "System", "String", "Concat"
+    ovl_static = S.class_detail("System.String", method_name=OVL_M,
+                                include_inherited=True)
+    ovl_meths = ovl_static.get("methods") or []
+    print(f"     静态元数据：{OVL_CLS}.{OVL_M} 有 {len(ovl_meths)} 个重载")
+    for m in ovl_meths:
+        print(f"       token={m.get('token')} 参数={m.get('parameter_count')}")
+
+    rt_ovl = S.find_hook_target(name=OVL_CLS, method=OVL_M, namespace=OVL_NS)
+    if not rt_ovl.get("ok"):
+        check("运行时能找到 System.String.Concat", False,
+              rt_ovl.get("error", "")[:80], warn_only=True)
+    else:
+        usable = [c for c in (rt_ovl.get("candidates") or [])
+                  if c.get("pointer") and c.get("in_module") is not False]
+        toks = [str(c.get("token", "")).lower() for c in usable]
+        pcs = [c.get("param_count") for c in usable]
+        print(f"     运行时候选 {len(rt_ovl.get('candidates') or [])} 个，"
+              f"其中可挂 {len(usable)} 个：{list(zip(toks, pcs))}")
+
+        check("System.String.Concat 运行时确有多重载（本用例前提）",
+              len(usable) >= 2, f"可挂候选 {len(usable)} 个")
+
+        if len(usable) >= 2:
+            # ① 不给选择依据 + 多个候选 → 必须拒绝，而不是猜一个
+            amb = S.hook_method(name=OVL_CLS, method=OVL_M, namespace=OVL_NS,
+                                max_calls=5, label="verify.ovl.ambig")
+            check("多候选且未指定重载 → 拒绝而非盲挂",
+                  amb.get("ok") is False and bool(amb.get("error")),
+                  f"ok={amb.get('ok')} error={str(amb.get('error'))[:60]}")
+            check("拒绝时给出候选清单供 Agent 决策",
+                  len(amb.get("candidates") or []) >= 2,
+                  f"candidates={len(amb.get('candidates') or [])} 个")
+
+            # ② 按 token 精确选择 —— 首选方式。故意选**最后一个**，
+            #    若实现退回「取第一个」这条断言就会失败。
+            want = usable[-1]
+            want_tok = want.get("token")
+            r1 = S.hook_method(name=OVL_CLS, method=OVL_M, namespace=OVL_NS,
+                               token=want_tok, max_calls=5,
+                               label="verify.ovl.token")
+            got1 = (r1.get("chosen") or {}).get("token", "")
+            check("按 token 指定重载 → 挂上的就是它（不是第一个）",
+                  r1.get("ok") and str(got1).lower() == str(want_tok).lower(),
+                  f"想要 {want_tok} 实际 {got1}")
+            if r1.get("ok"):
+                # 交叉验证：chosen.token 必须能在静态元数据里找到同名重载
+                static_tok = {str(m.get("token", "")).lower() for m in ovl_meths}
+                check("chosen.token 在静态元数据中存在（静态/运行时对账）",
+                      str(got1).lower() in static_tok,
+                      f"{got1} ∈ {sorted(static_tok)}")
+                S.unhook(r1.get("hook_id"))
+
+            # ③ 按 param_count 选择：挑一个**参数个数唯一**的候选
+            uniq_pc = next((p for p in pcs if pcs.count(p) == 1), None)
+            if uniq_pc is not None:
+                r2 = S.hook_method(name=OVL_CLS, method=OVL_M, namespace=OVL_NS,
+                                   param_count=uniq_pc, max_calls=5,
+                                   label="verify.ovl.pc")
+                got2 = (r2.get("chosen") or {}).get("token", "")
+                ch2 = next((c for c in usable
+                            if str(c.get("token", "")).lower() == str(got2).lower()),
+                           None)
+                check(f"按 param_count={uniq_pc} 指定重载 → 参数个数相符",
+                      r2.get("ok") and (ch2 or {}).get("param_count") == uniq_pc,
+                      f"chosen={got2} param={(ch2 or {}).get('param_count')}")
+                if r2.get("ok"):
+                    S.unhook(r2.get("hook_id"))
+
+            # ④ 参数个数有歧义 → 必须报歧义并提示改用 token，不许随便挑
+            dup_pc = next((p for p in pcs if pcs.count(p) > 1), None)
+            if dup_pc is not None:
+                r3 = S.hook_method(name=OVL_CLS, method=OVL_M, namespace=OVL_NS,
+                                   param_count=dup_pc, max_calls=5,
+                                   label="verify.ovl.dup")
+                check(f"param_count={dup_pc} 有多个重载 → 报歧义而非任选",
+                      r3.get("ok") is False and "token" in str(r3.get("error")),
+                      f"ok={r3.get('ok')} err={str(r3.get('error'))[:60]}")
+
+            # ⑤ 不存在的 token → 明确报错，不许随便挂一个
+            r4 = S.hook_method(name=OVL_CLS, method=OVL_M, namespace=OVL_NS,
+                               token="0xDEADBEEF", max_calls=5,
+                               label="verify.ovl.bad")
+            check("不存在的 token 被拒绝", r4.get("ok") is False,
+                  str(r4.get("error"))[:70])
+
+    # ⑥ 单一候选不受影响（Time.get_frameCount 无重载，走简单路径）
+    r5 = S.hook_method(name="Time", method="get_frameCount",
+                       namespace="UnityEngine", max_calls=5,
+                       label="verify.ovl.single")
+    check("无重载方法仍可直接挂（简单路径未被破坏）",
+          r5.get("ok"), r5.get("error", "")[:60])
+    if r5.get("ok"):
+        S.unhook(r5.get("hook_id"))
+
     # ============================================================ 12. 内存与扫描
     show("12. read_memory / write_memory / scan_pattern / eval_script")
     # 用持久缓冲区做读写往返（避免 GC 干扰）

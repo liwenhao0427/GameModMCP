@@ -292,18 +292,29 @@ runtime = find_hook_target(name="PresetLoaderV2", method="Update")
 每项都有 `param_count`，**先按参数个数认准你要的那个**：
 
 ```python
-tgt = find_hook_target(name="PresetLoaderV2", method="Update")
+tgt = find_hook_target(name="BodyPart", method="Visualize")
 for c in tgt["candidates"]:
     print(c["token"], c["param_count"], c["rva_hex"])
 ```
 
-> ⚠️ **已知限制**：`hook_method` 目前**不支持指定重载** ——
-> 它在候选里取第一个「有原生地址且在模块内」的（`session.py` 的
-> `chosen = usable[0]`）。
-> 所以当目标方法有多个重载时，**不要**直接用 `hook_method`，
-> 而要用 `find_hook_target` 拿到**你要的那个候选的 `address`**，
-> 再用 `hook_address(address=...)` 挂钩。
-> 挂完务必比对返回里的 token 与静态查到的是否一致。
+`hook_method` **支持指定重载**，两种方式：
+
+```python
+# 首选：按 token 精确指定（静态元数据里就有，最可靠）
+static = class_detail(full_name="BodyPart", method_name="Visualize")  # 拿到 token
+hook_method(name="BodyPart", method="Visualize", token="0x06000484")
+
+# 次选：按参数个数（仅当各重载参数个数互不相同时可用）
+hook_method(name="BodyPart", method="Visualize", param_count=1)
+```
+
+> ⚠️ 若目标方法有**多个重载而你没给 `token` / `param_count`**，
+> `hook_method` 会**拒绝挂载**并返回候选清单（`ok: false`）——
+> 这是故意的：盲选第一个候选会让 Hook 成功却挂错方法，
+> 错误要到很久以后才以「数据不对」的形式暴露，极难排查。
+> 只有候选唯一时才允许省略。
+>
+> 挂完**务必**核对返回里的 `chosen.token` 与静态查到的是否一致。
 
 ### 配方 6：大结果集翻页
 
@@ -414,5 +425,5 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 | `inject_process` 失败 | 权限不足 / 反调试 / 进程刚启动 | 试管理员；或改用 `launch_game` |
 | `runtime_class_info` 报错 | 类在游戏里还没被加载 | 先让游戏运行到相关场景（进游戏、打开对应界面） |
 | Hook 装上但 0 次触发 | 目标方法在当前场景/状态不会被调 | 换个确实会执行的方法；或 `launch_game` 早期挂钩 |
-| token 两边对不上 | 挂到了同名的重载 | 按 `param_count` 选候选 |
+| token 两边对不上 | 挂到了同名的重载 | 用 `token=` 精确指定；或 `param_count=`（见配方 5） |
 | AOB 扫描 0 命中 | 特征码写错 / 段不可读 | 优先改用元数据定位；确认特征码格式（`48 8B ?? ??`） |
