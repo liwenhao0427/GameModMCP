@@ -47,6 +47,16 @@ import sys
 import time
 from pathlib import Path
 
+# ---- 强制 stderr 用 UTF-8 ----
+# Windows 上 Python 默认按 ANSI 代码页（本机实测 cp936/gbk）编码 stderr，
+# 而 DSH 桥接按 UTF-8 读取 hook 的 stderr，中文日志会变成乱码
+# （实测输出 `���ύ 84 ���ļ�`）。不依赖 PYTHONUTF8 环境变量，脚本自持。
+for _stream in (sys.stderr,):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 # 哨兵文件：项目根出现它，才允许自动提交
 SENTINEL = ".dsh-autocommit.json"
 # 可选的提交信息文件（用完即删）
@@ -65,10 +75,14 @@ def log(msg: str) -> None:
 
 
 def git(repo: Path, *args: str) -> tuple[int, str]:
-    """跑一条 git 命令，返回 (returncode, stdout+stderr)。"""
+    """跑一条 git 命令，返回 (returncode, stdout+stderr)。
+
+    `core.quotepath=false` 是必需的：默认情况下 git 会把路径里的非 ASCII
+    字符转义成 `\\346\\226\\207` 形式，中文文件名会以八进制串进入提交信息。
+    """
     try:
         p = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            ["git", "-C", str(repo), "-c", "core.quotepath=false", *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
