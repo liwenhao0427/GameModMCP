@@ -328,6 +328,84 @@ if cd_mb.get("ok"):
           cd_mb.get("derived_returned") == len(cd_mb.get("derived") or []),
           f"returned={cd_mb.get('derived_returned')}")
 
+# ---- 同名类跨程序集：class_detail / class_hierarchy / analyze_dependency 必须拒绝 ----
+# 这三个工具返回的是「这个类的全部内容」，选错类不是少几条数据，
+# 而是整份字段/方法表都是别的类的，且返回里看不出异常。
+# 历史缺陷：它们用 `... LIMIT 1` 静默选中，实测 class_detail("UserData")
+# 返回了 Unity.InputSystem.dll 那个（11 字段），而调用方多半要游戏自己的（23 字段）。
+show("5c. 同名类跨程序集 —— 必须拒绝而不是静默选一个")
+
+# 先确认真值：索引库里 'UserData' 确实对应 2 个类型
+_dup = _idx_conn.execute(
+    "SELECT COUNT(*) FROM types WHERE name = 'UserData'").fetchone()[0]
+check("前提成立：'UserData' 在索引里对应 2 个同名类", _dup == 2, f"实际={_dup}")
+
+for _fn, _label in ((S.class_detail, "class_detail"),
+                    (S.class_hierarchy, "class_hierarchy"),
+                    (S.analyze_dependency, "analyze_dependency")):
+    _r = _fn(full_name="UserData")
+    _c = _r.get("candidates") or []
+    print(f"     {_label}('UserData'): ok={_r.get('ok')} candidates={len(_c)}")
+    check(f"{_label} 遇同名类时拒绝（不再 LIMIT 1 选一个）",
+          _r.get("ok") is False and len(_c) == 2,
+          f"ok={_r.get('ok')} candidates={len(_c)}")
+    check(f"{_label} 的候选带程序集（可用于 assembly 消歧）",
+          all(x.get("image") for x in _c), f"{[x.get('image') for x in _c]}")
+
+# 消歧后必须落到**游戏自己的**那个类，且字段数是它的真值 23
+_cd_asm = S.class_detail(full_name="UserData", assembly="TeamTapas")
+print(f"     class_detail('UserData', assembly='TeamTapas'): "
+      f"ok={_cd_asm.get('ok')} full={_cd_asm.get('full_name')!r} "
+      f"字段={len(_cd_asm.get('fields') or [])}")
+check("用 assembly 消歧后解析到游戏自己的 UserData",
+      _cd_asm.get("ok") is True
+      and _cd_asm.get("full_name") == "TeamTapas.ProjectR.UserDatas.UserData",
+      f"实际={_cd_asm.get('full_name')!r}")
+check("消歧后字段数是该类的真值 23（不是 Unity 那个的 11）",
+      len(_cd_asm.get("fields") or []) == 23,
+      f"实际={len(_cd_asm.get('fields') or [])} —— 若为 11 说明落到了 Unity 的类")
+check("消歧后 image 是游戏程序集",
+      "TeamTapas" in (_cd_asm.get("image") or ""),
+      f"实际={_cd_asm.get('image')!r}")
+
+# class_hierarchy / analyze_dependency 的消歧路径同样要能走通
+_ch_asm = S.class_hierarchy(full_name="UserData", assembly="TeamTapas")
+check("class_hierarchy 也能用 assembly 消歧",
+      _ch_asm.get("ok") is True
+      and (_ch_asm.get("root") or "").startswith("TeamTapas"),
+      f"root={_ch_asm.get('root')!r}")
+_ad_asm = S.analyze_dependency(full_name="UserData", assembly="TeamTapas")
+check("analyze_dependency 也能用 assembly 消歧",
+      _ad_asm.get("ok") is True
+      and (_ad_asm.get("class") or "").startswith("TeamTapas"),
+      f"class={_ad_asm.get('class')!r}")
+
+# 完整类名（无歧义）不应被这次收紧误伤
+for _nm in ("TeamTapas.ProjectR.UserDatas.UserData",
+            "TeamTapas.ProjectR.UserDatas.Service.UserData_Service",
+            "PresetLoaderV2"):
+    _r = S.class_detail(full_name=_nm)
+    check(f"完整名/唯一短名未被误伤：{_nm}", _r.get("ok") is True,
+          str(_r.get("error"))[:60])
+
+# 不存在的类必须仍是明确报错（不能退化成 found=False 的空返回骗过调用方）
+_absent = S.class_detail(full_name="这个类不存在Xyz")
+check("不存在的类仍明确报错", _absent.get("ok") is False,
+      str(_absent.get("error"))[:60])
+check("报错信息里保留请求的类名（可读性）",
+      "这个类不存在Xyz" in str(_absent.get("error")),
+      str(_absent.get("error"))[:60])
+
+# _index_query 的键冲突回归：索引层的 hint 与调用方兜底 hint 同名时
+# 曾经直接抛 TypeError（got multiple values for keyword argument 'hint'）
+_amb_cd = S.class_detail(full_name="UserData")
+check("歧义返回不因 hint 键重名而抛异常（_index_query 回归）",
+      isinstance(_amb_cd, dict) and "hint" in _amb_cd,
+      f"hint={str(_amb_cd.get('hint'))[:50]}")
+check("保留的是索引层更具体的 hint（指向 assembly 消歧）",
+      "assembly" in str(_amb_cd.get("hint")),
+      f"hint={str(_amb_cd.get('hint'))[:60]}")
+
 # ================================================================ 6. 句柄翻页
 show("6. read_query_result / search_query_result —— 结果句柄")
 h = sc.get("handle")

@@ -607,16 +607,20 @@ class Index:
         }
 
     def get_type(self, full_name: str) -> dict[str, Any] | None:
-        """按完整名精确取类型（支持嵌套全名与原始全名）。"""
+        """按完整名精确取类型（支持嵌套全名与原始全名）。
+
+        与 `class_detail` 走同一套唯一性解析：拿不准就返回 `None`，
+        **不**在多个同名类里随便挑一个（原来的 `LIMIT 1` 正是这么错的）。
+
+        注：当前仓库内没有调用方（实际入口是 `class_detail`），
+        保留是因为它是「按名取类型」的公开小工具，将来可能被复用；
+        若确认长期无人使用，可连同这段注释一起删除。
+        """
+        ids, err = self._match_type_ids(full_name)
+        if err or not ids:
+            return None
         row = self.conn.execute(
-            "SELECT * FROM types WHERE nested_name = ? OR full_name = ? LIMIT 1",
-            (full_name, full_name),
-        ).fetchone()
-        if row is None:
-            # 退化：按短名精确匹配
-            row = self.conn.execute(
-                "SELECT * FROM types WHERE name = ? LIMIT 1", (full_name,)
-            ).fetchone()
+            "SELECT * FROM types WHERE idx = ? LIMIT 1", (ids[0],)).fetchone()
         return self._row_to_type(row) if row else None
 
     # ------------------------------------------------------ 查询：成员
@@ -640,10 +644,10 @@ class Index:
     # （见下面 _paged 的说明）——「句柄不全」必须如实标注，不能悄悄截断。
     _HANDLE_CAP = 20000
 
-    def _resolve_owner(
-        self, owner: str, assembly: str = ""
+    def _match_type_ids(
+        self, name: str, assembly: str = "", label: str = "owner"
     ) -> tuple[list[int], dict[str, Any] | None]:
-        """把 owner 解析成**唯一**一个类型，必要时按 assembly 消歧。
+        """把类名解析成**唯一**一个类型，必要时按 assembly 消歧。
 
         返回 `(类型 idx 列表, 错误)`；成功时列表恰好一个元素。
 
@@ -651,7 +655,7 @@ class Index:
         `SELECT idx FROM types WHERE nested_name=? OR full_name=? OR name=?`，
         然后把**所有**命中的类型当同一个类来处理：
 
-            owner="UserData" → 命中 2 个类型
+            输入 "UserData" → 命中 2 个类型
                 UserData                              [Unity.InputSystem.dll]
                 TeamTapas.ProjectR.UserDatas.UserData [TeamTapas.ProjectR.dll]
 
@@ -666,14 +670,19 @@ class Index:
         若先单独试全名匹配，会「恰好命中一个」而看不出歧义，
         于是静默选中了 Unity 那个 —— 比原来的 bug 更隐蔽。
         合并后：全名匹配 {Unity} ∪ 短名匹配 {Unity, 团队那个} = 2 个 → 正确判为歧义。
+
+        碰撞规模是实测过的（不是拍脑袋加限制）：
+        IL2CPP 样本 20,072 个类型里，会被判为歧义的名字只有 585 个（3%）；
+        Mono 样本 1,387 个类型里是 0 个。也就是说「拒绝」几乎不会误伤，
+        而它拦掉的正是那种「看起来成功、偏移全错」的静默错误。
         """
         def _ids(where: str, *args: Any) -> list[int]:
             return [r["idx"] for r in self.conn.execute(
                 f"SELECT DISTINCT idx FROM types WHERE {where}", args)]
 
         # 全名/嵌套全名匹配 + 短名匹配，取并集（保持稳定顺序）
-        cand = _ids("nested_name = ? OR full_name = ?", owner, owner)
-        for i in _ids("name = ?", owner):
+        cand = _ids("nested_name = ? OR full_name = ?", name, name)
+        for i in _ids("name = ?", name):
             if i not in cand:
                 cand.append(i)
 
@@ -690,21 +699,59 @@ class Index:
 
         if not cand:
             if assembly:
-                return [], {"error": f"未找到类：{owner}（在程序集 "
+                return [], {"error": f"未找到类：{name}（在程序集 "
                                      f"{assembly!r} 里不存在，请检查拼写或去掉 assembly）",
                             "total": 0, "items": []}
-            return [], {"error": f"未找到类：{owner}"
-                                 f"（请用 class_detail/search_classes 确认完整类名）",
+            return [], {"error": f"未找到类：{name}"
+                                 f"（用 search_classes 搜短名以确认完整类名）",
                         "total": 0, "items": []}
 
         if len(cand) > 1:
-            return [], self._owner_ambiguous(owner, cand, assembly)
+            return [], self._type_ambiguous(name, cand, assembly, label)
         return cand, None
 
-    def _owner_ambiguous(
-        self, owner: str, ids: list[int], assembly: str
+    def _resolve_owner(
+        self, owner: str, assembly: str = ""
+    ) -> tuple[list[int], dict[str, Any] | None]:
+        """`search_fields` / `search_methods` 的 owner 解析（见 `_match_type_ids`）。"""
+        return self._match_type_ids(owner, assembly, label="owner")
+
+    def _resolve_type_row(
+        self, name: str, assembly: str = ""
+    ) -> tuple[sqlite3.Row | None, dict[str, Any] | None]:
+        """按名字解析出**唯一**一行的 `types` 记录（供 class_detail / class_hierarchy 用）。
+
+        与 `search_classes` 不同，这几个工具返回的是「这个类的全部内容」，
+        拿错类不是少几条数据，而是整份字段/方法表都是别人的 ——
+        所以这里同样必须拒绝歧义，而不是 `LIMIT 1` 随便选一个。
+
+        历史教训：`class_detail`/`class_hierarchy` 曾用
+        `... LIMIT 1` + 退化到 `name = ? LIMIT 1`，
+        实测 `class_detail("UserData")` 静默返回了 Unity.InputSystem.dll
+        那个 UserData（11 个字段），而调用方多半想要游戏自己的那个
+        （23 个字段），且返回里没有任何歧义提示。这与
+        `search_fields` 的 owner 合并是同一类缺陷，只是表现成「选错」而非「混合」。
+        """
+        ids, err = self._match_type_ids(name, assembly, label="full_name")
+        if err:
+            # 索引层统一用 found=False 表达「没查到」，server 的 _index_query
+            # 会把它转成 ok=False 并把 candidates/hint 一并透出。
+            out: dict[str, Any] = {"found": False,
+                                   "reason": err.get("error", f"未找到类：{name}")}
+            for k, v in err.items():
+                if k not in ("error", "total", "items"):
+                    out[k] = v
+            return None, out
+        row = self.conn.execute(
+            "SELECT * FROM types WHERE idx = ? LIMIT 1", (ids[0],)).fetchone()
+        if row is None:  # 理论上不可能：idx 刚从同一张表取出来
+            return None, {"found": False, "reason": f"未找到类：{name}"}
+        return row, None
+
+    def _type_ambiguous(
+        self, name: str, ids: list[int], assembly: str, label: str = "owner"
     ) -> dict[str, Any]:
-        """owner 命中多个类型：拒绝，并把候选摆出来（参照 hook_method 的做法）。"""
+        """类名命中多个类型：拒绝，并把候选摆出来（参照 hook_method 的做法）。"""
         cands = []
         for r in self.conn.execute(
             f"SELECT idx, nested_name, full_name, name, image, field_count, "
@@ -723,14 +770,16 @@ class Index:
         cands.sort(key=lambda c: (c["image"] or "", c["nested_name"] or ""))
         why = ("（已按 assembly 过滤，但仍不唯一）" if assembly else
                "（多半是不同程序集里有同名类）")
+        best = cands[0]
         return {
-            "error": f"owner={owner!r} 命中 {len(cands)} 个类{why}，"
+            "error": f"{label}={name!r} 命中 {len(cands)} 个类{why}，"
                      f"无法确定你要哪一个。请改用完整类名，或用 assembly 参数消歧。",
             "total": 0,
             "items": [],
             "candidates": cands,
-            "hint": "owner=\"TeamTapas.ProjectR.UserDatas.UserData\""
-                    " 或 owner=\"UserData\", assembly=\"TeamTapas\"",
+            "hint": f'{label}="{best["full_name"]}"'
+                    + (f' 或 {label}="{name}", assembly="{assembly}"' if assembly
+                       else f' 或 {label}="{name}", assembly="{best["image"]}"'),
         }
 
     def _paged(
@@ -854,21 +903,19 @@ class Index:
         return self._paged("methods", total, items, offset, limit,
                            total > len(items))
 
-    def class_detail(self, full_name: str, include_inherited: bool = False) -> dict[str, Any]:
+    def class_detail(self, full_name: str, include_inherited: bool = False,
+                     assembly: str = "") -> dict[str, Any]:
         """取一个类的完整信息：字段（含静态判定）、方法、基类链、接口、子类数。
 
         这是「搞清楚一个类长什么样」的主力工具，也是后续 Hook 的输入。
+        `assembly` 用于同名类消歧（见 `_match_type_ids`）。
         """
-        row = self.conn.execute(
-            "SELECT * FROM types WHERE nested_name = ? OR full_name = ? LIMIT 1",
-            (full_name, full_name),
-        ).fetchone()
-        if row is None:
-            row = self.conn.execute(
-                "SELECT * FROM types WHERE name = ? LIMIT 1", (full_name,)
-            ).fetchone()
-        if row is None:
-            return {"found": False, "query": full_name}
+        # 必须唯一解析：返回的是「这个类的全部内容」，选错类等于整份字段表
+        # 都是别人的，且返回里看不出异常（实测 UserData 会静默落到 Unity 那个）。
+        row, err = self._resolve_type_row(full_name, assembly)
+        if err:
+            return err
+        assert row is not None
 
         t = self.meta.types[row["idx"]]
         m = self.meta
@@ -997,15 +1044,18 @@ class Index:
 
     # ------------------------------------------------------ 查询：层级 / 依赖
 
-    def class_hierarchy(self, full_name: str, direction: str = "both", depth: int = 6) -> dict[str, Any]:
+    def class_hierarchy(self, full_name: str, direction: str = "both", depth: int = 6,
+                       assembly: str = "") -> dict[str, Any]:
         """类的继承层级树。
 
         direction: up（基类）/ down（子类）/ both
         """
         m = self.meta
-        t = m.type_by_name(full_name)
-        if t is None:
-            return {"found": False, "query": full_name}
+        # 与 class_detail 同一套解析：继承树挂到别的同名类上同样是无提示的错误。
+        _row, err = self._resolve_type_row(full_name, assembly)
+        if err:
+            return err
+        t = m.types[_row["idx"]]
 
         result: dict[str, Any] = {"found": True, "root": t.nested_name}
 
@@ -1118,7 +1168,8 @@ class Index:
             out["note"] = f"{out['note']} {extra}" if out.get("note") else extra
         return out
 
-    def analyze_dependency(self, full_name: str) -> dict[str, Any]:
+    def analyze_dependency(self, full_name: str,
+                           assembly: str = "") -> dict[str, Any]:
         """静态依赖概览：这个类引用了哪些类型、被谁引用。
 
         注意：**这是基于元数据签名的近似分析**，不是精确的调用图。
@@ -1126,9 +1177,11 @@ class Index:
         本工具给出的是「字段/方法签名里出现了哪些类型」，用于快速摸清耦合关系。
         """
         m = self.meta
-        t = m.type_by_name(full_name)
-        if t is None:
-            return {"found": False, "query": full_name}
+        # 同 class_detail：依赖清单必须属于**请求的那个类**，不能选错同名类。
+        _row, err = self._resolve_type_row(full_name, assembly)
+        if err:
+            return err
+        t = m.types[_row["idx"]]
 
         referenced: dict[str, int] = {}
 

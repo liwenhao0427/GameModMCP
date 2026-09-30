@@ -294,9 +294,17 @@ eval_script("""
 find_derived_classes(base_full_name="UnityEngine.MonoBehaviour",
                      assembly="Assembly-CSharp", limit=500)
 # 再看具体某个类有没有 Update
-class_detail(full_name="Player", method_name="Update")
-search_methods(pattern="Update", owner="Manager")
+class_detail(full_name="PlayerController", method_name="Update")
+search_methods(pattern="Update", owner="PlayerController")
 ```
+
+> **类名有歧义时工具会拒绝，不会替你猜。**
+> 同一个短名可能对应多个类（不同程序集各有同名类，实测 IL2CPP 样本
+> 20,072 个类型里有 585 个短名是这种情况）。这时返回
+> `ok: false` + `candidates`（含各自程序集），补 `assembly=` 消歧即可：
+> `class_detail(full_name="Player", assembly="Assembly-CSharp")`。
+> 这样做是因为「拿错类」比「报错」危险得多 —— 拿到的是**另一个类的整份字段表**，
+> 据此算出的偏移必然错，而且要到运行时才暴露。
 
 ### 配方 4：确认 Hook 落点是对的（重要）
 

@@ -122,13 +122,21 @@ def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
     索引层用 `found=False` 表示「查了但没这个对象」（而不是抛异常或返回 None）。
     如果直接把这种结果当成成功返回，Agent 会误以为查到了空数据 ——
     这是最容易骗到 Agent 的一类假成功，必须在这里拦掉。
+
+    `extra` 是调用方给的**兜底**提示（如「用 search_classes 先确认类名」），
+    只在索引层**没给**同名键时才补上。索引层的提示更具体
+    （例如歧义时它会给出 `candidates` 和「用 assembly 消歧」的 hint），
+    不能被调用方的泛泛提示覆盖，也不能因为键重名直接抛 TypeError ——
+    曾经 `_err()` 因此 `got multiple values for keyword argument 'hint'`。
     """
     if res is None:
         return _err(f"未找到{what}", **extra)
     if not res.get("found", True):
         reason = res.get("reason") or f"未找到{what}"
-        return _err(reason, **{k: v for k, v in res.items()
-                               if k not in ("found", "reason")}, **extra)
+        payload = {k: v for k, v in res.items() if k not in ("found", "reason")}
+        for k, v in extra.items():
+            payload.setdefault(k, v)     # 索引层的更具体，优先保留
+        return _err(reason, **payload)
     return _ok(**res)
 
 
@@ -346,7 +354,7 @@ def search_classes(
 
 @mcp.tool(annotations={"title": "查看类的完整细节", "readOnlyHint": True})
 def class_detail(full_name: str, include_inherited: bool = False,
-                 method_name: str = "") -> dict:
+                 method_name: str = "", assembly: str = "") -> dict:
     """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链。
 
     **这是定位 Hook 落点的核心工具**：方法的 token 由这里给出，
@@ -355,6 +363,10 @@ def class_detail(full_name: str, include_inherited: bool = False,
     重要：**静态元数据里没有字段偏移、也没有方法地址**（只有 token）。
     字段偏移与方法真实地址必须靠注入后的运行时工具取。
 
+    同类名跨程序集时会**拒绝并列出候选**（`ok:false` + `candidates`），
+    请改用完整名或补 `assembly=` —— 因为返回的是「这个类的全部字段表」，
+    选错类不是少几条数据，而是整份结果都是别的类的。
+
     Args:
         full_name:         类的完整名（如 "PresetLoaderV2" 或
                            "TeamTapas.ProjectR.UserDatas.Service.UserData_Service"）。
@@ -362,6 +374,8 @@ def class_detail(full_name: str, include_inherited: bool = False,
         method_name:       只关心某个方法时填这里。填了就只返回该方法的
                            全部重载（含 token / 参数表 / 是否静态），
                            等价于旧的 get_method_source，省一轮往返。
+        assembly:          同名类消歧用（子串匹配，如 "TeamTapas"）。留空则
+                           名字必须唯一，否则报错并给出候选。
 
     Returns:
         {ok, full_name, nested_name, namespace, image, token, ..., fields,
@@ -381,7 +395,8 @@ def class_detail(full_name: str, include_inherited: bool = False,
     # Update/OnEnable 会得到「未找到」的假否定。
     want_inherited = include_inherited or bool(method_name)
     try:
-        res = idx.class_detail(full_name, include_inherited=want_inherited)
+        res = idx.class_detail(full_name, include_inherited=want_inherited,
+                               assembly=assembly)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
 
@@ -512,19 +527,24 @@ def search_methods(
 
 
 @mcp.tool(annotations={"title": "查看类继承关系", "readOnlyHint": True})
-def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6) -> dict:
+def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
+                    assembly: str = "") -> dict:
     """查看类的继承体系（向上找基类、向下找派生类）。
+
+    同类名跨程序集时会拒绝并给出候选（与 `class_detail` 同一规则）。
 
     Args:
         full_name: 类完整名。
         direction: up / down / both。
         depth:     向下递归深度。
+        assembly:  同名类消歧用（子串匹配，如 "TeamTapas"）。
     """
     idx, err = _need_index()
     if err:
         return err
     try:
-        res = idx.class_hierarchy(full_name, direction=direction, depth=depth)
+        res = idx.class_hierarchy(full_name, direction=direction, depth=depth,
+                                  assembly=assembly)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
     return _index_query(res, f"类：{full_name}")
@@ -570,19 +590,22 @@ def find_derived_classes(base_full_name: str, limit: int = 200,
 
 
 @mcp.tool(annotations={"title": "分析类型依赖", "readOnlyHint": True})
-def analyze_dependency(full_name: str) -> dict:
+def analyze_dependency(full_name: str, assembly: str = "") -> dict:
     """分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。
 
     用来判断「改这个类会不会牵连很多地方」。
 
+    同类名跨程序集时会拒绝并给出候选（与 `class_detail` 同一规则）。
+
     Args:
         full_name: 类完整名。
+        assembly:  同名类消歧用（子串匹配，如 "TeamTapas"）。
     """
     idx, err = _need_index()
     if err:
         return err
     try:
-        res = idx.analyze_dependency(full_name)
+        res = idx.analyze_dependency(full_name, assembly=assembly)
     except Exception as exc:
         return _err(f"分析失败：{exc}")
     return _index_query(res, f"类：{full_name}")
