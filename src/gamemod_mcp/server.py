@@ -362,6 +362,14 @@ def class_detail(full_name: str, include_inherited: bool = False,
         method_name:       只关心某个方法时填这里。填了就只返回该方法的
                            全部重载（含 token / 参数表 / 是否静态），
                            等价于旧的 get_method_source，省一轮往返。
+
+    Returns:
+        {ok, full_name, nested_name, namespace, image, token, ..., fields,
+         methods, parent, base_chain, derived_count, derived, derived_returned,
+         derived_has_more}
+        `derived_count` 是**派生类总数**（真值）；`derived` 只是前 50 个名字，
+        被截断时 `derived_has_more` 为 True —— 需要完整列表请用
+        `find_derived_classes`。
     """
     idx, err = _need_index()
     if err:
@@ -513,9 +521,17 @@ def find_derived_classes(base_full_name: str, limit: int = 200,
     基类**不必**在当前索引的程序集里（如 UnityEngine.MonoBehaviour
     属于框架程序集），这种情况结果依然有效，并在 note 里如实说明。
 
+    `total` 是**匹配总数**，不受 limit 影响；`returned` 才是本次返回条数。
+    若 `has_more` 为 True，说明被 limit 截断了，还有结果没返回。
+
     Args:
         base_full_name: 基类完整名，如 "UnityEngine.MonoBehaviour"。
         assembly:       只看该程序集（子串匹配，如 "TeamTapas"）。留空不限。
+        limit:          最多返回多少条（`total` 仍是匹配总数）。
+
+    Returns:
+        {ok, found, base, total, returned, has_more, items: [{index,
+         full_name, image, field_count, method_count}]}
     """
     idx, err = _need_index()
     if err:

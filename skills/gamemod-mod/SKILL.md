@@ -309,11 +309,23 @@ for c in tgt["candidates"]:
 
 ```python
 r = search_classes(pattern="Player", limit=50)
-r["total"]        # 总共 697 个
+r["total"]        # 总共 697 个（**匹配总数**，不受 limit 影响）
 r["handle"]       # "classes-1"
 read_query_result(r["handle"], offset=500, limit=50)
 search_query_result(r["handle"], pattern="Controller")   # 在结果内再过滤
 ```
+
+**`total` 与 `returned` 不是一回事，`has_more` 才是截断标志**：
+
+| 字段 | 含义 |
+|---|---|
+| `total` | 匹配**总数**（不受 limit 影响） |
+| `returned` | 本次实际返回条数 |
+| `has_more` | `True` = 被 limit 截断，还有没返回的 |
+
+所以看到 `total=644 / returned=200 / has_more=true` 时，
+意思是「一共 644 个，这次只给了 200 个」，**不要**把 200 当成总数。
+`find_derived_classes` 也遵守同一约定。
 
 ---
 

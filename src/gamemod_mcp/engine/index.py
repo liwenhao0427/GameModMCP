@@ -845,7 +845,11 @@ class Index:
                         }
                     )
 
-        derived = m.find_derived(t.full_name, limit=200)
+        # 全量取回，这样 derived_count 才是真值（不是被 200 截断后的数）。
+        # 曾经写死 limit=200，于是 UnityEngine.MonoBehaviour 报 derived_count=200，
+        # 实际有 1548 个 —— 与 find_derived_classes 的 total 是同一类谎报。
+        derived = m.find_derived(t.full_name, limit=1_000_000)
+        derived_cap = 50
 
         return {
             "found": True,
@@ -870,7 +874,10 @@ class Index:
             "fields": fields,
             "methods": methods,
             "derived_count": len(derived),
-            "derived": [d.nested_name for d in derived[:50]],
+            "derived": [d.nested_name for d in derived[:derived_cap]],
+            # 如实标注列表被截断，避免 Agent 把 50 条当成全部
+            "derived_returned": min(len(derived), derived_cap),
+            "derived_has_more": len(derived) > derived_cap,
             "include_inherited": include_inherited,
         }
 
@@ -933,49 +940,68 @@ class Index:
         UnityEngine.CoreModule.dll —— 这时 `type_by_name` 找不到基类，
         但 `find_derived` 依然能正确工作（它扫的是派生类的基类引用）。
         所以这里**不能**因为找不到基类就报错。
+
+        返回的 `total` **必须**是过滤后的**真实总数**，不是被 limit 截断后的条数：
+        实测 Archon Soul 的 MonoBehaviour 派生类有 644 个，若按截断数返回
+        `total: 200`，Agent 会以为「这个游戏只有 200 个脚本」而漏掉三分之二。
+        所以这里全量算出结果集，再用 `has_more` 如实标注是否被截断。
+        全量扫描很便宜（实测 IL2CPP 20,072 类型 17 ms / Mono 1,387 类型 2 ms），
+        不值得为此牺牲正确性。
         """
         m = self.meta
         base = m.type_by_name(base_full_name)
 
-        # 多取一些再过滤，避免 assembly 过滤把结果砍到 limit 以下
-        want = limit if not assembly else min(limit * 20, 20000)
-        derived = m.find_derived(base_full_name, limit=want)
+        # 全量取回，再按 assembly 过滤 —— 这样 total 才是真值。
+        # 之前先用 limit*20 截断再过滤，导致 total 既不是真值、也不稳定。
+        derived = m.find_derived(base_full_name, limit=1_000_000)
 
-        items = []
+        filtered = []
         for d in derived:
             img = m.image_of_type(d)
             if assembly and assembly.lower() not in img.lower():
                 continue
-            items.append({
+            filtered.append({
                 "index": d.index,
                 "full_name": d.nested_name,
                 "image": img,
                 "field_count": d.field_count,
                 "method_count": d.method_count,
             })
-            if len(items) >= limit:
-                break
 
-        if base is None and not items:
+        total = len(filtered)
+        items = filtered[:limit]
+        truncated = total > limit
+
+        if base is None and total == 0:
             # 既找不到基类、也没有任何派生类 —— 这才是真的查不到
             return {"found": False, "query": base_full_name,
-                    "total": 0, "items": []}
+                    "total": 0, "returned": 0, "items": []}
 
         out: dict[str, Any] = {
             "found": True,
             "base": base.nested_name if base is not None else base_full_name,
-            "total": len(items),
+            "total": total,
+            "returned": len(items),
+            "has_more": truncated,
             "items": items,
         }
+        if truncated:
+            out["note"] = (
+                f"匹配 {total} 个，本次只返回前 {len(items)} 个（limit={limit}）。"
+                f"调大 limit，或加 assembly= 缩小范围。"
+            )
         if assembly:
             out["assembly_filter"] = assembly
         if base is None:
             # 如实说明：基类不在当前索引范围内，但派生类是通过基类名字符串
             # 比对出来的，结果依然有效。
-            out["note"] = (
+            # 注意：不能直接赋值覆盖 —— 可能上面已有「被截断」的提示，
+            # 两条信息都要保留（否则截断警告会被悄悄吞掉）。
+            extra = (
                 f"基类 {base_full_name} 不在当前索引的程序集内（例如它属于 "
                 f"UnityEngine/System 等框架程序集），派生类按基类名比对得出。"
             )
+            out["note"] = f"{out['note']} {extra}" if out.get("note") else extra
         return out
 
     def analyze_dependency(self, full_name: str) -> dict[str, Any]:

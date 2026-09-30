@@ -6,7 +6,20 @@
 ## 一条命令跑全部
 
 ```powershell
-python devtools\samples.py             # ← 先看本机样本可用性（不跑测试）
+python devtools\run_all_verify.py          # ← 推荐：全部 + 动态覆盖率门禁 + 崩溃重试
+python devtools\samples.py                 # 只看本机样本可用性（不跑测试）
+```
+
+`run_all_verify.py` 会自己带上覆盖率垫片、开跑前清空旧日志，
+所以**一条命令给出的就是本次运行的证据**。它还会：
+把「**断言失败**」与「**进程崩溃**」分开归类（`verify_agent_js`
+自注入 Frida 偶发访问违例，崩了不等于产品有问题，但也不算通过），
+并给自注入类脚本多一次重试预算 —— 重试过一定留痕，
+不会把偶发失败洗成通过。
+
+也可以按需单独跑：
+
+```powershell
 python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否一致（无需游戏）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
@@ -24,7 +37,36 @@ python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
 python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
 python devtools\verify_autocommit.py       # Stop hook 自动提交（临时仓库，无需游戏）
+python devtools\verify_tool_coverage.py    # 静态：每个工具是否被脚本调用过（无需游戏）
 ```
+
+## 确认「38 个工具真的都跑过」——动态覆盖率
+
+`verify_tool_coverage.py` 是**静态**检查（工具名有没有出现在脚本里），
+它会**高估**：`sess.hook_method(...)` 这种会话对象的调用也算数。
+真正「跑过没有」要用垫片记录。用 `run_all_verify.py` 跑就不必手动设环境变量；
+要自己组合时这样做：
+
+```powershell
+$env:PYTHONPATH   = "$PWD\devtools\_cov"
+$env:GAMEMOD_COV_OUT = "$PWD\.cache-test\tool_calls.jsonl"
+Remove-Item .cache-test\tool_calls.jsonl -ErrorAction SilentlyContinue
+# 然后正常跑各 verify 脚本
+python devtools\report_tool_coverage.py          # 汇总：真实调用过几个、返回体多大
+python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出码非零（门禁）
+```
+
+垫片（`devtools/_cov/sitecustomize.py`）只**观测**：不改参数、不改返回值、
+异常原样抛出。它记录每次调用的 `ok`、`error` 与返回体字节数，
+因此还能顺带暴露「哪个工具在返回超大结果」（对应契约 §3.1 第 5 条）。
+
+当前实测：**38 / 38 全部在 MCP 层真实调用过**。
+
+> 这个门禁不是摆设：曾把 `inject_process` 注入失败放宽成警告后，
+> 覆盖率立刻掉到 **35/38**（`hook_address` / `read_field_value` /
+> `gc_control` 因整段跳过而再没被调用）——静态检查完全看不出来。
+> 现在这三个工具在注入失败时会改走**负路径**（验「无会话必须报错」），
+> 保证仍被真实调用，并在输出里注明这比正路径的结论弱。
 
 不需要 `$env:PYTHONPATH`：每个脚本都通过 `samples.add_src_to_path()`
 从自身位置推导 `src`。
@@ -86,7 +128,10 @@ Agent 以为能用，一调就撞墙。只有 MCP 层的脚本能抓到这种问
 ```
 devtools/
 ├── samples.py             样本路径的集中定义（唯一真值）
+├── run_all_verify.py      一条命令跑全部 + 覆盖率门禁（崩溃重试并留痕）
 ├── verify_*.py            验收脚本（上面那批）
+├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
+├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
 ├── probes/                一次性逆向侦察脚本（30 个）
 ├── hooks/                 Stop hook 自动提交（见其中 README.md）
 └── groundtruth/           真值来源
@@ -121,8 +166,10 @@ devtools/
   `hook_fired_natural` 这项因此保持 ⚠️，
   Hook 的有效性改为「从注入侧主动调用目标」来证明。
   在有显示器/GPU 的机器上应当重新验证这一项。
-- `find_processes` 不总能列出正在跑的游戏，`diagnostics()` 的
-  `running_game_count` 也可能是 0。测试一律用 spawn 而不是靠发现。
+- `find_processes` 不总能列出正在跑的游戏 —— 测试一律用 spawn，
+  不靠发现。`get_diagnostics` 默认**不扫本机进程**（那一扫要 2.7 秒，
+  且与 `find_game_processes` 职责重复），要列进程请单独调
+  `find_game_processes`。
 - 跑运行时脚本前建议先 `Get-Process -Name '<游戏名>' | Stop-Process -Force`，
   残留的同名进程会让新实例的 IL2CPP 加载异常，
   表现为「注入成功但 IL2CPP 未就绪」这种假象。

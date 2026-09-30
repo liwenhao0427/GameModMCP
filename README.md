@@ -130,7 +130,7 @@ Agent 会自动：
 | `search_fields` | 按字段名搜（定位「金币」「血量」这类目标） |
 | `search_methods` | 按方法名搜，返回 token |
 | `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类） |
-| `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**） |
+| `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
 | `analyze_dependency` | 类型依赖概览（近似，非精确调用图） |
 | `list_images` | 列出所有程序集/映像 |
 

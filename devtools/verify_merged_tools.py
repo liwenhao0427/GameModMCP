@@ -96,6 +96,24 @@ def main() -> int:
               all("index" in it for it in items),
               f"首项键={sorted(items[0].keys()) if items else '无'}")
 
+        # ---- total 必须是**真实总数**，不能是被 limit 截断后的条数 ----
+        # 曾经这里返回 total=len(items)，于是 limit=5 时报 total=5，
+        # Agent 会以为「这个游戏只有 5 个脚本」。实测 Archon Soul 有 644 个。
+        show("1b. total 是匹配总数，不受 limit 影响（契约 §3.1 第 5 条）")
+        small = idx.find_derived_classes("UnityEngine.MonoBehaviour", limit=5)
+        full = idx.find_derived_classes("UnityEngine.MonoBehaviour", limit=5000)
+        check("limit=5 时 total 仍等于真实总数",
+              small.get("total") == full.get("total"),
+              f"limit=5 报 total={small.get('total')}，全量 total={full.get('total')}")
+        check("limit=5 时 returned=5 且 has_more=True",
+              small.get("returned") == 5 and small.get("has_more") is True,
+              f"returned={small.get('returned')} has_more={small.get('has_more')}")
+        check("未截断时 has_more=False",
+              full.get("has_more") is False,
+              f"has_more={full.get('has_more')} returned={full.get('returned')}")
+        check("被截断时给出提示", bool(small.get("note")),
+              str(small.get("note"))[:70])
+
         show("2. Mono 样本：class_detail(method_name=) 取代 get_method_source")
         # 取一个有方法的类
         cls = None

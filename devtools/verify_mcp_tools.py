@@ -145,6 +145,29 @@ en = S.search_classes(only_enums=True, pattern="CurrencyKey", limit=5)
 check("枚举过滤可用", en.get("ok") and (en.get("total") or 0) >= 1,
       f"命中 {en.get('total')}")
 
+# ---- list_images：MCP 层此前只在会话对象上验证过，工具层没跑过 ----
+li = S.list_images()
+check("list_images 返回 ok", li.get("ok"), li.get("error", ""))
+print(f"     程序集 {li.get('total')} 个, 返回前 {li.get('returned')} 个")
+check("程序集数量合理（>10）", (li.get("total") or 0) > 10,
+      f"实际={li.get('total')}")
+_top = (li.get("items") or [{}])[0]
+check("每项含 image 与 type_count",
+      bool(_top.get("image")) and _top.get("type_count") is not None,
+      f"首项={_top}")
+li_f = S.list_images(pattern="TeamTapas")
+check("list_images 支持 pattern 过滤",
+      li_f.get("ok") and (li_f.get("total") or 0) >= 1
+      and all("TeamTapas" in (i.get("image") or "")
+              for i in (li_f.get("items") or [])),
+      f"命中 {li_f.get('total')} 个（过滤后每项都应含 TeamTapas）")
+# 反例：不匹配的 pattern 必须如实返回 0，而不是回退成全量
+li_none = S.list_images(pattern="绝对不存在的程序集名_xyz")
+check("list_images pattern 无命中时如实返回 0",
+      li_none.get("ok") and li_none.get("total") == 0
+      and not (li_none.get("items") or []),
+      f"total={li_none.get('total')}")
+
 # ================================================================ 5. 类详情
 show("5. class_detail —— 字段/方法/继承链")
 cd = S.class_detail("TeamTapas.ProjectR.UserDatas.Service.UserData_Service")
@@ -172,6 +195,27 @@ if pl.get("ok"):
     check("PresetLoaderV2.userDataPresetFile 类型 = UnityEngine.TextAsset",
           pf.get("userDataPresetFile") == "UnityEngine.TextAsset",
           f"实际={pf.get('userDataPresetFile')}")
+
+# ---- derived_count 必须是真值（曾写死 limit=200，MonoBehaviour 报 200/实际 1548）----
+show("5b. class_detail.derived_count —— 不许被 200 截断后谎报")
+cd_mb = S.class_detail("UnityEngine.MonoBehaviour")
+check("class_detail(MonoBehaviour) 返回 ok", cd_mb.get("ok"),
+      cd_mb.get("error", ""))
+if cd_mb.get("ok"):
+    dc = cd_mb.get("derived_count")
+    print(f"     derived_count={dc} 列表={len(cd_mb.get('derived') or [])} "
+          f"has_more={cd_mb.get('derived_has_more')}")
+    # 地面真值：本样本 MonoBehaviour 的派生类实测 1548 个
+    check("derived_count 是真值 1548（不是被截断的 200）", dc == 1548,
+          f"实际={dc} —— 若为 200 说明又被 limit 截断了")
+    check("derived 列表被截断时如实标注",
+          len(cd_mb.get("derived") or []) == 50
+          and cd_mb.get("derived_has_more") is True,
+          f"列表={len(cd_mb.get('derived') or [])} "
+          f"has_more={cd_mb.get('derived_has_more')}")
+    check("derived_returned 与列表长度一致",
+          cd_mb.get("derived_returned") == len(cd_mb.get("derived") or []),
+          f"returned={cd_mb.get('derived_returned')}")
 
 # ================================================================ 6. 句柄翻页
 show("6. read_query_result / search_query_result —— 结果句柄")
