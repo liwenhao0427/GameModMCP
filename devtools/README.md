@@ -36,7 +36,6 @@ python devtools\verify_il2cpp_runtime.py   # 静态↔运行时 token 交叉验�
 python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
 python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
-python devtools\verify_autocommit.py       # Stop hook 自动提交（临时仓库，无需游戏）
 python devtools\verify_tool_coverage.py    # 静态：每个工具是否被脚本调用过（无需游戏）
 ```
 
@@ -133,7 +132,6 @@ devtools/
 ├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
 ├── probes/                一次性逆向侦察脚本（30 个）
-├── hooks/                 Stop hook 自动提交（见其中 README.md）
 └── groundtruth/           真值来源
     ├── mono/
     │   ├── MonoGroundTruth.csproj   .NET 真值生成器（用官方

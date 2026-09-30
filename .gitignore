@@ -40,9 +40,3 @@ desktop.ini
 .DS_Store
 *.tmp
 *~
-
-# ---- 自动提交 hook 的临时文件 ----
-# 提交信息文件是「传递信息」用的，用完即删；即便中途异常残留也不该入库。
-.dsh-autocommit-msg
-# 哨兵文件本身要入库（它是 opt-in 开关，需随项目走）
-!.dsh-autocommit.json

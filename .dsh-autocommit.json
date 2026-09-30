@@ -1,9 +1,0 @@
-{
-  "_说明": "本文件是 DSH 回合结束自动提交的哨兵（opt-in 开关）。存在即启用，删除即停用。",
-  "_为什么需要": "DSH 的 Stop hook 是进程级全局配置，会在任何项目里触发。没有这个哨兵，自动提交会误伤其它仓库。",
-  "enabled": true,
-  "repo": "GameModMCP",
-  "created": "2026-09-29",
-  "hook": "devtools/hooks/auto_commit.py",
-  "registeredIn": "%USERPROFILE%/.dsh/hooks/claude-hooks.json"
-}
