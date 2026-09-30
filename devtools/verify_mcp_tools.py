@@ -402,9 +402,76 @@ _amb_cd = S.class_detail(full_name="UserData")
 check("歧义返回不因 hint 键重名而抛异常（_index_query 回归）",
       isinstance(_amb_cd, dict) and "hint" in _amb_cd,
       f"hint={str(_amb_cd.get('hint'))[:50]}")
-check("保留的是索引层更具体的 hint（指向 assembly 消歧）",
-      "assembly" in str(_amb_cd.get("hint")),
-      f"hint={str(_amb_cd.get('hint'))[:60]}")
+check("保留的是索引层更具体的 hint（不是调用方那句泛泛提示）",
+      "search_classes 先确认名称" not in str(_amb_cd.get("hint")),
+      f"hint={str(_amb_cd.get('hint'))[:70]}")
+
+# ---- 拒绝返回必须**可操作**：hint 照做要能真的定位到类 ----
+# 这里踩过三个坑，都是实测出来的：
+#   1) hint 曾建议 full_name="State" —— 正是调用方刚传进来的歧义串，照做再错一次
+#   2) hint 曾无条件建议 assembly= —— 候选全在同一映像时毫无用处（UxmlTraits 54 个）
+#   3) 候选列表无上限 —— "<>c" 有 456 个候选、序列化 88 KB，白吃 Agent 上下文
+show("5d. 歧义拒绝的可操作性 —— hint 必须真能用、候选必须有界")
+
+for _nm in ("UserData", "State", "UxmlTraits", "InitData"):
+    _r = S.class_detail(full_name=_nm)
+    _c = _r.get("candidates") or []
+    _cnt = _r.get("candidate_count")
+    _size = len(json.dumps(_r, ensure_ascii=False).encode())
+    print(f"     class_detail({_nm!r}): 候选={_cnt} 列出={len(_c)} "
+          f"payload={_size/1024:.1f}KB assembly_helps={_r.get('assembly_helps')}")
+
+    check(f"{_nm}: 候选总数如实给出 candidate_count",
+          _cnt == len(_c) or (_cnt or 0) > len(_c),
+          f"candidate_count={_cnt} 列出={len(_c)}")
+    check(f"{_nm}: 候选列表有上限（不超 30 条）", len(_c) <= 30, f"{len(_c)}")
+    check(f"{_nm}: 错误返回体积可控（< 20 KB）", _size < 20000,
+          f"{_size/1024:.1f}KB")
+
+    # 核心断言：照 hint 回灌必须成功。hint 是给 Agent 的下一步动作，
+    # 它错了比不给 hint 更糟 —— 会让 Agent 在同一个错误上打转。
+    _h = _r.get("hint") or ""
+    check(f"{_nm}: 给出 hint", bool(_h), f"hint={_h!r}")
+    if _h:
+        _sug = _h.split("=", 1)[1].strip().strip('"')
+        check(f"{_nm}: hint 建议的不是调用方刚传进来的那个歧义串（否则等于没建议）",
+              _sug != _nm, f"hint 又建议了 {_sug!r}")
+        _r2 = S.class_detail(full_name=_sug)
+        check(f"{_nm}: 照 hint 回灌能真的定位到类（hint 有效性）",
+              _r2.get("ok") is True and _r2.get("nested_name") == _sug,
+              f"回灌 {_sug!r} -> ok={_r2.get('ok')}")
+
+    # 候选全在同一映像时，成因描述不能说是「不同程序集」，且要提醒 assembly 无效
+    _imgs = {x.get("image") for x in _c}
+    if len(_imgs) == 1:
+        check(f"{_nm}: 同映像候选时如实标注 assembly_helps=False",
+              _r.get("assembly_helps") is False,
+              f"assembly_helps={_r.get('assembly_helps')}")
+        check(f"{_nm}: 同映像候选时提示 assembly 帮不上忙（不给空头支票）",
+              "帮不上忙" in str(_r.get("error")),
+              str(_r.get("error"))[:80])
+
+# 最坏情形：'<>c' 有数百个候选，payload 曾经 88 KB
+_big = S.class_detail(full_name="<>c")
+_big_size = len(json.dumps(_big, ensure_ascii=False).encode())
+print(f"     极端情形 '<>c': 候选={_big.get('candidate_count')} "
+      f"列出={len(_big.get('candidates') or [])} payload={_big_size/1024:.1f}KB")
+check("大量同名（'<>c'）时 payload 仍受控（< 20 KB）", _big_size < 20000,
+      f"{_big_size/1024:.1f}KB —— 修复前是 88 KB")
+check("大量同名时如实标注候选被截断",
+      _big.get("candidates_truncated") is True
+      and bool(_big.get("candidates_note")),
+      f"truncated={_big.get('candidates_truncated')}")
+
+# search_fields 的 owner 歧义 hint 同样要真能用
+_sf = S.search_fields(pattern="a", owner="UserData", limit=5)
+_sf_h = _sf.get("hint") or ""
+check("search_fields 的歧义也给出 hint", bool(_sf_h), f"hint={_sf_h!r}")
+if _sf_h:
+    _sf_sug = _sf_h.split("=", 1)[1].strip().strip('"')
+    _sf2 = S.search_fields(pattern="a", owner=_sf_sug, limit=5)
+    check("search_fields 的 hint 照做能成功（hint 有效性）",
+          _sf2.get("ok") is True, f"回灌 {_sf_sug!r} -> {_sf2.get('ok')}")
 
 # ================================================================ 6. 句柄翻页
 show("6. read_query_result / search_query_result —— 结果句柄")

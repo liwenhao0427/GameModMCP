@@ -645,7 +645,8 @@ class Index:
     _HANDLE_CAP = 20000
 
     def _match_type_ids(
-        self, name: str, assembly: str = "", label: str = "owner"
+        self, name: str, assembly: str = "", label: str = "owner",
+        _probe: bool = True,
     ) -> tuple[list[int], dict[str, Any] | None]:
         """把类名解析成**唯一**一个类型，必要时按 assembly 消歧。
 
@@ -707,7 +708,10 @@ class Index:
                         "total": 0, "items": []}
 
         if len(cand) > 1:
-            return [], self._type_ambiguous(name, cand, assembly, label)
+            # _probe=False 用于「给自己找消歧建议」的内部验证调用，
+            # 避免 A 歧义 → 探测 B → B 也歧义 → 再探测 … 的递归。
+            return [], self._type_ambiguous(name, cand, assembly, label,
+                                            verify=_probe)
         return cand, None
 
     def _resolve_owner(
@@ -748,10 +752,36 @@ class Index:
             return None, {"found": False, "reason": f"未找到类：{name}"}
         return row, None
 
+    # 拒绝时最多列多少个候选。实测最坏情形（短名 "<>c"）有 456 个候选、
+    # 序列化后 88 KB —— 直接把全部塞进错误返回会白白吃掉 Agent 的上下文，
+    # 而它需要的只是「够看出该补什么限定」的前若干条。
+    _CAND_CAP = 30
+
     def _type_ambiguous(
-        self, name: str, ids: list[int], assembly: str, label: str = "owner"
+        self, name: str, ids: list[int], assembly: str, label: str = "owner",
+        verify: bool = True,
     ) -> dict[str, Any]:
-        """类名命中多个类型：拒绝，并把候选摆出来（参照 hook_method 的做法）。"""
+        """类名命中多个类型：拒绝，并把候选摆出来（参照 hook_method 的做法）。
+
+        拒绝必须**可操作**，否则等于把难题丢回给调用方。这里踩过三个坑，
+        都是实测出来的，不是推测：
+
+        1) hint 曾建议 `full_name="State"` —— 而这正是调用方**刚刚传进来**
+           的那个歧义串，照做只会再报一次同样的错。实测 131 个候选的
+           `State` 全部回传 `full_name="State"` 仍然歧义。
+           真正能唯一定位的是 `nested_name`（限定名，如
+           `TeamTapas.ProjectR.UI2.RUI_FloatingUI.State`），实测 131/131、
+           54/54、31/31 都唯一，回传即可命中。
+        2) hint 曾无条件建议 `assembly=` —— 但当所有候选都在**同一个映像**里时
+           这毫无用处（实测 `UxmlTraits` 的 54 个候选全在
+           UnityEngine.UIElementsModule.dll）。那种情况下必须说清
+           「assembly 帮不上忙」，否则调用方会反复试。
+        3) 候选列表曾无上限（456 个 / 88 KB）。
+
+        为了不给出「看起来像建议、实际没用」的 hint，这里**实际验证**过：
+        按顺序拿候选的 `nested_name` 回灌解析器，取第一个真能唯一定位的
+        作为建议值。宁可多花一两次索引查询，也不给空头支票。
+        """
         cands = []
         for r in self.conn.execute(
             f"SELECT idx, nested_name, full_name, name, image, field_count, "
@@ -768,19 +798,73 @@ class Index:
                 "method_count": r["method_count"],
             })
         cands.sort(key=lambda c: (c["image"] or "", c["nested_name"] or ""))
-        why = ("（已按 assembly 过滤，但仍不唯一）" if assembly else
-               "（多半是不同程序集里有同名类）")
-        best = cands[0]
-        return {
-            "error": f"{label}={name!r} 命中 {len(cands)} 个类{why}，"
-                     f"无法确定你要哪一个。请改用完整类名，或用 assembly 参数消歧。",
+        total = len(cands)
+        shown = cands[: self._CAND_CAP]
+
+        # assembly 是否真能消歧：只有当候选分散在**多个**映像里才有用
+        images = {c["image"] for c in cands}
+        asm_useful = len(images) > 1
+
+        # 找一个**验证过**能唯一定位的 nested_name 当建议（通常第 1 个就成）。
+        # nested_name 实测在绝大多数情况下唯一（IL2CPP 20,072 类型里只有 89 个
+        # 重复），但既然它**可能**不唯一，就不能想当然 —— 这里真的回灌解析器
+        # 验一遍，取第一个真能唯一定位的。verify=False 时跳过（防递归）。
+        usable = ""
+        if verify:
+            for c in cands[:5]:
+                nn = c.get("nested_name") or ""
+                if not nn:
+                    continue
+                resolved, err2 = self._match_type_ids(nn, _probe=False)
+                if not err2 and len(resolved) == 1:
+                    usable = nn
+                    break
+
+        # 成因描述必须与事实一致：曾无条件写「多半是不同程序集里有同名类」，
+        # 但实测 `UxmlTraits` 的 54 个候选全在同一个映像里（都是
+        # UnityEngine.UIElements 的嵌套类），那句话是错的 —— 而错误的成因
+        # 会把调用方引向错误的排查方向（去试 assembly=，越试越迷惑）。
+        if len(images) > 1:
+            why = (f"（分散在 {len(images)} 个程序集里）" if not assembly
+                   else "(已按 assembly 过滤，但仍不唯一)")
+        else:
+            why = (f"（都在同一个程序集 {sorted(images)[0]!r} 里，"
+                   f"是嵌套/同名类型）")
+        if usable:
+            # nested_name 能唯一定位，那就直接给出可照抄的调用
+            how = f'{label}="{usable}" 可直接定位到其中一个。'
+            if not asm_useful:
+                # 顺手掐掉一个可预见的弯路：调用方看到「同名类」很容易先试
+                # assembly=，但这里候选全在同一映像，试了只会再失败一次。
+                how += (f'（这些候选都在同一个程序集 '
+                        f'{sorted(images)[0]!r} 里，assembly 参数帮不上忙）')
+        elif asm_useful:
+            how = (f'候选分散在 {len(images)} 个映像里，'
+                   f'可用 {label}="<完整类名>" 或 {label}="{name}", '
+                   f'assembly="<下列某一程序集>" 消歧。')
+        else:
+            # 同映像内同名：assembly 完全帮不上忙，必须说明，否则调用方白试
+            how = (f'注意：这些候选都在同一个程序集 {sorted(images)[0]!r} 里，'
+                   f'assembly 参数**帮不上忙**，请改用上面候选的 nested_name。')
+        out: dict[str, Any] = {
+            "error": f"{label}={name!r} 命中 {total} 个类{why}，"
+                     f"无法确定你要哪一个。{how}",
             "total": 0,
             "items": [],
-            "candidates": cands,
-            "hint": f'{label}="{best["full_name"]}"'
-                    + (f' 或 {label}="{name}", assembly="{assembly}"' if assembly
-                       else f' 或 {label}="{name}", assembly="{best["image"]}"'),
+            "candidates": shown,
+            "candidate_count": total,
+            "assembly_helps": asm_useful,
         }
+        if total > len(shown):
+            out["candidates_truncated"] = True
+            out["candidates_note"] = (
+                f"候选共 {total} 个，此处只列前 {len(shown)} 个"
+                f"（避免错误返回体积过大）；用 search_classes(pattern=..., "
+                f"subtype_of=...) 可自行缩小范围。"
+            )
+        if usable:
+            out["hint"] = f'{label}="{usable}"'
+        return out
 
     def _paged(
         self, kind: str, total: int, items: list[dict[str, Any]],
