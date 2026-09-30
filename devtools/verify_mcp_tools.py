@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ import samples  # noqa: E402
 samples.add_src_to_path()
 
 from gamemod_mcp import server as S  # noqa: E402
+from gamemod_mcp.engine import state  # noqa: E402
 
 # 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
 _GAME = samples.find_il2cpp()
@@ -125,6 +127,10 @@ print(f"     类型={idx_info.get('type_count')} 方法={idx_info.get('method_co
 check("类型数为 20072", idx_info.get("type_count") == 20072,
       f"实际={idx_info.get('type_count')}")
 
+# 直接连索引库，供「total 是否真实」这类断言拿**独立于被测代码**的真值。
+# 走 COUNT(*) 而不是再调一次被测工具 —— 拿被测实现当真值等于没验证。
+_idx_conn = sqlite3.connect(str(state.state().index.db_path))
+
 # ================================================================ 4. 搜索
 show("4. search_classes —— 搜索类")
 sc = S.search_classes(pattern="UserData_Service")
@@ -167,6 +173,111 @@ check("list_images pattern 无命中时如实返回 0",
       li_none.get("ok") and li_none.get("total") == 0
       and not (li_none.get("items") or []),
       f"total={li_none.get('total')}")
+
+# ---- search_fields / search_methods：total 真值、offset 翻页、owner 消歧 ----
+# 这三项都是本轮修复的真实缺陷，断言要点是「对得上真值」，不是「没报错」。
+# 真值直接来自索引库的 COUNT(*)，是独立于工具实现的一条路径。
+show("4b. search_fields / search_methods —— total 真值 + 翻页 + owner 消歧")
+
+_tp = "a"   # 用极泛的模式把结果数顶到句柄上限之上
+
+
+def _truth(table: str, pat: str) -> int:
+    """直接用 SQL 算真值（绕开被测代码）。"""
+    row = _idx_conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE name LIKE ?", (f"%{pat}%",)).fetchone()
+    return row[0]
+
+
+for _tab, _fn, _label in (("fields", S.search_fields, "search_fields"),
+                          ("methods", S.search_methods, "search_methods")):
+    _truth_n = _truth(_tab, _tp)
+    _r = _fn(pattern=_tp, limit=5)
+    print(f"     {_label}({_tp!r}): total={_r.get('total')} 真值={_truth_n} "
+          f"returned={_r.get('returned')} has_more={_r.get('has_more')}")
+    check(f"{_label} 的 total 是真实总数（不是被 LIMIT 截断的值）",
+          _r.get("total") == _truth_n,
+          f"工具={_r.get('total')} 真值={_truth_n}")
+    check(f"{_label} 返回了 returned/offset/limit/has_more",
+          all(k in _r for k in ("returned", "offset", "limit", "has_more")))
+    check(f"{_label} 结果远多于 limit 时 has_more 必须为 True",
+          _r.get("has_more") is True, f"has_more={_r.get('has_more')}")
+
+# total 超过句柄上限时要如实标注（句柄存不下全集，但不能装作存下了）
+_big = S.search_fields(pattern=_tp, limit=5)
+if (_big.get("total") or 0) > 20000:
+    check("总数超过句柄上限时如实标注 handle_truncated",
+          _big.get("handle_truncated") is True and bool(_big.get("handle_note")),
+          f"handle_truncated={_big.get('handle_truncated')}")
+
+# offset 必须真的生效：两页不能有重叠，且合起来是前 2*limit 条
+_p1 = S.search_fields(pattern=_tp, offset=0, limit=10)
+_p2 = S.search_fields(pattern=_tp, offset=10, limit=10)
+_i1 = [i["index"] for i in _p1.get("items") or []]
+_i2 = [i["index"] for i in _p2.get("items") or []]
+print(f"     offset 翻页: 第1页 {len(_i1)} 条 / 第2页 {len(_i2)} 条, 重叠="
+      f"{len(set(_i1) & set(_i2))}")
+check("offset 生效（两页无重叠）", not (set(_i1) & set(_i2)),
+      f"交集={sorted(set(_i1) & set(_i2))[:3]}")
+check("第二页返回的 offset 被如实回显", _p2.get("offset") == 10,
+      f"offset={_p2.get('offset')}")
+
+# 小结果集不该出现 has_more=True（假截断）
+_small = S.search_fields(pattern="Effect", limit=2000)
+check("小结果集 has_more 为 False（不假报截断）",
+      _small.get("has_more") is False,
+      f"total={_small.get('total')} returned={_small.get('returned')} "
+      f"has_more={_small.get('has_more')}")
+
+# owner 命中多个同名类时必须拒绝。
+# 这是本轮修的核心缺陷：原来会把两个无关类（跨程序集）的字段合并返回，
+# ok 仍是 true，Agent 据此算偏移必然错。
+_amb = S.search_fields(pattern="a", owner="UserData")
+print(f"     owner='UserData'（同名类跨程序集）: ok={_amb.get('ok')} "
+      f"candidates={len(_amb.get('candidates') or [])}")
+check("owner 命中多个同名类时拒绝，不再静默合并",
+      _amb.get("ok") is False and len(_amb.get("candidates") or []) > 1,
+      f"ok={_amb.get('ok')} candidates={len(_amb.get('candidates') or [])}")
+if _amb.get("ok") is False:
+    check("拒绝时把候选类摆出来（含程序集，便于消歧）",
+          all(c.get("image") for c in _amb.get("candidates") or []),
+          f"{[c.get('image') for c in (_amb.get('candidates') or [])]}")
+    check("拒绝时给出可操作的 hint",
+          bool(_amb.get("hint")), f"{( _amb.get('hint') or '')[:60]}")
+
+# 用 assembly 消歧后必须成功，且**只**返回那个类的字段
+_dis = S.search_fields(pattern="a", owner="UserData", assembly="TeamTapas", limit=50)
+_seen = sorted({i.get("owner") for i in _dis.get("items") or []})
+print(f"     + assembly='TeamTapas': ok={_dis.get('ok')} total={_dis.get('total')} "
+      f"类={_seen}")
+check("用 assembly 消歧后成功", _dis.get("ok") is True, _dis.get("error", ""))
+check("消歧后只返回一个类的字段（不再混入同名类）",
+      len(_seen) == 1 and "TeamTapas" in (_seen[0] or ""),
+      f"实际涉及 {len(_seen)} 个类：{_seen}")
+
+# 指定了错误的 assembly → 必须报错，不能退回返回那个不属于它的类
+_wrong = S.search_fields(pattern="a", owner="UserData", assembly="绝对不存在的程序集")
+check("assembly 与 owner 不匹配时报错（不静默返回无关类）",
+      _wrong.get("ok") is False, f"ok={_wrong.get('ok')} total={_wrong.get('total')}")
+
+# 完整类名（无歧义）直接成功，且字段确实属于那个类
+_full = S.search_fields(pattern="actorData",
+                        owner="TeamTapas.ProjectR.UserDatas.UserData", limit=20)
+check("完整类名可直接定位（无歧义路径）",
+      _full.get("ok") is True and (_full.get("total") or 0) >= 1,
+      f"total={_full.get('total')}")
+check("命中字段的 owner 与请求的类一致",
+      all(i.get("owner") == "TeamTapas.ProjectR.UserDatas.UserData"
+          for i in _full.get("items") or []),
+      f"{sorted({i.get('owner') for i in _full.get('items') or []})}")
+
+# 不存在的类仍要明确报错
+_nc = S.search_fields(pattern="a", owner="这个类不存在Xyz")
+check("owner 指向不存在的类时报错", _nc.get("ok") is False,
+      str(_nc.get("error"))[:70])
+check("报错信息里带上请求的类名（可读性）",
+      "这个类不存在Xyz" in str(_nc.get("error")),
+      str(_nc.get("error"))[:70])
 
 # ================================================================ 5. 类详情
 show("5. class_detail —— 字段/方法/继承链")

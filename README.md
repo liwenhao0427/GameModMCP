@@ -127,8 +127,8 @@ Agent 会自动：
 |---|---|
 | `search_classes` | 搜类/结构/枚举，支持按基类与程序集过滤 |
 | `class_detail` | 类的字段、方法、参数、继承链；给 `method_name` 可只看某方法的重载 |
-| `search_fields` | 按字段名搜（定位「金币」「血量」这类目标） |
-| `search_methods` | 按方法名搜，返回 token |
+| `search_fields` | 按字段名搜（定位「金币」「血量」这类目标）。`total` 是真实匹配总数，配合 `offset`/`limit` 翻页。`owner` 限定单个类，同名类跨程序集时会**拒绝并给候选**，可用 `assembly=` 消歧 |
+| `search_methods` | 按方法名搜，返回 token。`owner` 语义与 `search_fields` 一致 |
 | `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类） |
 | `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
 | `analyze_dependency` | 类型依赖概览（近似，非精确调用图） |

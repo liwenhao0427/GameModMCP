@@ -636,30 +636,163 @@ class Index:
             "owner": row["owner"],
         }
 
+    # 句柄里最多留多少条。超过这个数就不再往句柄里堆，但 `total` 仍然是**真实总数**
+    # （见下面 _paged 的说明）——「句柄不全」必须如实标注，不能悄悄截断。
+    _HANDLE_CAP = 20000
+
+    def _resolve_owner(
+        self, owner: str, assembly: str = ""
+    ) -> tuple[list[int], dict[str, Any] | None]:
+        """把 owner 解析成**唯一**一个类型，必要时按 assembly 消歧。
+
+        返回 `(类型 idx 列表, 错误)`；成功时列表恰好一个元素。
+
+        为什么必须唯一（历史教训）：早期实现是
+        `SELECT idx FROM types WHERE nested_name=? OR full_name=? OR name=?`，
+        然后把**所有**命中的类型当同一个类来处理：
+
+            owner="UserData" → 命中 2 个类型
+                UserData                              [Unity.InputSystem.dll]
+                TeamTapas.ProjectR.UserDatas.UserData [TeamTapas.ProjectR.dll]
+
+        工具照样返回 `ok: true`，把 Unity 的字段和游戏自己的字段**混在一起**。
+        Agent 以为拿到的是「UserData 这个类的字段」，据此算偏移必然错，
+        而且错误要到运行时才暴露。所以命中多个时**拒绝并给出候选**，
+        让调用方补 `assembly` 消歧，而不是替它猜。
+
+        为什么必须把「全名」与「短名」两种匹配**合并**后再判歧义：
+        没有命名空间的类型，其 `full_name` **就等于**短名
+        （实测 `UserData` 的 `full_name` 就是 `"UserData"`）。
+        若先单独试全名匹配，会「恰好命中一个」而看不出歧义，
+        于是静默选中了 Unity 那个 —— 比原来的 bug 更隐蔽。
+        合并后：全名匹配 {Unity} ∪ 短名匹配 {Unity, 团队那个} = 2 个 → 正确判为歧义。
+        """
+        def _ids(where: str, *args: Any) -> list[int]:
+            return [r["idx"] for r in self.conn.execute(
+                f"SELECT DISTINCT idx FROM types WHERE {where}", args)]
+
+        # 全名/嵌套全名匹配 + 短名匹配，取并集（保持稳定顺序）
+        cand = _ids("nested_name = ? OR full_name = ?", owner, owner)
+        for i in _ids("name = ?", owner):
+            if i not in cand:
+                cand.append(i)
+
+        # assembly 过滤必须在判歧义**之前**做：它是调用方给的消歧依据。
+        # 注意不能因为 len==1 就跳过 —— 那样「指定了错误的 assembly」
+        # 会静默返回那个不属于该程序集的类（实测：assembly="TeamTapas"
+        # 却返回了 Unity 的 UserData）。
+        if assembly and cand:
+            ph = ",".join("?" * len(cand))
+            keep = {r["idx"] for r in self.conn.execute(
+                f"SELECT idx FROM types WHERE idx IN ({ph}) AND image LIKE ?",
+                (*cand, f"%{assembly}%"))}
+            cand = [i for i in cand if i in keep]
+
+        if not cand:
+            if assembly:
+                return [], {"error": f"未找到类：{owner}（在程序集 "
+                                     f"{assembly!r} 里不存在，请检查拼写或去掉 assembly）",
+                            "total": 0, "items": []}
+            return [], {"error": f"未找到类：{owner}"
+                                 f"（请用 class_detail/search_classes 确认完整类名）",
+                        "total": 0, "items": []}
+
+        if len(cand) > 1:
+            return [], self._owner_ambiguous(owner, cand, assembly)
+        return cand, None
+
+    def _owner_ambiguous(
+        self, owner: str, ids: list[int], assembly: str
+    ) -> dict[str, Any]:
+        """owner 命中多个类型：拒绝，并把候选摆出来（参照 hook_method 的做法）。"""
+        cands = []
+        for r in self.conn.execute(
+            f"SELECT idx, nested_name, full_name, name, image, field_count, "
+            f"method_count FROM types WHERE idx IN ({','.join('?' * len(ids))})",
+            tuple(ids),
+        ):
+            cands.append({
+                "index": r["idx"],
+                "full_name": r["full_name"],
+                "nested_name": r["nested_name"],
+                "name": r["name"],
+                "image": r["image"],
+                "field_count": r["field_count"],
+                "method_count": r["method_count"],
+            })
+        cands.sort(key=lambda c: (c["image"] or "", c["nested_name"] or ""))
+        why = ("（已按 assembly 过滤，但仍不唯一）" if assembly else
+               "（多半是不同程序集里有同名类）")
+        return {
+            "error": f"owner={owner!r} 命中 {len(cands)} 个类{why}，"
+                     f"无法确定你要哪一个。请改用完整类名，或用 assembly 参数消歧。",
+            "total": 0,
+            "items": [],
+            "candidates": cands,
+            "hint": "owner=\"TeamTapas.ProjectR.UserDatas.UserData\""
+                    " 或 owner=\"UserData\", assembly=\"TeamTapas\"",
+        }
+
+    def _paged(
+        self, kind: str, total: int, items: list[dict[str, Any]],
+        offset: int, limit: int, handle_truncated: bool, **extra: Any
+    ) -> dict[str, Any]:
+        """组装统一的分页返回（`total` 是真值，`has_more` 如实标注）。
+
+        关键：`total` 由调用方用 `COUNT(*)` 算出来，**不是** `len(items)`。
+        早期实现在 SQL 里写死 `LIMIT 20000` 再令 `total = len(items)`，
+        于是「'a' 命中 49286 个字段」被报成 20000（实测），
+        而且是**静默**的：Agent 会以为全局只有 2 万个匹配，据此判断覆盖率。
+        """
+        limit = max(1, min(limit, 2000))
+        offset = max(0, offset)
+        page = items[offset : offset + limit]
+        out = {
+            "handle": self.results.put(kind, items).handle,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "has_more": offset + len(page) < total,
+            "items": page,
+        }
+        if handle_truncated:
+            out["handle_truncated"] = True
+            out["handle_note"] = (
+                f"匹配数 {total} 超过句柄上限 {self._HANDLE_CAP}，"
+                f"句柄只保留了前 {len(items)} 条；翻页请用本工具的 offset/limit，"
+                f"不要依赖 read_query_result 拿到全集。"
+            )
+        out.update(extra)
+        return out
+
     def search_fields(
-        self, pattern: str, offset: int = 0, limit: int = 50, owner: str = ""
+        self, pattern: str, offset: int = 0, limit: int = 50, owner: str = "",
+        assembly: str = "",
     ) -> dict[str, Any]:
         """按字段名搜索（大小写不敏感）。
 
-        owner 非空时只保留属于该类（含嵌套名/短名匹配）的字段。
-        很多字段名（如 value、data、count）在几万个类里重复，
-        不给 owner 会淹没在噪声里。
+        owner 非空时只保留属于**某一个**类的字段，该类由 owner 唯一确定：
+        先按完整名/嵌套全名匹配，再退到短名；命中多个则拒绝并给候选
+        （可用 assembly 消歧）。很多字段名（如 value、data、count）在几万个
+        类里重复，不给 owner 会淹没在噪声里。
         """
-        sql = "SELECT * FROM fields WHERE name LIKE ?"
+        where = "name LIKE ?"
         params: list[Any] = [f"%{pattern}%"]
         if owner:
-            owners = [r["idx"] for r in self.conn.execute(
-                "SELECT idx FROM types WHERE nested_name = ? OR full_name = ? "
-                "OR name = ?", (owner, owner, owner),
-            )]
-            if not owners:
-                # 归属类不存在：明确报错，不要退化成「搜全部」
-                return {"error": f"未找到类：{owner}", "total": 0, "items": []}
-            sql += f" AND owner IN ({','.join('?' * len(owners))})"
+            owners, bad = self._resolve_owner(owner, assembly)
+            if bad:
+                return bad
+            where += f" AND owner IN ({','.join('?' * len(owners))})"
             params.extend(owners)
-        sql += " ORDER BY name LIMIT 20000"
 
-        rows = list(self.conn.execute(sql, params))
+        # total 走 COUNT(*) 拿真值；items 才受句柄上限约束
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM fields WHERE {where}", params).fetchone()[0]
+        rows = list(self.conn.execute(
+            f"SELECT * FROM fields WHERE {where} ORDER BY name LIMIT ?",
+            (*params, self._HANDLE_CAP)))
+
         items = []
         for r in rows:
             dt = adapt.resolve_field(self.meta, r["type_index"])
@@ -678,41 +811,33 @@ class Index:
                     "type_index": r["type_index"],
                 }
             )
-        qr = self.results.put("fields", items)
-        total = len(items)
-        limit = max(1, min(limit, 2000))
-        offset = max(0, offset)
-        return {
-            "handle": qr.handle,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "returned": len(items[offset : offset + limit]),
-            "has_more": offset + limit < total,
-            "items": items[offset : offset + limit],
-        }
+        return self._paged("fields", total, items, offset, limit,
+                           total > len(items))
 
     def search_methods(
-        self, pattern: str, offset: int = 0, limit: int = 50, owner: str = ""
+        self, pattern: str, offset: int = 0, limit: int = 50, owner: str = "",
+        assembly: str = "",
     ) -> dict[str, Any]:
         """按方法名搜索（大小写不敏感）。
 
-        owner 非空时只保留属于该类的方法（如搜 Update 时限定 Player）。
+        owner 非空时只保留属于**某一个**类的方法，语义与 search_fields
+        完全一致（含「命中多个就拒绝」）。如搜 Update 时限定 Player。
         """
-        sql = "SELECT * FROM methods WHERE name LIKE ?"
+        where = "name LIKE ?"
         params: list[Any] = [f"%{pattern}%"]
         if owner:
-            owners = [r["idx"] for r in self.conn.execute(
-                "SELECT idx FROM types WHERE nested_name = ? OR full_name = ? "
-                "OR name = ?", (owner, owner, owner),
-            )]
-            if not owners:
-                return {"error": f"未找到类：{owner}", "total": 0, "items": []}
-            sql += f" AND owner IN ({','.join('?' * len(owners))})"
+            owners, bad = self._resolve_owner(owner, assembly)
+            if bad:
+                return bad
+            where += f" AND owner IN ({','.join('?' * len(owners))})"
             params.extend(owners)
-        sql += " ORDER BY name LIMIT 20000"
 
-        rows = list(self.conn.execute(sql, params))
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM methods WHERE {where}", params).fetchone()[0]
+        rows = list(self.conn.execute(
+            f"SELECT * FROM methods WHERE {where} ORDER BY name LIMIT ?",
+            (*params, self._HANDLE_CAP)))
+
         items = [
             {
                 "index": r["idx"],
@@ -726,19 +851,8 @@ class Index:
             }
             for r in rows
         ]
-        qr = self.results.put("methods", items)
-        total = len(items)
-        limit = max(1, min(limit, 2000))
-        offset = max(0, offset)
-        return {
-            "handle": qr.handle,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "returned": len(items[offset : offset + limit]),
-            "has_more": offset + limit < total,
-            "items": items[offset : offset + limit],
-        }
+        return self._paged("methods", total, items, offset, limit,
+                           total > len(items))
 
     def class_detail(self, full_name: str, include_inherited: bool = False) -> dict[str, Any]:
         """取一个类的完整信息：字段（含静态判定）、方法、基类链、接口、子类数。

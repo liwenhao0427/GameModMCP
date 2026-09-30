@@ -432,8 +432,10 @@ def class_detail(full_name: str, include_inherited: bool = False,
 @mcp.tool(annotations={"title": "搜索字段", "readOnlyHint": True})
 def search_fields(
     pattern: str,
+    offset: int = 0,
     limit: int = 100,
     owner: str = "",
+    assembly: str = "",
 ) -> dict:
     """按名字搜索字段，返回所属类与字段类型。
 
@@ -441,8 +443,19 @@ def search_fields(
 
     Args:
         pattern: 字段名子串（大小写不敏感）。
-        owner:   限定在某个类里搜（子串匹配）。
-        limit:   最多返回多少条。
+        offset:  跳过前多少条（配合 total / has_more 翻页）。
+        limit:   本页最多返回多少条（上限 2000）。
+        owner:   限定在某一个类里搜。接受完整类名或短名，但**短名必须唯一**：
+                 若命中多个同名类（常见于不同程序集），本工具会拒绝并返回
+                 candidates，此时请改用完整类名或用 assembly 消歧。
+                 为什么不猜：把两个无关类的字段混在一起返回，ok 仍是 true，
+                 但算出来的偏移必然错，且要到运行时才暴露。
+        assembly: 程序集名子串，仅用于在 owner 命中多个类时消歧。
+
+    Returns:
+        {ok, handle, total, offset, limit, returned, has_more, items}
+        `total` 是**真实匹配总数**；若超过句柄上限会带 handle_truncated
+        与 handle_note（翻页请用本工具的 offset，不要依赖句柄拿全集）。
     """
     idx, err = _need_index()
     if err:
@@ -450,10 +463,11 @@ def search_fields(
     if not pattern:
         return _err("必须提供 pattern")
     try:
-        res = idx.search_fields(pattern=pattern, limit=limit, owner=owner)
+        res = idx.search_fields(pattern=pattern, offset=offset, limit=limit,
+                                owner=owner, assembly=assembly)
     except Exception as exc:
         return _err(f"搜索失败：{exc}")
-    # 索引层在 owner 查不到时返回 {"error": ...} 而不是结果集；
+    # 索引层在 owner 查不到/有歧义时返回 {"error": ...} 而不是结果集；
     # 若直接 _ok(**res) 就会变成 ok=true + error=... 的假成功。
     if "error" in res:
         return _err(res["error"], **{k: v for k, v in res.items() if k != "error"})
@@ -463,15 +477,24 @@ def search_fields(
 @mcp.tool(annotations={"title": "搜索方法", "readOnlyHint": True})
 def search_methods(
     pattern: str,
+    offset: int = 0,
     limit: int = 100,
     owner: str = "",
+    assembly: str = "",
 ) -> dict:
     """按名字搜索方法，返回所属类、返回类型与 token。
 
     Args:
         pattern: 方法名子串（大小写不敏感）。
-        owner:   限定在某个类里搜（子串匹配）。
-        limit:   最多返回多少条。
+        offset:  跳过前多少条（配合 total / has_more 翻页）。
+        limit:   本页最多返回多少条（上限 2000）。
+        owner:   限定在某一个类里搜，语义与 search_fields 一致
+                 （短名必须唯一，否则拒绝并给 candidates）。
+        assembly: 程序集名子串，仅用于 owner 消歧。
+
+    Returns:
+        {ok, handle, total, offset, limit, returned, has_more, items}
+        `total` 是真实匹配总数。
     """
     idx, err = _need_index()
     if err:
@@ -479,7 +502,8 @@ def search_methods(
     if not pattern:
         return _err("必须提供 pattern")
     try:
-        res = idx.search_methods(pattern=pattern, limit=limit, owner=owner)
+        res = idx.search_methods(pattern=pattern, offset=offset, limit=limit,
+                                 owner=owner, assembly=assembly)
     except Exception as exc:
         return _err(f"搜索失败：{exc}")
     if "error" in res:
