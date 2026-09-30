@@ -392,8 +392,49 @@ def ensure_runtime(
                            RuntimeUnavailable, probe_available)
 
     with _state.lock:
+        # ---------------------------------------------------------- 已有会话
+        # 这里的判断很关键：早期实现是无条件 `if has_runtime(): return reused`，
+        # 于是 inject_process(pid=B) 在已有 pid=A 的会话时**静默返回 A**，
+        # launch_game() 也**永远不启动**（直接复用旧会话）。
+        # 显式指定的目标被忽略，是比报错更糟的失败——Agent 以为成功了。
+        #
+        # 现在的规则：
+        #   · 没指定目标            → 复用现有会话（这是「懒注入」的正常路径）
+        #   · 指定的 pid 就是当前会话 → 复用
+        #   · 指定了另一个 pid       → 切换：断开旧的，接上新的
+        #   · 要求 spawn 新进程      → 拒绝并说明，绝不静默起第二个游戏进程
         if _state.has_runtime():
-            return {"ok": True, "reused": True, **_state.summary()}
+            cur = _state.runtime
+            cur_pid = getattr(cur, "pid", 0)
+
+            if not pid and not (launcher_exe and spawn):
+                # 未指定目标：复用是正确的（Agent 通常只是想「确保有注入」）
+                return {"ok": True, "reused": True, **_state.summary()}
+
+            if launcher_exe and spawn:
+                # 已经有一个活着的会话，再 spawn 会起**第二个游戏进程**，
+                # 两个实例共享存档/配置，行为难以预料。拒绝，并给出出路。
+                return {
+                    "ok": False,
+                    "error": f"已有一个运行中的会话（pid={cur_pid}"
+                             f"{'，spawned' if getattr(cur, 'spawned', False) else ''}），"
+                             "拒绝再启动新进程。",
+                    "hint": "若确实要重新启动，先调用 close_session() 关闭当前会话，"
+                            "再调用 launch_game()。"
+                            "close_session 只卸载 Hook 并断开连接，不会结束游戏进程。",
+                    "current_pid": cur_pid,
+                }
+
+            if pid and pid == cur_pid:
+                return {"ok": True, "reused": True, **_state.summary()}
+
+            # 指定了另一个 pid：切换过去。
+            # close() 只 detach（卸载 Hook、断开连接），**不会杀掉进程**，
+            # 所以旧目标会恢复到未被修改的状态并继续运行。
+            old_pid = cur_pid
+            _state.close_runtime()
+            _state.note(f"目标变更（pid {old_pid} → {pid}），"
+                        f"已断开旧会话 pid={old_pid}（进程未被结束）")
 
         # launcher_exe：spawn 模式
         if launcher_exe and spawn:
@@ -484,8 +525,16 @@ def ensure_runtime(
 # ---------------------------------------------------------------- 环境探测
 
 
-def diagnostics() -> dict:
-    """汇总环境与依赖状态，供 Agent 判断能做什么、不能做什么。"""
+def diagnostics(scan_processes: bool = False) -> dict:
+    """汇总环境与依赖状态，供 Agent 判断能做什么、不能做什么。
+
+    Args:
+        scan_processes: 是否顺带扫本机正在运行的游戏。
+            默认 **False** —— 该扫描实测耗时 2.66 秒（枚举 460 个进程），
+            而它要回答的问题「有哪些游戏在跑」已经有专门的
+            `find_game_processes` 工具。诊断工具不该每次调用都付这笔钱，
+            也不该越界去做全机扫描（本 MCP 的运行上下文限定在游戏项目目录内）。
+    """
     from ..runtime import probe_available, frida_version
 
     probes = probe_available()
@@ -522,17 +571,23 @@ def diagnostics() -> dict:
         "session": _state.summary(),
     }
 
-    # 探测本机可用的游戏
-    try:
-        all_procs = discovery.find_processes(only_games=True)
-        info["running_games"] = [
-            {"pid": p.pid, "name": p.name, "runtime": p.runtime}
-            for p in all_procs[:20]
-        ]
-        info["running_game_count"] = len(all_procs)
-    except Exception as exc:
-        info["running_games"] = []
-        info["running_games_error"] = str(exc)
+    # 探测本机可用的游戏 —— 仅在显式要求时做（默认关闭，见 docstring）
+    if scan_processes:
+        try:
+            all_procs = discovery.find_processes(only_games=True)
+            info["running_games"] = [
+                {"pid": p.pid, "name": p.name, "runtime": p.runtime}
+                for p in all_procs[:20]
+            ]
+            info["running_game_count"] = len(all_procs)
+        except Exception as exc:
+            info["running_games"] = []
+            info["running_games_error"] = str(exc)
+    else:
+        info["running_games_skipped"] = (
+            "默认不扫本机进程（耗时约 2.7s）；要列运行中的游戏请用 "
+            "find_game_processes，或传 scan_processes=True"
+        )
 
     # 顺带报一下 PE 解析能力是否可用
     try:

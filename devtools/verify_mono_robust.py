@@ -6,14 +6,20 @@
 
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 import tempfile
 from pathlib import Path
 
 from gamemod_mcp.engine.mono_meta import Metadata, MetadataError
 
-ROOT = Path(r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP")
+ROOT = samples.ROOT
 
 results = []
 
@@ -35,10 +41,12 @@ def expect_error(label, fn):
 print("=" * 78)
 print("1. 编码检查（必须 UTF-8 无 BOM）")
 print("=" * 78)
+# 注：此处原先还检查 devtools\probe_mono_paramcount.py，
+# 但该文件在 git 历史里从未存在过（死引用会导致整个脚本 FileNotFoundError 崩掉），
+# 已移除。
 for rel in (
     r"src\gamemod_mcp\engine\mono_meta.py",
     r"devtools\verify_mono.py",
-    r"devtools\probe_mono_paramcount.py",
 ):
     p = ROOT / rel
     raw = p.read_bytes()
@@ -76,10 +84,20 @@ tmp2.write_bytes(b"MZ" + b"\x00" * 2 + b"garbage" * 50)
 expect_error("损坏的 PE（MZ 头后无有效 PE 签名）", lambda: Metadata(tmp2))
 
 # 2.4 真实的原生 DLL（IL2CPP 的 GameAssembly.dll）—— 非托管，应清晰拒绝
+# 样本位置由 samples.py 提供：优先用 IL2CPP 样本自带的 GameAssembly.dll，
+# 拿不到再退回在样本根目录下递归找任意一个。
 native = None
-for cand in sorted(Path(r"D:\Projects").rglob("GameAssembly.dll"))[:1]:
-    native = cand
+_il2cpp = samples.find_il2cpp()
+if _il2cpp is not None and (_il2cpp / "GameAssembly.dll").is_file():
+    native = _il2cpp / "GameAssembly.dll"
+else:
+    for _root in samples.SAMPLE_ROOTS:
+        hits = sorted(_root.rglob("GameAssembly.dll"))[:1]
+        if hits:
+            native = hits[0]
+            break
 if native is None:
+    samples.require(None, "任意一个 IL2CPP 的 GameAssembly.dll（原生非托管样本）")
     print("  [SKIP] 未找到 GameAssembly.dll，跳过「原生 DLL 应被拒绝」这一项")
 else:
     print(f"  （原生非托管样本：{native}，{native.stat().st_size:,} 字节）")
@@ -89,8 +107,14 @@ print()
 print("=" * 78)
 print("3. 截断真实程序集（文件被切断时应清晰失败）")
 print("=" * 78)
-real = Path(r"D:\Projects\Archon Soul\Archon Soul_Data\Managed\Assembly-CSharp.dll")
-if real.is_file():
+real = None
+_mono = samples.find_mono()
+if _mono is not None:
+    real = _mono / "Archon Soul_Data" / "Managed" / "Assembly-CSharp.dll"
+if real is None or not real.is_file():
+    samples.require(real, "Mono 程序集 Archon Soul（截断样本的真值来源）")
+    print("  [SKIP] 真实样本不存在")
+else:
     raw = real.read_bytes()
 
     # 先正常解析一次，**实测**元数据在文件里的真实结束位置，
@@ -122,8 +146,6 @@ if real.is_file():
     except Exception as exc:  # noqa: BLE001
         print(f"  [BAD]  元数据之后截断 -> 不该失败却失败: {type(exc).__name__}: {exc}")
         results.append(("元数据之后截断仍可解析", False))
-else:
-    print("  [SKIP] 真实样本不存在")
 
 print()
 print("=" * 78)

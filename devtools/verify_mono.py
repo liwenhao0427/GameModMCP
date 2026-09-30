@@ -25,7 +25,13 @@
 
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 import json
 import shutil
@@ -37,15 +43,26 @@ from gamemod_mcp.engine.mono_meta import Metadata, MetadataError, TABLE_NAMES
 
 # ---------------------------------------------------------------- 样本
 
+# 样本路径全部从 samples.py 取（根目录）+ 相对路径拼出来；取不到就是 None，
+# 由 main() 记为「无法验证」并跳过，不计入 FAIL。
+_ARCHON = samples.find_mono()
+_KINNY = samples.find_mono_multi()
+
+
+def _mono_dll(game: "Path | None", data_dir: str, dll: str):
+    """从样本根目录拼出托管程序集路径；样本缺失时返回 None。"""
+    return (game / f"{data_dir}_Data" / "Managed" / dll) if game else None
+
+
 SAMPLES = [
     (
         "Archon Soul",
-        Path(r"D:\Projects\Archon Soul\Archon Soul_Data\Managed\Assembly-CSharp.dll"),
+        _mono_dll(_ARCHON, "Archon Soul", "Assembly-CSharp.dll"),
         {"needle": "Player", "base": "UnityEngine.MonoBehaviour"},
     ),
     (
         "Kinny and the Cosmic Cauldron",
-        Path(r"D:\Projects\Kinny and the Cosmic Cauldron\Kinny and the Cosmic Cauldron_Data\Managed\Assembly-CSharp.dll"),
+        _mono_dll(_KINNY, "Kinny and the Cosmic Cauldron", "Assembly-CSharp.dll"),
         {"needle": "Player", "base": "UnityEngine.MonoBehaviour"},
     ),    # 第三个样本刻意选 mscorlib：它是基础类库，类型/方法/字段规模远大于游戏脚本，
     # 且含大量泛型、值类型、接口、P/Invoke，能把「表宽度 / coded index 宽度」
@@ -61,7 +78,7 @@ SAMPLES = [
     # 那是**断言设计错了**，不是解析错了。
     (
         "mscorlib (Archon Soul)",
-        Path(r"D:\Projects\Archon Soul\Archon Soul_Data\Managed\mscorlib.dll"),
+        _mono_dll(_ARCHON, "Archon Soul", "mscorlib.dll"),
         {"needle": "String", "base": "System.MulticastDelegate"},
     ),
 ]
@@ -635,10 +652,15 @@ def main() -> int:
     print(f"Python: {sys.version.split()[0]}")
     print(f"样本数: {len(SAMPLES)}")
 
-    found = [(n, p, pr) for n, p, pr in SAMPLES if p.is_file()]
-    missing = [(n, p) for n, p, _ in SAMPLES if not p.is_file()]
-    for n, p in missing:
-        print(f"  [缺失] {n}: {p}")
+    def _exists(p) -> bool:
+        """样本路径可用性判断；None（samples.py 没找到样本根）一律算缺失。"""
+        return p is not None and p.is_file()
+
+    found = [(n, p, pr) for n, p, pr in SAMPLES if _exists(p)]
+    for name, path, _pr in SAMPLES:
+        if not _exists(path):
+            # 样本拿不到 → 记为「无法验证」并跳过，不算失败
+            print(f"  [缺失] {name}: {path}（无法验证，跳过）")
 
     if not found:
         print()

@@ -16,7 +16,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# sys.path 与样本路径都由 samples.py 推导/集中定义，脚本自身不写绝对路径
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import samples                                            # noqa: E402
+samples.add_src_to_path()
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -24,21 +27,25 @@ except Exception:
 
 import gamemod_mcp.server as S              # noqa: E402
 
-# 两个已实测的真实 UE 样本
+# 两个已实测的真实 UE 样本：根目录从 samples.py 取，派生路径用相对路径拼出来
+_UE_V12 = samples.find_ue_pak_v12()
+_UE_V11 = samples.find_ue_pak_v11()
+_IL2CPP_GAME = samples.find_il2cpp()
+
 SAMPLES = [
     {
         "name": "CatapultHero",
-        "root": r"D:\Projects\CatapultHero",
-        "exe": r"D:\Projects\CatapultHero\CatapultHero\Binaries\Win64"
-               r"\CatapultHero-Win64-Shipping.exe",
+        "root": str(_UE_V12) if _UE_V12 else "",
+        "exe": str(_UE_V12 / "CatapultHero" / "Binaries" / "Win64"
+                   / "CatapultHero-Win64-Shipping.exe") if _UE_V12 else "",
         "pak_version": 12,
         "entry_kind": "pak",
     },
     {
         "name": "Dinoblade",
-        "root": r"D:\Projects\Dinoblade",
-        "exe": r"D:\Projects\Dinoblade\DinobladeGame\Binaries\Win64"
-               r"\DinobladeGame-Win64-Shipping.exe",
+        "root": str(_UE_V11) if _UE_V11 else "",
+        "exe": str(_UE_V11 / "DinobladeGame" / "Binaries" / "Win64"
+                   / "DinobladeGame-Win64-Shipping.exe") if _UE_V11 else "",
         "pak_version": 11,
         "entry_kind": "utoc",
     },
@@ -47,8 +54,14 @@ SAMPLES = [
 # 负例：必须被判定为非 UE
 NEGATIVES = [
     r"C:\Windows\System32\notepad.exe",
-    r"D:\Projects\Garden of Witches\Garden of Witches.exe",   # IL2CPP
+    # IL2CPP 样本（不可用时由下面的存在性判断跳过）
+    str(_IL2CPP_GAME / "Garden of Witches.exe") if _IL2CPP_GAME else "",
 ]
+
+# UE 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+samples.require(_UE_V12, "UE 样本 CatapultHero（pak v12）")
+samples.require(_UE_V11, "UE 样本 Dinoblade（pak v11）")
+samples.require(_IL2CPP_GAME, "IL2CPP 样本 Garden of Witches")
 
 PASS = 0
 FAIL = 0
@@ -299,8 +312,9 @@ check("在非 UE 目录找清单时如实报错", mf_bad.get("ok") is False,
 # ============================================================ 7. 与 IL2CPP 互不干扰
 section("7. UE 工具不应影响 IL2CPP/Mono 会话")
 
-IL2CPP_DIR = r"D:\Projects\Garden of Witches"
-if Path(IL2CPP_DIR).is_dir():
+IL2CPP_DIR = str(_IL2CPP_GAME) if _IL2CPP_GAME else ""
+_HAS_UE_V12 = _UE_V12 is not None and Path(str(_UE_V12)).is_dir()
+if IL2CPP_DIR and Path(IL2CPP_DIR).is_dir() and _HAS_UE_V12:
     op = S.open_game(game_dir=IL2CPP_DIR)
     check("IL2CPP 游戏仍能正常 open_game", op.get("ok") is True,
           str(op.get("error", ""))[:70])
@@ -311,7 +325,7 @@ if Path(IL2CPP_DIR).is_dir():
     S.close_session()
 
     # 反过来：先开 UE（不建索引），再确认 IL2CPP 不受影响
-    insp = S.inspect_game(r"D:\Projects\CatapultHero")
+    insp = S.inspect_game(str(_UE_V12))
     check("inspect_game 对 UE 目录识别正确",
           insp.get("engine") == "ue", f"engine={insp.get('engine')}")
     op2 = S.open_game(game_dir=IL2CPP_DIR)

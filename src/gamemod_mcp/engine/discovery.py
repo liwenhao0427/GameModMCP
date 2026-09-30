@@ -1,6 +1,10 @@
-"""游戏发现：进程枚举、Steam 库扫描、引擎自动识别。
+"""游戏发现：进程枚举与引擎自动识别。
 
 不依赖 psutil —— 用 ctypes 直接调 Win32 API，保证零第三方依赖。
+
+注：原先还有一套「扫 Steam 库列出本机装了哪些游戏」的逻辑，
+随 detect_games 工具一并移除了 —— 本 MCP 每次运行都限定在
+一个游戏项目目录内，全机扫描属于噪声能力。
 """
 
 from __future__ import annotations
@@ -9,7 +13,6 @@ import ctypes
 import ctypes.wintypes as wt
 import enum
 import os
-import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,36 +87,6 @@ class ProcessInfo:
     @property
     def image_name(self) -> str:
         return Path(self.exe_path).name if self.exe_path else self.name
-
-    def to_dict(self) -> dict:
-        return {
-            "pid": self.pid,
-            "name": self.name,
-            "exe": self.exe_path,
-            "runtime": self.runtime,
-            "is_64": self.is_64,
-            "window_title": self.window_title,
-        }
-
-
-@dataclass
-class GameInstall:
-    """一个已安装的游戏（来自 Steam / 自定义登记）。"""
-
-    name: str
-    exe: str
-    install_dir: str = ""
-    appid: str = ""
-    source: str = "custom"
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "exe": self.exe,
-            "install_dir": self.install_dir,
-            "appid": self.appid,
-            "source": self.source,
-        }
 
 
 # ---------------------------------------------------------------- 进程枚举
@@ -390,108 +363,6 @@ def find_processes(name_filter: str = "", only_games: bool = True) -> list[Proce
 
     # 有运行时的排前面，其次按名字
     out.sort(key=lambda p: (p.runtime == "unknown", p.name.lower()))
-    return out
-
-
-# ---------------------------------------------------------------- Steam 扫描
-
-
-STEAM_REG_PATHS = [
-    (r"SOFTWARE\Valve\Steam", "SteamPath"),
-    (r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
-]
-
-
-def steam_root() -> str:
-    """从注册表取 Steam 安装目录。"""
-    try:
-        import winreg
-    except ImportError:
-        return ""
-
-    for subkey, value in STEAM_REG_PATHS:
-        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-            try:
-                with winreg.OpenKey(hive, subkey) as key:
-                    path, _ = winreg.QueryValueEx(key, value)
-                    if path and Path(path).exists():
-                        return str(path)
-            except OSError:
-                continue
-    return ""
-
-
-def steam_libraries() -> list[Path]:
-    """列出所有 Steam 库目录（含外置库）。"""
-    root = steam_root()
-    if not root:
-        return []
-
-    libs: list[Path] = []
-    root_path = Path(root)
-    if (root_path / "steamapps").is_dir():
-        libs.append(root_path)
-
-    vdf = root_path / "steamapps" / "libraryfolders.vdf"
-    if not vdf.is_file():
-        vdf = root_path / "config" / "libraryfolders.vdf"
-
-    if vdf.is_file():
-        try:
-            text = vdf.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
-        # 匹配 "path"  "D:\\SteamLibrary"
-        for m in re.finditer(r'"path"\s*"([^"]+)"', text):
-            candidate = Path(m.group(1).replace("\\\\", "\\"))
-            if candidate.is_dir() and candidate not in libs:
-                libs.append(candidate)
-
-    return libs
-
-
-def list_steam_games(limit: int = 0) -> list[GameInstall]:
-    """枚举 Steam 库中已安装的游戏。"""
-    out: list[GameInstall] = []
-
-    for lib in steam_libraries():
-        steamapps = lib / "steamapps"
-        if not steamapps.is_dir():
-            continue
-
-        for acf in steamapps.glob("appmanifest_*.acf"):
-            try:
-                text = acf.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-
-            def field(key: str) -> str:
-                mm = re.search(rf'"{key}"\s*"([^"]*)"', text)
-                return mm.group(1) if mm else ""
-
-            appid = field("appid")
-            name = field("name")
-            installdir = field("installdir")
-            if not installdir:
-                continue
-
-            install_path = steamapps / "common" / installdir
-            if not install_path.is_dir():
-                continue
-
-            out.append(
-                GameInstall(
-                    name=name or installdir,
-                    exe="",
-                    install_dir=str(install_path),
-                    appid=appid,
-                    source="steam",
-                )
-            )
-            if limit and len(out) >= limit:
-                return out
-
-    out.sort(key=lambda g: g.name.lower())
     return out
 
 

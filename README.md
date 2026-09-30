@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，41 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，38 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -16,10 +16,13 @@
 
 | | 传统 CE 式 | GameMod MCP |
 |---|---|---|
-| 怎么找 "金币" | 反复搜内存值、改值、再筛 | 查元数据，直接拿到 `UserData.gold` 的**字段偏移** |
-| 怎么找函数 | AOB 特征码猜机器码 | 查元数据拿方法 **token**，运行时换算出**真实 RVA** |
+| 怎么找 "金币" | 反复搜内存值、改值、再筛 | 查元数据拿到 `UserData.gold` 的**字段名与类型**，注入后取它的**真实偏移** |
+| 怎么找函数 | AOB 特征码猜机器码 | 查元数据拿方法 **token**，注入后用 token 对账换算出**真实地址** |
 | 稳定性 | 游戏更新即失效 | 元数据变了才失效，且自动重建缓存 |
 | 靠猜吗 | 靠猜（试错） | 基本不靠猜（可枚举、可比对、可验证） |
+
+> 注意两侧的分工：**静态元数据没有字段偏移、也没有方法地址**（只有 token）。
+> 偏移与地址一律来自注入后的运行时探针，`token` 是把两侧对上的钥匙。
 
 具体做法是两段式：
 
@@ -80,7 +83,7 @@ Claude Code、Codex CLI、Cursor 以及任何标准 MCP 客户端。
 ### 3. 让 Agent 加载 skill
 
 把 [`skills/gamemod-mod/`](skills/gamemod-mod/SKILL.md) 放进你的 Agent 的
-skill 目录。它包含完整工作流、各引擎差异、6 个常用配方、以及一份
+skill 目录。它包含完整工作流、各引擎差异、7 个配方（含 Unreal 路线）、以及一份
 「查不到东西怎么办」的排查表——**这是让 Agent 少走弯路的关键**。
 
 ### 4. 开跑
@@ -100,12 +103,14 @@ Agent 会自动：
 
 ---
 
-## 工具一览（41 个）
+## 工具一览（38 个）
+
+> 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐：
+> 数量或名字对不上就会非零退出。改工具请同步这张表。
 
 ### 发现层
 | 工具 | 作用 |
 |---|---|
-| `detect_games` | 扫描本机已安装的游戏（Steam 库等） |
 | `find_game_processes` | 找正在运行的游戏进程 |
 | `inspect_game` | 探测游戏目录：引擎类型、主程序、关键文件 |
 | `inspect_binary` | 分析 PE 文件：架构、节区、导出/导入表、运行时类型 |
@@ -121,15 +126,13 @@ Agent 会自动：
 | 工具 | 作用 |
 |---|---|
 | `search_classes` | 搜类/结构/枚举，支持按基类与程序集过滤 |
-| `class_detail` | 类的字段、方法、参数、继承链 |
+| `class_detail` | 类的字段、方法、参数、继承链；给 `method_name` 可只看某方法的重载 |
 | `search_fields` | 按字段名搜（定位「金币」「血量」这类目标） |
 | `search_methods` | 按方法名搜，返回 token |
 | `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类） |
-| `find_derived_classes` | 所有继承自某类的类型（**找 MonoBehaviour 脚本的必备工具**） |
-| `find_monobehaviours` | 游戏自己写的 MonoBehaviour 脚本 |
+| `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**） |
 | `analyze_dependency` | 类型依赖概览（近似，非精确调用图） |
 | `list_images` | 列出所有程序集/映像 |
-| `get_method_source` | 方法的元数据形态（签名 + token + 参数表） |
 
 ### 结果句柄（大结果集翻页）
 | 工具 | 作用 |
@@ -156,7 +159,7 @@ Agent 会自动：
 | `find_hook_target` | 定位 Hook 落点并比对 token |
 | `hook_method` | 按类名+方法名装 Hook |
 | `hook_address` | 按绝对地址装 Hook |
-| `unhook` / `unhook_all` / `hook_status` | 卸载与查看 Hook |
+| `unhook` / `hook_status` | 卸载与查看 Hook（`unhook` 不带参数即卸载全部） |
 | `drain_events` | 取走捕获到的调用事件 |
 | `read_memory` / `write_memory` | 读写内存 |
 | `read_field_value` | 按字段偏移读值 |
@@ -167,7 +170,7 @@ Agent 会自动：
 ### 诊断
 | 工具 | 作用 |
 |---|---|
-| `get_diagnostics` | 环境自检：Frida、各解析器、缓存、运行中的游戏 |
+| `get_diagnostics` | 环境自检：Frida、各解析器、缓存（默认不扫本机进程，见 `scan_processes`） |
 
 ---
 
@@ -181,7 +184,7 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（41 个工具）
+│   ├── server.py                MCP 服务器（38 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
@@ -215,7 +218,7 @@ GameModMCP/
 | 静态查询类型 | ✅ 完整 | ✅ 完整 | ❌ 无类型系统可查 |
 | 字段类型精度 | ⚠️ 启发式（~90%） | ✅ 精确（ECMA-335 签名） | — |
 | 字段偏移 | 运行时取 | 运行时取 | ❌ 需运行时，未实现 |
-| 方法地址 | ✅ 运行时取 | ✅ 元数据含 RVA | — |
+| 方法地址 | 运行时取 | ⚠️ 元数据含 **IL 的 RVA**（不是机器码地址，需再算） | — |
 | 运行时 Hook | ✅ | ⚠️ 需 mono_* API | — |
 | **资源容器清单** | — | — | ✅ **pak/utoc 100% 准确** |
 | 可反编译出源码 | ❌（已转 C++） | ✅（ILSpy/dnSpy 接近源码） | ❌ |

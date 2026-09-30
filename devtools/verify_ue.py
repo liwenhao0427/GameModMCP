@@ -1,6 +1,12 @@
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 # stderr 同样统一成 UTF-8：否则在 cp936 控制台下，logutil 输出的中文会变成乱码
 # （logutil 的所有日志都走 stderr，这是它的设计约定）
@@ -19,8 +25,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
   - 绝不为了让输出好看而编造类名或偏移
 
 运行方式（务必用 python，不要用 python3）：
-    cd C:\\Users\\Administrator\\Documents\\deepseek-harness\\默认工作区\\GameModMCP
-    python devtools\\verify_ue.py 2>&1
+    在仓库根目录下执行：python devtools\\verify_ue.py 2>&1
 """
 
 import os
@@ -32,28 +37,42 @@ from gamemod_mcp.engine import ue
 
 # ---------------------------------------------------------------------------
 # 真实样本（实测存在的两个 UE 工程）
+#
+# 根目录从 samples.py 取，exe / manifest / pak / utoc / global_utoc 等派生路径
+# 一律用相对路径拼出来，脚本内不保留任何绝对路径。
 # ---------------------------------------------------------------------------
 
+_UE_V12 = samples.find_ue_pak_v12()
+_UE_V11 = samples.find_ue_pak_v11()
+
+
+def _ue_sample(name: str, root, project_dir: str, exe_name: str) -> dict:
+    """按 UE 工程的固定布局，从根目录拼出一个样本的全部路径。"""
+    if root is None:
+        return {"name": name, "exe": "", "root": "", "manifest": "",
+                "pak": "", "utoc": "", "global_utoc": ""}
+    paks = root / project_dir / "Content" / "Paks"
+    return {
+        "name": name,
+        "exe": str(root / project_dir / "Binaries" / "Win64" / exe_name),
+        "root": str(root),
+        "manifest": str(root / "Manifest_UFSFiles_Win64.txt"),
+        "pak": str(paks / f"{project_dir}-Windows.pak"),
+        "utoc": str(paks / f"{project_dir}-Windows.utoc"),
+        "global_utoc": str(paks / "global.utoc"),
+    }
+
+
 SAMPLES = [
-    {
-        "name": "CatapultHero",
-        "exe": r"D:\Projects\CatapultHero\CatapultHero\Binaries\Win64\CatapultHero-Win64-Shipping.exe",
-        "root": r"D:\Projects\CatapultHero",
-        "manifest": r"D:\Projects\CatapultHero\Manifest_UFSFiles_Win64.txt",
-        "pak": r"D:\Projects\CatapultHero\CatapultHero\Content\Paks\CatapultHero-Windows.pak",
-        "utoc": r"D:\Projects\CatapultHero\CatapultHero\Content\Paks\CatapultHero-Windows.utoc",
-        "global_utoc": r"D:\Projects\CatapultHero\CatapultHero\Content\Paks\global.utoc",
-    },
-    {
-        "name": "Dinoblade",
-        "exe": r"D:\Projects\Dinoblade\DinobladeGame\Binaries\Win64\DinobladeGame-Win64-Shipping.exe",
-        "root": r"D:\Projects\Dinoblade",
-        "manifest": r"D:\Projects\Dinoblade\Manifest_UFSFiles_Win64.txt",
-        "pak": r"D:\Projects\Dinoblade\DinobladeGame\Content\Paks\DinobladeGame-Windows.pak",
-        "utoc": r"D:\Projects\Dinoblade\DinobladeGame\Content\Paks\DinobladeGame-Windows.utoc",
-        "global_utoc": r"D:\Projects\Dinoblade\DinobladeGame\Content\Paks\global.utoc",
-    },
+    _ue_sample("CatapultHero", _UE_V12, "CatapultHero",
+               "CatapultHero-Win64-Shipping.exe"),
+    _ue_sample("Dinoblade", _UE_V11, "DinobladeGame",
+               "DinobladeGame-Win64-Shipping.exe"),
 ]
+
+# 样本不可用时记为「无法验证」并跳过（本脚本按样本逐个跳过，不算失败）
+samples.require(_UE_V12, "UE 样本 CatapultHero（pak v12）")
+samples.require(_UE_V11, "UE 样本 Dinoblade（pak v11）")
 
 # ---------------------------------------------------------------------------
 # 结果收集：脚本结束时统一分两节输出
@@ -211,8 +230,10 @@ def main() -> int:
 
     # 负例：必须能拒绝非 UE 程序，否则判定没有意义
     sub("负例检验 —— 非 UE 程序必须被拒绝")
-    for negative in [r"C:\Windows\System32\notepad.exe", r"D:\Projects\Dinoblade\DinobladeGame.exe"]:
-        if not os.path.isfile(negative):
+    # 第二个负例是样本根目录下的一个非 UE 可执行/目录名；样本缺失时自动为 None 被跳过
+    _neg2 = (str(_UE_V11) + "\\DinobladeGame.exe") if _UE_V11 else None
+    for negative in [r"C:\Windows\System32\notepad.exe", _neg2]:
+        if not negative or not os.path.isfile(negative):
             print(f"   {negative} —— 不存在，跳过")
             continue
         det = ue.detect_ue_game(negative)
@@ -481,11 +502,15 @@ def main() -> int:
     # 7. UE 配置读取
     # =====================================================================
     section("步骤 7：read_ue_config() —— UE 配置 / .ini 读取")
-    config_candidates = [
-        r"D:\Projects\CatapultHero\Engine\Config\StagedBuild_CatapultHero.ini",
-        r"D:\Projects\Dinoblade\Engine\Config\StagedBuild_DinobladeGame.ini",
-        r"D:\Projects\Dinoblade\Engine\Binaries\ThirdParty\Steamworks\Steamv157\Win64\steam_emu.ini",
-    ]
+    # 配置候选：根目录从 samples.py 拿到的 UE 样本推导，全部用相对路径拼
+    config_candidates = [_p for _p in [
+        str(_UE_V12 / "Engine" / "Config" / "StagedBuild_CatapultHero.ini")
+        if _UE_V12 else None,
+        str(_UE_V11 / "Engine" / "Config" / "StagedBuild_DinobladeGame.ini")
+        if _UE_V11 else None,
+        str(_UE_V11 / "Engine" / "Binaries" / "ThirdParty" / "Steamworks"
+            / "Steamv157" / "Win64" / "steam_emu.ini") if _UE_V11 else None,
+    ] if _p]
     for cfg in config_candidates:
         sub(os.path.basename(cfg))
         print(f"   路径     = {cfg}")
@@ -575,19 +600,26 @@ def main() -> int:
     # --- 9.1 .usmap ---
     sub("9.1 .usmap 解析 —— 样本中不存在")
     usmap_found: list[str] = []
-    for root in [r"D:\Projects\CatapultHero", r"D:\Projects\Dinoblade"]:
+    # 样本根目录来自 samples.py；样本缺失时该列表为空，等价于「没有样本可搜」
+    usmap_roots = [str(r) for r in (_UE_V12, _UE_V11) if r is not None]
+    for root in usmap_roots:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d != ".git"]
             for fname in filenames:
                 if fname.lower().endswith((".usmap", ".uproject", ".upluginmanifest")):
                     usmap_found.append(os.path.join(dirpath, fname))
-    print(f"   在 D:\\Projects\\CatapultHero 与 D:\\Projects\\Dinoblade 下递归搜索：")
+    print(f"   在 {' 与 '.join(usmap_roots) if usmap_roots else '(无可用样本根)'} 下递归搜索：")
     print(f"      *.usmap / *.uproject / *.upluginmanifest 共找到 {len(usmap_found)} 个")
     for path in usmap_found[:10]:
         print(f"      {path}")
-    probe = ue.parse_usmap(r"D:\Projects\CatapultHero\CatapultHero\Content\Paks\CatapultHero-Windows.pak")
-    print(f"   parse_usmap() 返回值：implemented={probe['implemented']}")
-    print(f"      原因：{probe['reason']}")
+    _probe_pak = next((s["pak"] for s in SAMPLES if s["pak"]
+                       and os.path.isfile(s["pak"])), None)
+    if _probe_pak is None:
+        print("   parse_usmap() 跳过：没有可用的 pak 样本")
+    else:
+        probe = ue.parse_usmap(_probe_pak)
+        print(f"   parse_usmap() 返回值：implemented={probe['implemented']}")
+        print(f"      原因：{probe['reason']}")
     mark_no(
         f".usmap 解析：**未实现** —— 两个样本所在目录下递归搜索 *.usmap 结果为 {len(usmap_found)} 个，"
         f"没有真实样本就无法验证 magic/版本枚举/压缩格式，因此拒绝照搬网上格式硬写"

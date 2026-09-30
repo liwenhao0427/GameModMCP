@@ -8,12 +8,27 @@
 #   5. 方法归属：对 dump 中全部顶层类做方法多重集比对（用铺满性质证明无偏移）
 import sys, io, re, collections
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 from gamemod_mcp.engine.il2cpp_meta import Metadata
 
-META = r"D:\Projects\Garden of Witches\Garden of Witches_Data\il2cpp_data\Metadata\global-metadata.dat"
-DUMP = r"D:\Projects\aiMod\dump\Garden of Witches.exe\il2cpp_dump.cs"
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_GAME = samples.find_il2cpp()
+META = (_GAME / "Garden of Witches_Data" / "il2cpp_data"
+        / "Metadata" / "global-metadata.dat") if _GAME else None
+DUMP = samples.find_il2cpp_dump()
+
+# 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+if not samples.require(META, "IL2CPP 元数据 Garden of Witches"):
+    sys.exit(0)
+if not samples.require(DUMP, "IL2CPP 真值 dump il2cpp_dump.cs"):
+    sys.exit(0)
 
 RE_TOP = re.compile(r"^(class|enum|interface)\s+(\S+?)\s*(?::\s*(.*))?$")
 RE_DECL = re.compile(r"^\s*/\*0x[0-9a-f]+\*/\s+(.*)\((.*)\)\s*;?\s*$")

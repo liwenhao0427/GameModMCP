@@ -162,6 +162,12 @@ def main() -> int:
     check("退出码为 0", code == 0, f"exit={code}")
     check("采用了指定信息", msg == "修复(runtime): ensure_runtime 早退导致指定 pid 被忽略", msg)
     check("信息文件已被删除", not (repo_msg / ".dsh-autocommit-msg").exists())
+    # 回归：提交信息文件绝不能出现在提交内容里
+    # （早期实现先 `git add -A` 再读信息文件，会把它自己提交进历史）
+    files_in_commit = git(repo_msg, "show", "--name-only", "--pretty=format:")
+    check("信息文件未混进本次提交",
+          ".dsh-autocommit-msg" not in files_in_commit,
+          files_in_commit.strip())
 
     # ---------------- 6. 删除文件也会被提交 ----------------
     show("6. 删除文件同样是变更 → 必须提交（用 git add -A 而非 add .）")

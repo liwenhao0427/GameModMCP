@@ -7,7 +7,13 @@
 
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 import inspect
 

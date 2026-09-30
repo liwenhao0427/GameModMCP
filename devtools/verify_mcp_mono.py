@@ -16,7 +16,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# sys.path 与样本路径都由 samples.py 推导/集中定义，脚本自身不写绝对路径
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import samples                                            # noqa: E402
+samples.add_src_to_path()
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -25,7 +28,9 @@ except Exception:
 import gamemod_mcp.server as S              # noqa: E402
 from gamemod_mcp.engine import state        # noqa: E402
 
-MONO_GAME = r"D:\Projects\Archon Soul"
+# 样本路径从 samples.py 取；取不到就记为「无法验证」并跳过（跳过不算失败）
+_MONO_GAME = samples.find_mono()
+MONO_GAME = str(_MONO_GAME) if _MONO_GAME else None
 MONO_ASM_NAME = "Assembly-CSharp.dll"
 
 PASS = 0
@@ -58,8 +63,8 @@ def section(t: str) -> None:
 # ============================================================ 1. 识别 Mono 游戏
 section("1. inspect_game —— 识别 Mono 引擎")
 
-game = Path(MONO_GAME)
-if not game.is_dir():
+game = Path(MONO_GAME) if MONO_GAME else None
+if not samples.require(MONO_GAME, "Mono 样本 Archon Soul") or not game.is_dir():
     print(f"  \u26a0\ufe0f  样本游戏不存在，跳过：{MONO_GAME}")
     sys.exit(0)
 

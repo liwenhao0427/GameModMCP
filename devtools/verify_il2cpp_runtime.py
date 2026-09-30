@@ -14,14 +14,28 @@
 #     起不来就如实报告「运行时未验证」，绝不伪造数字。
 import sys, io, os, json, time, subprocess, traceback
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 from gamemod_mcp.engine.il2cpp_meta import Metadata
 from gamemod_mcp.engine import discovery
 
-GAME_EXE = r"D:\Projects\Garden of Witches\Garden of Witches.exe"
-META = (r"D:\Projects\Garden of Witches\Garden of Witches_Data"
-        r"\il2cpp_data\Metadata\global-metadata.dat")
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_GAME = samples.find_il2cpp()
+GAME_EXE = (str(_GAME / "Garden of Witches.exe")) if _GAME else None
+META = (_GAME / "Garden of Witches_Data" / "il2cpp_data"
+        / "Metadata" / "global-metadata.dat") if _GAME else None
+
+# 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+if not samples.require(META, "IL2CPP 元数据 Garden of Witches"):
+    sys.exit(0)
+if not samples.require(GAME_EXE, "IL2CPP 游戏主程序 Garden of Witches.exe"):
+    sys.exit(0)
 
 # 拿静态元数据当「标准答案」
 print("=" * 78)

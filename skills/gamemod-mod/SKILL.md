@@ -7,7 +7,7 @@ description: 用 GameMod MCP 工具集做游戏 Mod：定位类/字段/方法、
 
 ## 先判断引擎——它决定你能做什么
 
-**动手前第一步永远是 `detect_games()` 或 `inspect_game(game_dir=...)`**，
+**动手前第一步永远是 `inspect_game(game_dir=...)`**，
 因为三件引擎的能力边界差别很大，走错路会白折腾很久：
 
 | 引擎 | 能查类型系统？ | 能查字段偏移？ | 主打能力 |
@@ -30,14 +30,25 @@ description: 用 GameMod MCP 工具集做游戏 Mod：定位类/字段/方法、
 
 | | 传统 CE 式做法 | 本工具集做法 |
 |---|---|---|
-| 怎么找 "金币" | 反复搜索内存值、改值、再筛 | 查元数据，直接找到 `UserData.gold` 的**字段偏移** |
-| 怎么找函数 | AOB 特征码猜机器码 | 查元数据拿方法 **token**，运行时换算出 **RVA** |
+| 怎么找 "金币" | 反复搜索内存值、改值、再筛 | 查元数据拿到 `UserData.gold` 的**字段名与类型**，注入后取它的**真实偏移** |
+| 怎么找函数 | AOB 特征码猜机器码 | 查元数据拿方法 **token**，注入后用 token 对账换算出**真实地址** |
 | 稳定性 | 游戏一更新就全废 | 元数据变了才失效，且能自动重新解析 |
 | 需要猜测吗 | 需要（试错） | 基本不需要（可枚举、可比对） |
 
 **所以：优先用 `search_classes` / `class_detail` 定位，`scan_pattern` 只是符号被剥离时的兜底。**
 
-### 为什么元数据能直接给出落点
+### 元数据能给出什么、不能给出什么
+
+⚠️ **最容易记反的一点**：静态元数据给出的是**类型系统**，不是内存落点。
+
+| 信息 | 静态元数据 | 注入后的运行时 |
+|---|---|---|
+| 类 / 字段 / 方法的**存在与签名** | ✅ 有 | ✅ 有 |
+| 方法的 **token** | ✅ 有 | ✅ 有 |
+| 字段的**字节偏移** | ❌ **没有** | ✅ `runtime_class_info` |
+| 方法的 **RVA / 绝对地址** | ❌ **没有** | ✅ `find_hook_target` |
+
+所以路径永远是：**静态拿名字与 token → 注入 → 运行时拿偏移与地址 → 用 token 对账**。
 
 游戏（IL2CPP/Mono）的元数据里保存了**完整的类型系统**：
 类型名、字段名、字段类型、方法名、方法签名、方法 token。
@@ -62,15 +73,18 @@ get_diagnostics()
 务必先看这个。它会告诉你：
 - Frida 装没装（没有的话**所有运行时工具都不能用**，只能做静态分析）
 - Mono / UE 解析器是否就绪
-- 本机有没有游戏在跑
+- 缓存目录在哪、当前会话状态
+
+> 它**默认不扫本机进程**（那一步实测要 2.7 秒，且与 `find_game_processes` 重复）。
+> 要列正在运行的游戏，直接调 `find_game_processes`。
 
 如果 `frida.installed = false`，就**不要**尝试 `inject_process`，直接告诉用户需要装 Frida。
 
 ### 第 1 步：找到游戏
 
 ```
-detect_games()                    # 扫 Steam 库
-inspect_game(game_dir="D:\\...")  # 非 Steam 安装用这个
+inspect_game(game_dir="D:\\...")   # 探测安装目录：引擎、主程序、关键文件
+find_game_processes()              # 游戏已经在跑时，用它拿 pid
 ```
 
 `inspect_game` 返回的 `engine` 字段决定后续路线：`il2cpp` / `mono` / `ue` / `unity`。
@@ -102,7 +116,8 @@ search_methods(pattern="AddCurrency")          # 直接搜方法名
 然后看细节：
 ```python
 class_detail("TeamTapas.ProjectR.UserDatas.Service.UserData_Service")
-# → fields: [{name, type, offset?}], methods: [{name, token, ...}], parent
+# → fields: [{name, type, type_confidence}], methods: [{name, token, ...}], parent
+# 注意 fields 里**没有 offset** —— 偏移要注入后从 runtime_class_info 取
 ```
 
 **关键**：静态元数据里的字段**没有偏移**（偏移是运行时才定的），方法**只有 token 没有地址**。
@@ -251,10 +266,12 @@ eval_script("""
 ### 配方 3：找所有每帧执行的更新逻辑
 
 ```python
-search_classes(subtype_of="UnityEngine.MonoBehaviour", limit=2000)
-# 再用 class_detail 看有没有 Update 方法
-search_methods(pattern="Update", owner="Player")
-find_monobehaviours(name_pattern="Manager")
+# 找游戏自己写的 MonoBehaviour 脚本（assembly 过滤掉 UnityEngine 等框架程序集）
+find_derived_classes(base_full_name="UnityEngine.MonoBehaviour",
+                     assembly="Assembly-CSharp", limit=500)
+# 再看具体某个类有没有 Update
+class_detail(full_name="Player", method_name="Update")
+search_methods(pattern="Update", owner="Manager")
 ```
 
 ### 配方 4：确认 Hook 落点是对的（重要）
@@ -272,7 +289,21 @@ runtime = find_hook_target(name="PresetLoaderV2", method="Update")
 ### 配方 5：处理重载方法
 
 同名不同参数的方法有不同 token。`find_hook_target` 返回的 `candidates` 里
-每项都有 `param_count`，**按参数个数选**，不要只看名字。
+每项都有 `param_count`，**先按参数个数认准你要的那个**：
+
+```python
+tgt = find_hook_target(name="PresetLoaderV2", method="Update")
+for c in tgt["candidates"]:
+    print(c["token"], c["param_count"], c["rva_hex"])
+```
+
+> ⚠️ **已知限制**：`hook_method` 目前**不支持指定重载** ——
+> 它在候选里取第一个「有原生地址且在模块内」的（`session.py` 的
+> `chosen = usable[0]`）。
+> 所以当目标方法有多个重载时，**不要**直接用 `hook_method`，
+> 而要用 `find_hook_target` 拿到**你要的那个候选的 `address`**，
+> 再用 `hook_address(address=...)` 挂钩。
+> 挂完务必比对返回里的 token 与静态查到的是否一致。
 
 ### 配方 6：大结果集翻页
 

@@ -2,11 +2,12 @@
 
 `verify_mcp_tools.py` 与 `verify_mcp_mono.py` 覆盖的是**主工作流**
 （发现 → 索引 → 查询 → 注入 → Hook）。本脚本补上主流程没有走到的
-9 个工具，让 36 个工具全部经过实际调用：
+工具，让所有工具都经过实际调用：
 
-    detect_games / find_game_processes / inspect_binary /
-    find_monobehaviours / get_method_source / inject_process /
+    find_game_processes / inspect_binary / inject_process /
     hook_address / read_field_value / gc_control
+    + 合并后能力的回归：find_derived_classes(assembly=) /
+      class_detail(method_name=)
 
 其中 inject_process / hook_address / read_field_value / gc_control
 需要一个真实运行中的游戏，所以本脚本会自己 spawn 一个（用 Garden of Witches），
@@ -15,12 +16,16 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# sys.path 与样本路径都由 samples.py 推导/集中定义，脚本自身不写绝对路径
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import samples                                            # noqa: E402
+samples.add_src_to_path()
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -28,12 +33,18 @@ except Exception:
 
 import gamemod_mcp.server as S              # noqa: E402
 
-GAME_DIR = r"D:\Projects\Garden of Witches"
-GAME_EXE = r"D:\Projects\Garden of Witches\Garden of Witches.exe"
-GAME_ASSEMBLY = (
-    r"D:\Projects\Garden of Witches\Garden of Witches_Data"
-    r"\il2cpp_data\Metadata\global-metadata.dat"
-)
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_GAME = samples.find_il2cpp()
+GAME_DIR = str(_GAME) if _GAME else None
+GAME_EXE = str(_GAME / "Garden of Witches.exe") if _GAME else None
+GAME_ASSEMBLY = (str(_GAME / "Garden of Witches_Data" / "il2cpp_data"
+                     / "Metadata" / "global-metadata.dat")) if _GAME else None
+
+# 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+HAVE_GAME = samples.require(GAME_DIR, "IL2CPP 样本 Garden of Witches")
+if HAVE_GAME and not os.path.isfile(GAME_EXE):
+    print(f"  ⚠️  无法验证：样本主程序不存在 —— {GAME_EXE}")
+    HAVE_GAME = False
 
 PASS = 0
 FAIL = 0
@@ -62,19 +73,18 @@ def section(t: str) -> None:
     print("=" * 78)
 
 
-# ============================================================ 1. 纯静态工具
-section("1. detect_games / find_game_processes —— 不依赖任何游戏")
+def have(path) -> bool:
+    """样本路径存在性判断；路径为 None（样本缺失）时返回 False。"""
+    return bool(path) and Path(path).is_file()
 
-dg = S.detect_games(limit=20)
-check("detect_games 返回 ok", dg.get("ok") is True, dg.get("error", ""))
-games = dg.get("games") or []
-print(f"     扫到 {len(games)} 个游戏（本机 Steam 库）")
-check("返回结构里带 games 列表", isinstance(games, list))
-if games:
-    g0 = games[0]
-    print(f"     样例: {g0.get('name')} @ {g0.get('install_dir')}")
-    check("游戏条目带 name 与 install_dir",
-          bool(g0.get("name")) and bool(g0.get("install_dir")))
+
+# ============================================================ 1. 纯静态工具
+section("1. find_game_processes —— 不依赖任何游戏")
+#
+# 注：detect_games 已移除。理由是本 MCP 的每次运行都限定在
+# 「游戏项目目录」这个上下文里，主动扫全机 Steam 库属于噪声工具，
+# 而且它的结果并不能直接驱动后续步骤（open_game 仍要显式给目录）。
+# 因此这里不再断言它存在。
 
 fg = S.find_game_processes()
 check("find_game_processes 返回 ok", fg.get("ok") is True, fg.get("error", ""))
@@ -94,7 +104,7 @@ if fg.get("processes"):
 
 section("2. inspect_binary —— PE 结构分析")
 
-if Path(GAME_EXE).is_file():
+if have(GAME_EXE):
     ib = S.inspect_binary(GAME_EXE)
     check("inspect_binary 返回 ok", ib.get("ok") is True, ib.get("error", ""))
     print(f"     架构: {ib.get('machine')}  运行时: {ib.get('runtime')}")
@@ -114,7 +124,7 @@ if Path(GAME_EXE).is_file():
 
     # GameAssembly.dll 才是 IL2CPP 的逻辑所在，它应当有大量导出
     ga = str(Path(GAME_EXE).parent / "GameAssembly.dll")
-    if Path(ga).is_file():
+    if have(ga):
         ib2 = S.inspect_binary(ga)
         check("inspect_binary 能读 GameAssembly.dll", ib2.get("ok") is True)
         print(f"     GameAssembly.dll: 导出数={ib2.get('export_count')} "
@@ -130,51 +140,76 @@ bad = S.inspect_binary(r"C:\这个文件根本不存在_xyz.exe")
 check("不存在的文件被拒绝", bad.get("ok") is False, bad.get("error", ""))
 
 
-section("3. find_monobehaviours / get_method_source —— 需要索引")
+section("3. find_derived_classes(assembly=) / class_detail(method_name=) —— 需要索引")
+#
+# find_monobehaviours 与 get_method_source 已合并进这两个工具：
+#   find_monobehaviours → find_derived_classes(base_full_name="UnityEngine.MonoBehaviour",
+#                                              assembly="Assembly-CSharp")
+#   get_method_source  → class_detail(full_name=..., method_name=...)
+# 合并的验收断言写成「旧能力仍然可达」，而不是简单删掉原断言。
 
-if not Path(GAME_ASSEMBLY).is_file():
+if not have(GAME_ASSEMBLY):
     print(f"  \u26a0\ufe0f  样本元数据不存在，跳过：{GAME_ASSEMBLY}")
 else:
     op = S.open_game(game_dir=GAME_DIR)
     check("open_game 成功", op.get("ok") is True, op.get("error", ""))
 
-    mb = S.find_monobehaviours(limit=20)
-    check("find_monobehaviours 返回 ok", mb.get("ok") is True, mb.get("error", ""))
-    print(f"     MonoBehaviour 脚本: {mb.get('total')}")
-    check("找到 MonoBehaviour 脚本", (mb.get("total") or 0) > 0,
-          f"{mb.get('total')}")
+    # 原 find_monobehaviours 的能力：找游戏自己写的 MonoBehaviour 脚本
+    mb = S.find_derived_classes(
+        base_full_name="UnityEngine.MonoBehaviour",
+        assembly="Assembly-CSharp", limit=5000)
+    check("find_derived_classes 返回 ok", mb.get("ok") is True, mb.get("error", ""))
+    print(f"     MonoBehaviour 脚本（限 Assembly-CSharp）: {mb.get('total')}")
+    check("找到 MonoBehaviour 脚本（原 find_monobehaviours 的能力）",
+          (mb.get("total") or 0) > 0, f"{mb.get('total')}")
     if mb.get("items"):
         print(f"     样例: {mb['items'][0].get('full_name')}")
+        check("每项都带 index（合并后新增的信息）",
+              all("index" in it for it in mb["items"]))
 
-    # 限定名字前缀
-    mbn = S.find_monobehaviours(name_pattern="Motion", limit=10)
-    print(f"     名字含 Motion 的脚本: {mbn.get('total')}")
-    check("find_monobehaviours 支持名字过滤",
-          mbn.get("ok") is True, mbn.get("error", ""))
+    # 不限程序集时结果只会更多，不会更少
+    mb_all = S.find_derived_classes(
+        base_full_name="UnityEngine.MonoBehaviour", limit=5000)
+    check("不限程序集得到的结果不少于过滤后",
+          (mb_all.get("total") or 0) >= (mb.get("total") or 0),
+          f"全部={mb_all.get('total')} vs 过滤={mb.get('total')}")
 
-    # get_method_source：拿方法的元数据形态
-    gms = S.get_method_source("TransformPingPongMotion", "Update")
-    check("get_method_source 返回 ok", gms.get("ok") is True,
+    # 原 get_method_source 的能力：按方法名取静态信息（token 等）
+    gms = S.class_detail(full_name="TransformPingPongMotion",
+                         method_name="Update")
+    check("class_detail(method_name=) 返回 ok", gms.get("ok") is True,
           str(gms.get("error", ""))[:80])
     if gms.get("ok"):
         print(f"     方法: {gms.get('method')}  "
               f"token={gms.get('token')}  重载数={gms.get('overload_count')}")
         check("返回里有 token（Hook 定位的关键）",
               bool(gms.get("token")), f"{gms.get('token')!r}")
+        check("返回里有 methods 列表", isinstance(gms.get("methods"), list))
 
-    # 不存在的方法必须报错
-    bad2 = S.get_method_source("TransformPingPongMotion", "这个方法不存在Xyz")
+    # 不存在的方法必须报错（原 get_method_source 的假否定防护）
+    bad2 = S.class_detail(full_name="TransformPingPongMotion",
+                          method_name="这个方法不存在Xyz")
     check("不存在的方法被拒绝", bad2.get("ok") is False, bad2.get("error", ""))
+    check("报错时给出可用方法名作为线索",
+          bool(bad2.get("available")),
+          f"{len(bad2.get('available') or [])} 个候选")
 
     # 不存在的类必须报错
-    bad3 = S.get_method_source("这个类不存在Xyz", "Whatever")
-    check("不存在的类被拒绝", bad3.get("ok") is False, bad3.get("error", ""))
+    bad3 = S.class_detail(full_name="这个类不存在Xyz", method_name="Whatever")
+    check("不存在的类被拒绝", bad3.get("ok") is False,
+          str(bad3.get("error", bad3))[:80])
+
+    # 不给 method_name 时仍返回完整类信息（原 class_detail 行为不变）
+    full = S.class_detail(full_name="TransformPingPongMotion")
+    check("不给 method_name 时返回完整类信息",
+          full.get("ok") is True and "fields" in full and "methods" in full,
+          f"字段={len(full.get('fields') or [])} 方法={len(full.get('methods') or [])}")
 
 
 # ============================================================ 4. 需要运行时的工具
 section("4. inject_process / hook_address / read_field_value / gc_control")
 
-if not Path(GAME_EXE).is_file():
+if not have(GAME_EXE):
     print(f"  \u26a0\ufe0f  游戏不存在，跳过运行时部分：{GAME_EXE}")
 else:
     # 先手动 spawn 一个进程（不注入），再走 inject_process 这条路 ——
@@ -439,7 +474,8 @@ section("补充覆盖验证汇总")
 print(f"  通过 {PASS} 项 / 失败 {FAIL} 项 / 警告 {WARN} 项")
 print()
 if FAIL == 0:
-    print("  \u2605 36 个工具全部经过实际调用。")
+    print("  \u2605 本脚本负责的工具全部经过实际调用"
+          "（含合并后能力的回归：find_derived_classes / class_detail）。")
 else:
     print(f"  \u26a0 有 {FAIL} 项失败。")
 

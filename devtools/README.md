@@ -6,7 +6,8 @@
 ## 一条命令跑全部
 
 ```powershell
-$env:PYTHONPATH = "$PWD\src"
+python devtools\samples.py             # ← 先看本机样本可用性（不跑测试）
+python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否一致（无需游戏）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_fieldtypes.py   # 字段类型解析率与精度
@@ -20,10 +21,39 @@ python devtools\verify_mcp_ue.py       # ← MCP 工具层端到端（UE，静�
 python devtools\verify_mcp_extra.py    # ← 补全工具覆盖（需游戏）
 python devtools\verify_il2cpp_runtime.py   # 静态↔运行时 token 交叉验证（需游戏）
 python devtools\verify_runtime.py          # 运行时层分组（需游戏）
+python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
+python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
+python devtools\verify_autocommit.py       # Stop hook 自动提交（临时仓库，无需游戏）
 ```
+
+不需要 `$env:PYTHONPATH`：每个脚本都通过 `samples.add_src_to_path()`
+从自身位置推导 `src`。
 
 带「需游戏」的会**真的启动游戏进程**并在结束时结束它，
 需要 Frida + 管理员权限，且本机要有对应样本。
+
+## 样本路径从哪来（不许硬编码）
+
+样本路径**只在 `devtools/samples.py` 里定义**，其他脚本一律调它的 `find_*`：
+
+| 访问器 | 样本 | 用于 |
+|---|---|---|
+| `find_il2cpp()` | Garden of Witches | IL2CPP（17 MB 元数据） |
+| `find_mono()` | Archon Soul | Mono（单程序集） |
+| `find_mono_multi()` | Kinny and the Cosmic Cauldron | Mono（多程序集） |
+| `find_ue_pak_v12()` | CatapultHero | UE（pak v12 / utoc v8） |
+| `find_ue_pak_v11()` | Dinoblade | UE（pak v11 / utoc v8） |
+| `find_il2cpp_dump()` | `aiMod/dump/*/il2cpp_dump.cs` | IL2CPP 字段类型真值 |
+| `find_mono_groundtruth()` | `devtools/groundtruth/mono/` | Mono 真值生成器 |
+
+样本根默认是 `D:\Projects` 与 `~/Projects`，可用环境变量
+`GAMEMOD_SAMPLES` 整体重定向。
+
+样本不在时脚本记为**「无法验证」并跳过**，不会假装通过。
+
+> 历史教训：脚本曾各自硬编码
+> `C:\Users\Administrator\Documents\deepseek-harness\默认工作区\...`，
+> 工作区一挪就整套跑不起来。绝对路径是本项目最容易腐坏的东西。
 
 ## 两类脚本的区别（这个区分很重要）
 
@@ -38,27 +68,27 @@ python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 而 `get_diagnostics` 还报 `ue.ready = true` —— 那是最糟的状态：
 Agent 以为能用，一调就撞墙。只有 MCP 层的脚本能抓到这种问题。
 
-## 需要的外部样本
+## 需要的样本清单（实际路径见 samples.py）
 
-脚本硬编码了本机样本路径，换机器需要改：
+| 样本 | 用于 |
+|---|---|
+| Garden of Witches | IL2CPP（17 MB 元数据） |
+| Archon Soul | Mono |
+| Kinny and the Cosmic Cauldron | Mono（多程序集） |
+| CatapultHero | UE（pak v12 / utoc v8） |
+| Dinoblade | UE（pak v11 / utoc v8） |
+| `il2cpp_dump.cs` | IL2CPP 字段类型真值（33 万行） |
 
-| 样本 | 路径 | 用于 |
-|---|---|---|
-| Garden of Witches | `D:\Projects\Garden of Witches` | IL2CPP（17 MB 元数据） |
-| Archon Soul | `D:\Projects\Archon Soul` | Mono |
-| Kinny and the Cosmic Cauldron | `D:\Projects\Kinny and the Cosmic Cauldron` | Mono（多程序集） |
-| CatapultHero | `D:\Projects\CatapultHero` | UE（pak v12 / utoc v8） |
-| Dinoblade | `D:\Projects\Dinoblade` | UE（pak v11 / utoc v8） |
-| il2cpp_dump.cs | `D:\Projects\aiMod\dump\Garden of Witches.exe\il2cpp_dump.cs` | IL2CPP 字段类型真值（33 万行） |
-
-样本不在时脚本会记为「无法验证」而不是失败，不会假装通过。
+具体路径不在这里写死 —— 跑 `python devtools\samples.py` 看本机实际情况。
 
 ## 目录
 
 ```
 devtools/
+├── samples.py             样本路径的集中定义（唯一真值）
 ├── verify_*.py            验收脚本（上面那批）
-├── probes/                一次性逆向侦察脚本（31 个）
+├── probes/                一次性逆向侦察脚本（30 个）
+├── hooks/                 Stop hook 自动提交（见其中 README.md）
 └── groundtruth/           真值来源
     ├── mono/
     │   ├── MonoGroundTruth.csproj   .NET 真值生成器（用官方

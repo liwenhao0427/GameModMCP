@@ -1,11 +1,15 @@
 {
+  "_说明": "DSH 回合结束自动提交的 hook 注册。复制到 %USERPROFILE%\\.dsh\\hooks\\claude-hooks.json 并在 profile 里注册。详见 devtools/hooks/README.md",
+  "_命令解析": "hook 由 `bash -c` 执行（dsh-bash-local，实测 python 可解析）。",
+  "_为什么带 test -f 与 || true": "这份配置是进程级全局的，会在任何项目里触发。其它项目没有本脚本，test -f 会失败；若不以 || true 收尾，DSH 会把它记为 hook 失败并在每个无关项目里刷日志。脚本自身一律 exit 0，所以 || true 不会掩盖真实问题。",
+  "_timeout": "单位是秒（桥接映射到 timeoutSec）。脚本内部对单条 git 命令另设 60s 超时。",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/devtools/hooks/auto_commit.py\"",
+            "command": "test -f \"${CLAUDE_PROJECT_DIR}/devtools/hooks/auto_commit.py\" && python \"${CLAUDE_PROJECT_DIR}/devtools/hooks/auto_commit.py\" || true",
             "timeout": 60
           }
         ]

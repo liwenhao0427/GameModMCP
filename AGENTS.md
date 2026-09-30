@@ -67,7 +67,7 @@ src/gamemod_mcp/
 ├── server.py         MCP 工具层（@mcp.tool）。只做：参数校验 → 调下层 → 组装返回
 ├── engine/
 │   ├── state.py      进程级单例会话（当前游戏 / 索引 / 运行时）
-│   ├── discovery.py  进程与安装目录发现
+│   ├── discovery.py  进程发现与引擎识别（不再做全机 Steam 扫描）
 │   ├── pe.py         PE 解析
 │   ├── il2cpp_meta.py  global-metadata.dat 解析
 │   ├── mono_meta.py    ECMA-335 程序集解析
@@ -111,12 +111,24 @@ src/gamemod_mcp/
 | 4 | `devtools/verify_mcp_*.py` | 覆盖该工具的验收断言 |
 
 **工具清单以代码为准，文档不许硬编码数量。**
-用 `python devtools/verify_tool_inventory.py` 校验三处（代码 / README / SKILL）是否一致；
-该脚本不一致时返回非零退出码，是判断「文档是否实时更新」的唯一依据。
+用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **5 处**：
+
+| 校验对象 | 强度 |
+|---|---|
+| README「工具一览」表格 | **双向完全一致**（不多、不少） |
+| README 正文的数量声明（「N 个工具」） | 数值必须等于实际 |
+| `server.py` docstring 的「工具分层」列表 | 双向完全一致 |
+| `FastMCP(instructions=...)` | 只许提到存在的工具 |
+| `SKILL.md`（含**代码块里的调用形式**） | 只许提到存在的工具 |
+
+不一致时返回非零退出码，是判断「文档是否实时更新」的唯一依据。
 
 > 历史教训：`README.md:159` 曾列出并不存在的 `unhook_all`；
 > `server.py:19-30` 的 docstring 漏写了 13 个工具；
-> README 写「41 个工具」而实际已变。**靠人肉对照必然漂移，所以要用脚本卡住。**
+> README 写「41 个工具」而实际已变；
+> SKILL.md 的配方里留着已删除的 `find_monobehaviours` 与 `detect_games`
+> ——最后这个当时**没被任何检查发现**，因为它在 ```python 代码块里、不带反引号。
+> **所以校验脚本必须扫代码块，不能只扫反引号。**
 
 ---
 

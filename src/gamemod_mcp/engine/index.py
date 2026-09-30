@@ -163,6 +163,11 @@ class Index:
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.results = ResultStore()
+        # 这个索引是「复用既有缓存」还是「刚刚全量重建」——
+        # 只有 open() 知道，所以由它赋值，默认按「新建」算。
+        # 之前 index_info 里硬编码 True，导致重建一次（几秒到几十秒）
+        # 也会报 cache_hit=true，Agent 据此以为走了快路径，无法察觉异常。
+        self.cache_hit = False
         self._build()
 
     # ------------------------------------------------------ 生命周期
@@ -239,13 +244,15 @@ class Index:
             idx.conn = sqlite3.connect(str(db_path))
             idx.conn.row_factory = sqlite3.Row
             idx.results = ResultStore()
+            idx.cache_hit = True          # ← 真的复用了缓存
             return idx
 
         if db_path.is_file() and force_rebuild:
             db_path.unlink()
 
         progress(f"构建索引 {db_path.name}（{adapt.engine_label(meta)}）...")
-        return cls(meta, db_path)
+        idx = cls(meta, db_path)          # __init__ 里 cache_hit=False
+        return idx
 
     @staticmethod
     def _is_valid(db_path: Path) -> bool:
@@ -451,7 +458,11 @@ class Index:
     # ------------------------------------------------------ 查询：类型
 
     def index_info(self) -> dict[str, Any]:
-        """索引概况（供 get_dump_summary 之类的工具使用）。"""
+        """索引概况。
+
+        `cache_hit` 如实反映「这次是复用缓存还是真重建」：
+        false 意味着刚刚花了时间做全量解析，是排查「为什么慢」的第一手线索。
+        """
         cur = self.conn.cursor()
         info = dict(cur.execute("SELECT key, value FROM meta").fetchall())
         # meta 表里存的是文本，这里把计数字段转成 int，
@@ -469,7 +480,7 @@ class Index:
             "SELECT COUNT(*) FROM types WHERE is_enum=1"
         ).fetchone()[0]
         info["image_count"] = cur.execute("SELECT COUNT(*) FROM images").fetchone()[0]
-        info["cache_hit"] = True
+        info["cache_hit"] = bool(getattr(self, "cache_hit", False))
         # 把「这个引擎在元数据层面能提供什么」一并透给 Agent，
         # 免得它把「IL2CPP 本来就没有字段 flags」误判成工具出错。
         info["capabilities"] = adapt.capabilities(self.meta)
@@ -813,6 +824,20 @@ class Index:
                             "token": x.runtime_token,
                             "return_type": adapt.resolve_method_return(
                                 m, adapt.method_return_key(m, x)),
+                            # 继承来的方法同样要给参数表：class_detail 的
+                            # method_name 过滤（原 get_method_source 的职责）
+                            # 会同时命中自身与继承的方法，字段形状必须一致，
+                            # 否则 Agent 按 parameter_count 选重载时会拿到 None。
+                            "parameter_count": x.parameter_count,
+                            "parameters": [
+                                {"name": p.name, "type": pt}
+                                for p, pt in zip(
+                                    m.parameters_of(x),
+                                    adapt.resolve_param_types(m, x) or
+                                    [None] * len(m.parameters_of(x)),
+                                )
+                            ],
+                            "flags": f"0x{x.flags:04X}",
                             "is_static": x.is_static,
                             "is_virtual": x.is_virtual,
                             "is_constructor": x.is_constructor,
@@ -848,29 +873,6 @@ class Index:
             "derived": [d.nested_name for d in derived[:50]],
             "include_inherited": include_inherited,
         }
-
-    def get_method_source(self, full_name: str, method_name: str) -> dict[str, Any]:
-        """取某个方法的「元数据形态源码」（不是真实 IL/C# 代码）。
-
-        诚实说明：IL2CPP 的托管代码已被翻译成 C++，
-        没有托管 IL 可供反编译，因此这里给出的是：
-            签名 + token + 参数表 + 可用的 Hook 定位信息 + 反汇编入口
-        真正的指令级分析走 disassemble_method（原生反汇编）。
-        """
-        detail = self.class_detail(full_name, include_inherited=True)
-        if not detail.get("found"):
-            return {"found": False, "reason": "类不存在", "query": full_name}
-
-        hits = [x for x in detail["methods"] if x["name"] == method_name]
-        if not hits:
-            return {
-                "found": False,
-                "reason": "该类中未找到该方法",
-                "class": detail["full_name"],
-                "method": method_name,
-                "available": sorted({x["name"] for x in detail["methods"]})[:80],
-            }
-        return {"found": True, "class": detail["full_name"], "methods": hits}
 
     # ------------------------------------------------------ 查询：层级 / 依赖
 
@@ -909,8 +911,22 @@ class Index:
 
         return result
 
-    def find_derived_classes(self, base_full_name: str, limit: int = 200) -> dict[str, Any]:
+    def find_derived_classes(self, base_full_name: str, limit: int = 200,
+                             assembly: str = "") -> dict[str, Any]:
         """列出所有继承自某类的类型（找 MonoBehaviour 脚本的必备工具）。
+
+        判定用**传递式**继承（含间接继承），因此
+        `find_derived_classes("UnityEngine.MonoBehaviour")` 能一次拿到
+        所有脚本组件 —— 这正是它取代旧 `find_monobehaviours` 的原因：
+        那个工具只是本方法加了一个「只看游戏程序集」的粗糙过滤器，
+        而 `assembly` 参数能把这件事做得更明确、更可控。
+
+        Args:
+            base_full_name: 基类完整名。
+            limit:          最多返回多少条。
+            assembly:       只看该程序集（子串匹配，如 "Assembly-CSharp"）。
+                            留空则不限。找游戏自己的 MonoBehaviour 脚本时
+                            传 "Assembly-CSharp" 比按前缀猜引擎程序集更可靠。
 
         注意：基类**不必**出现在被索引的程序集里。Mono 游戏只索引
         Assembly-CSharp.dll，而 `UnityEngine.MonoBehaviour` 定义在
@@ -921,17 +937,24 @@ class Index:
         m = self.meta
         base = m.type_by_name(base_full_name)
 
-        derived = m.find_derived(base_full_name, limit=limit)
-        items = [
-            {
+        # 多取一些再过滤，避免 assembly 过滤把结果砍到 limit 以下
+        want = limit if not assembly else min(limit * 20, 20000)
+        derived = m.find_derived(base_full_name, limit=want)
+
+        items = []
+        for d in derived:
+            img = m.image_of_type(d)
+            if assembly and assembly.lower() not in img.lower():
+                continue
+            items.append({
                 "index": d.index,
                 "full_name": d.nested_name,
-                "image": m.image_of_type(d),
+                "image": img,
                 "field_count": d.field_count,
                 "method_count": d.method_count,
-            }
-            for d in derived
-        ]
+            })
+            if len(items) >= limit:
+                break
 
         if base is None and not items:
             # 既找不到基类、也没有任何派生类 —— 这才是真的查不到
@@ -944,6 +967,8 @@ class Index:
             "total": len(items),
             "items": items,
         }
+        if assembly:
+            out["assembly_filter"] = assembly
         if base is None:
             # 如实说明：基类不在当前索引范围内，但派生类是通过基类名字符串
             # 比对出来的，结果依然有效。
@@ -952,47 +977,6 @@ class Index:
                 f"UnityEngine/System 等框架程序集），派生类按基类名比对得出。"
             )
         return out
-
-    def find_monobehaviours(self, name_pattern: str = "", limit: int = 200) -> dict[str, Any]:
-        """找游戏自己写的 MonoBehaviour 脚本（Mod 最常 Hook 的目标）。
-
-        `name_pattern` 为空时返回该游戏程序集（非 UnityEngine/System）下的全部脚本。
-        """
-        m = self.meta
-        out: list[dict[str, Any]] = []
-        for t in m.types:
-            if not m.is_subclass_of(t, "UnityEngine.MonoBehaviour"):
-                continue
-            if t.nested_name == "UnityEngine.MonoBehaviour":
-                continue
-            img = m.image_of_type(t)
-            # 只要游戏主程序集，过滤掉引擎与框架自带的
-            if not name_pattern and not self._is_game_assembly(img):
-                continue
-            if name_pattern and name_pattern.lower() not in t.nested_name.lower():
-                continue
-            out.append(
-                {
-                    "full_name": t.nested_name,
-                    "image": img,
-                    "field_count": t.field_count,
-                    "method_count": t.method_count,
-                }
-            )
-            if len(out) >= limit:
-                break
-
-        return {"total": len(out), "items": out, "pattern": name_pattern}
-
-    @staticmethod
-    def _is_game_assembly(image: str) -> bool:
-        """粗略判断是否「游戏自己」的程序集。"""
-        engine_prefixes = (
-            "UnityEngine", "Unity.", "System", "mscorlib", "netstandard",
-            "Mono.", "Newtonsoft", "Microsoft", "nunit", "JetBrains",
-            "TMPro", "DG.Tweening", "Spine", "Cinemachine",
-        )
-        return not image.startswith(engine_prefixes)
 
     def analyze_dependency(self, full_name: str) -> dict[str, Any]:
         """静态依赖概览：这个类引用了哪些类型、被谁引用。

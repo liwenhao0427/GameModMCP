@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""校验「工具清单」在代码与文档之间是否一致。
+
+为什么必须有这个脚本
+============================================================
+本项目有 4 个地方都在描述「有哪些工具」：
+
+    1. src/gamemod_mcp/server.py   —— 代码本身（唯一真值）
+    2. src/gamemod_mcp/server.py   —— 模块 docstring 的「工具分层」列表
+    3. src/gamemod_mcp/server.py   —— FastMCP(instructions=...) 里的工作流
+    4. README.md                   —— 「工具一览」表格
+    5. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
+
+经验证明靠人肉同步**必然漂移**（真实发生过的三起）：
+    · README 写了并不存在的 `unhook_all`
+    · server.py 的 docstring 漏写了 13 个工具
+    · README 的「41 个工具」与实际数量不符
+所以用本脚本卡住：**不一致就非零退出**。
+
+校验规则
+============================================================
+代码（@mcp.tool 装饰的函数）是唯一真值，其余都是「必须与之一致」的副本。
+
+- README 表格：必须是**双向完全一致**（不多、不少）。
+  这是权威清单，Agent 与人都靠它了解全貌。
+- README 正文里的数量：「41 个工具」这类数字必须等于实际数量。
+- server.py docstring 分层列表：双向一致（它声明了每个工具的归属层）。
+- instructions：**只许提到存在的工具**（它是精简工作流，不必列全）。
+- SKILL.md：**只许提到存在的工具**（它是使用指南，不必列全），
+  但要能识别出「曾经存在、现已删除」的名字。
+
+用法
+============================================================
+    python devtools/verify_tool_inventory.py          # 校验，返回 0/1
+    python devtools/verify_tool_inventory.py --list    # 顺便打印清单
+"""
+
+from __future__ import annotations
+
+import io
+import os as _os
+import re
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+_sys.stdout = io.TextIOWrapper(_sys.stdout.buffer, encoding="utf-8",
+                               errors="replace")
+
+import samples  # noqa: E402
+
+ROOT = samples.ROOT
+SERVER = ROOT / "src" / "gamemod_mcp" / "server.py"
+README = ROOT / "README.md"
+SKILL = ROOT / "skills" / "gamemod-mod" / "SKILL.md"
+
+# SKILL.md 里被反引号包起来的「字段名/参数名」，不是工具名。
+# 必须显式列出，否则「工具名」与「参数名」在文本上无法区分。
+NON_TOOL_IDENTIFIERS = {
+    # 通用参数 / 返回字段
+    "args_type", "retval_type", "max_calls", "backtrace", "hook_id",
+    "preferred_module", "auto_find", "name_filter", "only_games",
+    "include_inherited", "base_full_name", "full_name", "method_name",
+    "metadata_path", "cache_dir", "force_rebuild", "game_dir",
+    "nested_name", "param_count", "parameter_count", "return_type",
+    "type_confidence", "field_count", "method_count", "type_count",
+    "install_dir", "appid", "output_path", "include_entries",
+    "exclude_compiler_generated", "subtype_of", "only_enums",
+    "has_more", "cache_hit", "readOnlyHint", "destructiveHint",
+    "image_count", "rva_hex", "hex_data", "module", "offset",
+    # 非本项目的标识符（引擎/框架 API）
+    "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
+}
+
+# 曾经存在、现已删除的工具名。看到它们出现在文档里 = 文档没跟上代码。
+REMOVED_TOOLS = {
+    "detect_games":       "移除：全机扫描属噪声工具，运行上下文限定在游戏项目目录",
+    "find_monobehaviours": "合并进 find_derived_classes(assembly=...)",
+    "get_method_source":  "合并进 class_detail(method_name=...)",
+    "unhook_all":         "从未存在过（README 的历史笔误），卸载全部用 unhook()",
+}
+
+# 分层列表里的「层名」等非工具词，解析时需要排除。
+LAYER_WORDS = {
+    "UE", "IL2CPP", "Mono", "MCP", "API",
+}
+
+PASS, FAIL = [], []
+
+
+def check(label: str, cond: bool, detail: str = "") -> bool:
+    tag = "✅" if cond else "❌"
+    print(f"  {tag} {label}" + (f" — {detail}" if detail else ""))
+    (PASS if cond else FAIL).append(label)
+    return cond
+
+
+def show(title: str) -> None:
+    print()
+    print("=" * 76)
+    print(title)
+    print("=" * 76)
+
+
+def code_tools() -> set[str]:
+    """从 server.py 抽出所有 @mcp.tool 装饰的函数名 —— 唯一真值。"""
+    src = SERVER.read_text(encoding="utf-8")
+    return set(re.findall(
+        r"@mcp\.tool\([^)]*\)\s*\ndef\s+(\w+)\(", src, re.S))
+
+
+def backticked(text: str) -> set[str]:
+    return set(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", text))
+
+
+def called_names(text: str) -> set[str]:
+    """抽出「像工具调用」的标识符，含代码块里的 `name(` 形式。
+
+    只扫反引号是不够的 —— SKILL.md 的配方大多写在 ```python 代码块里，
+    形如 `find_monobehaviours(name_pattern="Manager")`，
+    **不带反引号**。曾经正是这种形式让一个已删除的工具名留在了文档里
+    而校验脚本毫无察觉（`find_monobehaviours` 就是被漏掉的那个）。
+    """
+    return set(re.findall(r"\b([a-z][a-z0-9_]*)\s*\(", text))
+
+
+def readme_table_tools() -> set[str]:
+    """README「工具一览」表格第一列里的工具名。
+
+    该表格有 `| \\`unhook\\` / \\`hook_status\\` | ... |` 这种一格多工具的写法，
+    所以要把一格里的所有反引号标识符都取出来。
+    """
+    text = README.read_text(encoding="utf-8")
+    m = re.search(r"^##\s*工具一览.*?$(.*?)(?=^##\s|\Z)",
+                  text, re.S | re.M)
+    if not m:
+        return set()
+    names: set[str] = set()
+    for line in m.group(1).splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = line.split("|")
+        if len(cells) < 2:
+            continue
+        first = cells[1]
+        for tok in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", first):
+            names.add(tok)
+    return names
+
+
+def server_docstring_tools() -> set[str]:
+    """server.py 模块 docstring 里「工具分层」列表提到的工具名。
+
+    注意这份列表**不用反引号**，且**会折行**，形如：
+        1. 发现层      : find_game_processes / inspect_game / inspect_binary
+        3. 静态查询层  : search_classes / class_detail /
+                         search_methods / class_hierarchy /
+    所以不能只取「冒号后那一行」——续行（没有 `N. 层名 :` 前缀）同样要收，
+    否则会把折行写到第二行的工具全部误判成「docstring 漏收」。
+    """
+    src = SERVER.read_text(encoding="utf-8")
+    doc = src.split('"""', 2)[1]
+    m = re.search(r"工具分层(.*?)关键约定", doc, re.S)
+    if not m:
+        return set()
+    names: set[str] = set()
+    for line in m.group(1).splitlines():
+        # 首行形如「    1. 发现层      : find_game_processes / ...」
+        # 续行没有这个前缀，整行都是工具名。
+        head = re.match(r"\s*\d+\.\s*\S+\s*:\s*(.*)$", line)
+        part = head.group(1) if head else line
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", part):
+            names.add(tok)
+    return names
+
+
+def main() -> int:
+    argv = set(_sys.argv[1:])
+    tools = code_tools()
+
+    print("工具清单一致性校验")
+    print(f"  真值来源: {SERVER.relative_to(ROOT)}")
+    print(f"  当前工具数: {len(tools)}")
+
+    if not tools:
+        print("\n❌ 没能从 server.py 解析出任何工具 —— 解析规则失效了，"
+              "请先修正本脚本再谈一致性。")
+        return 1
+
+    # ------------------------------------------------------------ 1. README 表格
+    show("1. README「工具一览」表格 vs 代码（必须双向完全一致）")
+    rm = readme_table_tools()
+    print(f"  README 表格列出 {len(rm)} 个")
+
+    only_code = sorted(tools - rm)
+    only_readme = sorted(rm - tools)
+
+    check("代码里有、README 漏掉的工具为 0", not only_code,
+          f"{only_code}" if only_code else "（无遗漏）")
+    check("README 写了、代码里没有的工具为 0", not only_readme,
+          f"{only_readme}" if only_readme else "（无多余）")
+
+    # 历史笔误单独点名，便于快速定位
+    stale = sorted(rm & set(REMOVED_TOOLS))
+    if stale:
+        for s in stale:
+            print(f"      ⚠️  `{s}`：{REMOVED_TOOLS[s]}")
+
+    # ------------------------------------------------------------ 2. README 数字
+    show("2. README 里声明的工具数量 vs 实际")
+    rtext = README.read_text(encoding="utf-8")
+    # 抓「41 个工具」这类数字（含「工具一览（41 个）」）
+    nums = set()
+    for pat in (r"(\d+)\s*个工具", r"工具一览（(\d+)\s*个）",
+                r"工具一览\((\d+)\s*个\)"):
+        nums |= {int(x) for x in re.findall(pat, rtext)}
+    for n in sorted(nums):
+        check(f"README 写的 {n} 与实际 {len(tools)} 一致", n == len(tools),
+              "" if n == len(tools) else f"实际是 {len(tools)}")
+    if not nums:
+        check("README 里找到了工具数量声明", False,
+              "没找到「N 个工具」字样（工具清单应说明规模）")
+
+    # ------------------------------------------------------------ 3. server docstring
+    show("3. server.py 模块 docstring「工具分层」列表 vs 代码")
+    dt = server_docstring_tools()
+    print(f"  docstring 列出 {len(dt)} 个")
+    miss_doc = sorted(tools - dt)
+    extra_doc = sorted(dt - set(NON_TOOL_IDENTIFIERS) - LAYER_WORDS - tools)
+    check("代码里的工具都被 docstring 收录", not miss_doc,
+          f"{miss_doc}" if miss_doc else "（无遗漏）")
+    check("docstring 没有不存在的工具", not extra_doc,
+          f"{extra_doc}" if extra_doc else "（无多余）")
+
+    # ------------------------------------------------------------ 4. instructions
+    show("4. FastMCP(instructions=...) 只许提到存在的工具")
+    doc = SERVER.read_text(encoding="utf-8").split('"""', 2)[1]
+    src = SERVER.read_text(encoding="utf-8")
+    m = re.search(r"instructions=\((.*?)\n    \),", src, re.S)
+    inst = m.group(1) if m else ""
+    inst_tools = set(re.findall(r"(\w+)\(", inst))
+    # 括号里的调用形式才是工具调用；排掉 xx()  这类空壳
+    inst_tools = {t for t in inst_tools if t in tools or t in REMOVED_TOOLS}
+    ghost = sorted(inst_tools & set(REMOVED_TOOLS))
+    check("instructions 里没有已删除的工具", not ghost,
+          f"{ghost}" if ghost else "（干净）")
+    check("instructions 提到了工具", bool(inst_tools),
+          f"{len(inst_tools)} 个：{sorted(inst_tools)}")
+
+    # ------------------------------------------------------------ 5. SKILL.md
+    show("5. SKILL.md 只许提到存在的工具")
+    stext = SKILL.read_text(encoding="utf-8")
+    stoks = backticked(stext)
+    # 反引号里的 snake_case 标识符：排除已知字段名与非工具名
+    suspicious = sorted(
+        t for t in stoks
+        if "_" in t
+        and t not in tools
+        and t not in NON_TOOL_IDENTIFIERS
+    )
+    check("SKILL.md 没有引用不存在的工具名", not suspicious,
+          f"{suspicious}" if suspicious else "（干净）")
+
+    ghost_skill = sorted(stoks & set(REMOVED_TOOLS))
+    check("SKILL.md 没有引用已删除的工具", not ghost_skill,
+          f"{ghost_skill}" if ghost_skill else "（干净）")
+
+    # 代码块里的调用形式（不带反引号）也必须扫 —— 这是最容易漏的一类
+    skill_calls = called_names(stext)
+    ghost_calls = sorted(skill_calls & set(REMOVED_TOOLS))
+    check("SKILL.md 代码块里没有已删除工具的调用", not ghost_calls,
+          f"{ghost_calls}" if ghost_calls else "（干净）")
+
+    # 代码块里调用的、既不是工具也不是已知非工具函数的名字 —— 提示可能写错了
+    unknown_calls = sorted(
+        n for n in skill_calls
+        if n not in tools and n not in NON_TOOL_IDENTIFIERS
+    )
+    # 只报告「像工具名」的（含下划线，排除 print/sorted/len 这类内建）
+    toolish = [n for n in unknown_calls if "_" in n]
+    check("SKILL.md 没有调用不存在的工具类函数", not toolish,
+          f"{toolish}" if toolish else "（干净）")
+
+    # SKILL.md 是使用指南，不要求列全；但至少要覆盖核心工作流
+    core = {"open_game", "search_classes", "class_detail", "hook_method"}
+    check("SKILL.md 覆盖了核心工作流工具", core <= stoks,
+          f"缺少 {sorted(core - stoks)}" if not (core <= stoks) else "（齐全）")
+
+    # ------------------------------------------------------------ 6. 已删除工具
+    show("6. 已删除工具不得在任何文档中残留")
+    for name, why in sorted(REMOVED_TOOLS.items()):
+        spots = []
+        if name in rm:
+            spots.append("README 工具表")
+        if name in stoks:
+            spots.append("SKILL.md")
+        if name in dt:
+            spots.append("server docstring")
+        if name in inst_tools:
+            spots.append("instructions")
+        # 代码里当然也不该有
+        if re.search(rf"\ndef\s+{name}\(", src):
+            spots.append("代码")
+        check(f"`{name}` 已清理", not spots,
+              f"仍出现在 {spots}（{why}）" if spots else f"（{why}）")
+
+    # ------------------------------------------------------------ 汇总
+    if "--list" in argv:
+        show("当前工具清单")
+        for t in sorted(tools):
+            print(f"    {t}")
+
+    print()
+    print("=" * 76)
+    print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
+    if FAIL:
+        print("失败项：")
+        for f in FAIL:
+            print(f"  - {f}")
+        print()
+        print("→ 工具清单已漂移：请按 AGENTS.md §4「必须同步的四处」改完再提交。")
+    print("=" * 76)
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    _sys.exit(main())

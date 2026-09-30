@@ -237,12 +237,15 @@ def main() -> int:
             return 0
         changed = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
 
+        # 提交信息必须在 `git add -A` **之前**读走并删除：
+        # 否则这个临时文件本身会被暂存，跟着一起提交进历史。
+        message = build_message(git_root, changed)
+
         code, out = git(git_root, "add", "-A")
         if code != 0:
             log(f"git add 失败：{out.strip()}")
             return 0
 
-        message = build_message(git_root, changed)
         code, out = git(git_root, "commit", "-m", message)
         if code != 0:
             log(f"git commit 失败：{out.strip()[:500]}")

@@ -35,12 +35,27 @@ import sys
 import time
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 from gamemod_mcp import server as S  # noqa: E402
 
-GAME_DIR = r"D:\Projects\Garden of Witches"
-GAME_EXE = r"D:\Projects\Garden of Witches\Garden of Witches.exe"
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_GAME = samples.find_il2cpp()
+GAME_DIR = str(_GAME) if _GAME else None
+GAME_EXE = str(_GAME / "Garden of Witches.exe") if _GAME else None
+
+# 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+if not samples.require(GAME_DIR, "IL2CPP 样本 Garden of Witches"):
+    sys.exit(0)
+if not os.path.isfile(GAME_EXE):
+    print(f"  ⚠️  无法验证：样本主程序不存在 —— {GAME_EXE}")
+    sys.exit(0)
 
 PASS, FAIL, WARN = [], [], []
 
@@ -74,7 +89,14 @@ check("Mono 解析器就绪", d["engines"]["mono"]["ready"],
       "mono_meta.py 是否存在", warn_only=True)
 check("UE 解析器就绪", d["engines"]["ue"]["ready"],
       "ue.py 是否存在", warn_only=True)
-print(f"     本机运行中的游戏: {d.get('running_game_count')}")
+# get_diagnostics 默认不再扫本机进程（耗时约 2.7s，且与 find_game_processes 重复），
+# 所以这里改为：确认它**如实说明跳过了**，并验证专门的工具能列出进程。
+check("get_diagnostics 如实标注跳过了进程扫描",
+      "running_games_skipped" in d,
+      "默认不扫本机进程（与 find_game_processes 职责分开）")
+gp = S.find_game_processes()
+check("find_game_processes 可用（列运行中的游戏）", gp.get("ok") is True,
+      f"本机发现 {gp.get('count')} 个")
 
 # ================================================================ 2. 识别引擎
 show("2. inspect_game —— 识别游戏引擎")

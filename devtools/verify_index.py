@@ -1,12 +1,25 @@
 # 索引层验收：构建 SQLite 索引并用真实游戏数据跑通全部查询
 import sys, io, time, shutil
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.path.insert(0, r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\src")
+# 仓库路径由 samples.py 推导（不许硬编码工作区绝对路径）
+# 用 os.path 推导，避免依赖后面才 import 的 pathlib
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import samples  # noqa: E402
+samples.add_src_to_path()
 
 from gamemod_mcp.engine.index import Index, default_cache_dir
 
-META = r"D:\Projects\Garden of Witches\Garden of Witches_Data\il2cpp_data\Metadata\global-metadata.dat"
-CACHE = r"C:\Users\Administrator\Documents\deepseek-harness\默认工作区\GameModMCP\.cache-test"
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_GAME = samples.find_il2cpp()
+META = (_GAME / "Garden of Witches_Data" / "il2cpp_data"
+        / "Metadata" / "global-metadata.dat") if _GAME else None
+CACHE = str(samples.CACHE_TEST)
+
+# 样本不可用时记为「无法验证」并跳过（跳过不算失败）
+if not samples.require(META, "IL2CPP 元数据 Garden of Witches"):
+    sys.exit(0)
 
 # 清掉旧缓存，强制走完整构建路径
 shutil.rmtree(CACHE, ignore_errors=True)
@@ -96,10 +109,13 @@ for it in r["items"][:5]:
 
 print()
 print("=" * 74)
-print("9. find_monobehaviours：游戏自己的脚本")
+print("9. find_derived_classes(assembly=)：游戏自己的脚本")
 print("=" * 74)
-r = idx.find_monobehaviours(limit=8)
-print(f"  共 {r['total']:,} 个游戏脚本，前 8:")
+# find_monobehaviours 已并入本方法：assembly 参数比原来「按程序集名
+# 前缀猜哪些是引擎自带的」更明确可控。
+r = idx.find_derived_classes("UnityEngine.MonoBehaviour",
+                             assembly="Assembly-CSharp", limit=8)
+print(f"  限 Assembly-CSharp 共 {r['total']:,} 个游戏脚本，前 8:")
 for it in r["items"][:8]:
     print(f"    {it['full_name']:<56} [{it['image']}]")
 
@@ -155,14 +171,19 @@ print(f"  向下: {h.get('down_count', 0)} 个")
 
 print()
 print("=" * 74)
-print("15. get_method_source（诚实返回元数据形态）")
+print("15. class_detail + 按方法名收窄（原 get_method_source 的能力）")
 print("=" * 74)
-ms = idx.get_method_source("TeamTapas.ProjectR.UserDatas.Service.UserData_Service", ".ctor")
-if ms["found"]:
-    for x in ms["methods"]:
-        print(f"    {x['name']} token={x['token']} 参数={x.get('parameters')}")
-else:
-    print(f"    {ms}")
+# get_method_source 已并入 class_detail 的 method_name 参数：
+# 它原本就是「class_detail 结果里按名字过滤 methods」，独立成工具
+# 只会让 Agent 犹豫该调哪个。
+_cls = "TeamTapas.ProjectR.UserDatas.Service.UserData_Service"
+det = idx.class_detail(_cls, include_inherited=True)
+hits = [x for x in det.get("methods", []) if x["name"] == ".ctor"]
+print(f"  {_cls} 共 {det.get('method_count')} 个方法，"
+      f"其中 .ctor {len(hits)} 个重载：")
+for x in hits[:5]:
+    print(f"    {x['name']} token={x['token']} "
+          f"参数数={x.get('parameter_count')} 参数={x.get('parameters')}")
 
 idx.close()
 print()

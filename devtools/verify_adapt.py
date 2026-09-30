@@ -16,7 +16,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+# sys.path 与样本路径都由 samples.py 推导/集中定义，脚本自身不写绝对路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import samples                                            # noqa: E402
+samples.add_src_to_path()
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -25,14 +28,18 @@ except Exception:
 from gamemod_mcp.engine import adapt                      # noqa: E402
 from gamemod_mcp.engine.index import Index                # noqa: E402
 
-IL2CPP_META = Path(
-    r"D:\Projects\Garden of Witches\Garden of Witches_Data"
-    r"\il2cpp_data\Metadata\global-metadata.dat"
-)
-MONO_ASM = Path(
-    r"D:\Projects\Archon Soul\Archon Soul_Data\Managed\Assembly-CSharp.dll"
-)
-CACHE = ROOT / ".cache-adapt-test"
+# 样本路径：根目录从 samples.py 取，派生路径用相对路径拼出来
+_IL2CPP_GAME = samples.find_il2cpp()
+_MONO_GAME = samples.find_mono()
+IL2CPP_META = (_IL2CPP_GAME / "Garden of Witches_Data" / "il2cpp_data"
+               / "Metadata" / "global-metadata.dat") if _IL2CPP_GAME else None
+MONO_ASM = (_MONO_GAME / "Archon Soul_Data" / "Managed"
+            / "Assembly-CSharp.dll") if _MONO_GAME else None
+CACHE = samples.CACHE_ADAPT_TEST
+
+# 样本不可用时记为「无法验证」并跳过，不计入 FAIL
+HAVE_IL2CPP = samples.require(IL2CPP_META, "IL2CPP 元数据 Garden of Witches")
+HAVE_MONO = samples.require(MONO_ASM, "Mono 程序集 Archon Soul")
 
 PASS = 0
 FAIL = 0
@@ -64,7 +71,7 @@ def section(title: str) -> None:
 # ============================================================ 1. 引擎嗅探
 section("1. 引擎嗅探 —— 按文件头自动分辨 IL2CPP / Mono")
 
-if IL2CPP_META.is_file():
+if IL2CPP_META is not None and IL2CPP_META.is_file():
     with open(IL2CPP_META, "rb") as fh:
         head = fh.read(4)
     magic = int.from_bytes(head, "little")
@@ -72,16 +79,16 @@ if IL2CPP_META.is_file():
           magic == 0xFAB11BAF, f"0x{magic:08X}")
     sniff = Index._sniff_engine(IL2CPP_META)
     check("嗅探判为 il2cpp", sniff == "il2cpp", f"实际={sniff}")
-else:
+elif HAVE_IL2CPP:
     check("IL2CPP 元数据存在", False, str(IL2CPP_META))
 
-if MONO_ASM.is_file():
+if MONO_ASM is not None and MONO_ASM.is_file():
     with open(MONO_ASM, "rb") as fh:
         head = fh.read(2)
     check("Mono 程序集以 MZ 开头", head == b"MZ", f"实际={head!r}")
     sniff = Index._sniff_engine(MONO_ASM)
     check("嗅探判为 mono", sniff == "mono", f"实际={sniff}")
-else:
+elif HAVE_MONO:
     check("Mono 程序集存在", False, str(MONO_ASM))
 
 
@@ -218,10 +225,12 @@ def run_engine(label: str, path: Path, expect_engine: str,
     idx2.close()
 
 
-run_engine("IL2CPP", IL2CPP_META, "il2cpp",
-           known_class="UserData_Service", known_field="userDataPresetFile")
-run_engine("Mono", MONO_ASM, "mono",
-           known_class="Player", known_field="health")
+if HAVE_IL2CPP:
+    run_engine("IL2CPP", IL2CPP_META, "il2cpp",
+               known_class="UserData_Service", known_field="userDataPresetFile")
+if HAVE_MONO:
+    run_engine("Mono", MONO_ASM, "mono",
+               known_class="Player", known_field="health")
 
 
 # ============================================================ 3. 能力声明
@@ -229,7 +238,7 @@ section("3. 能力声明 —— 两个引擎的差异要如实告知 Agent")
 
 for label, path, eng in (("IL2CPP", IL2CPP_META, "il2cpp"),
                          ("Mono", MONO_ASM, "mono")):
-    if not path.is_file():
+    if path is None or not path.is_file():
         continue
     try:
         idx = Index.open(path, cache_dir=CACHE, engine=eng)
@@ -249,7 +258,7 @@ for label, path, eng in (("IL2CPP", IL2CPP_META, "il2cpp"),
     idx.close()
 
 # IL2CPP 必须诚实说明「static 查不到」，否则 Agent 会把 None 当成 False
-if IL2CPP_META.is_file():
+if IL2CPP_META is not None and IL2CPP_META.is_file():
     idx = Index.open(IL2CPP_META, cache_dir=CACHE, engine="il2cpp")
     cap = adapt.capabilities(idx.meta)
     check("IL2CPP 声明 static 信息不可用",
@@ -263,7 +272,7 @@ if IL2CPP_META.is_file():
               got is None, f"实际={got!r}")
     idx.close()
 
-if MONO_ASM.is_file():
+if MONO_ASM is not None and MONO_ASM.is_file():
     idx = Index.open(MONO_ASM, cache_dir=CACHE, engine="mono")
     cap = adapt.capabilities(idx.meta)
     check("Mono 声明 static 信息可用",
@@ -274,14 +283,15 @@ if MONO_ASM.is_file():
 # ============================================================ 4. 错误路径
 section("4. 错误路径 —— 不支持就报错，不能静默降级")
 
-try:
-    Index.open(IL2CPP_META, cache_dir=CACHE, engine="不存在的引擎")
-    check("不支持的引擎被拒绝", False, "竟然成功了")
-except Exception as exc:
-    check("不支持的引擎被拒绝", True, f"{type(exc).__name__}: {exc}")
+if HAVE_IL2CPP:
+    try:
+        Index.open(IL2CPP_META, cache_dir=CACHE, engine="不存在的引擎")
+        check("不支持的引擎被拒绝", False, "竟然成功了")
+    except Exception as exc:
+        check("不支持的引擎被拒绝", True, f"{type(exc).__name__}: {exc}")
 
 # 显式指定错误引擎时，应当报错而不是硬解出乱七八糟的数据
-if MONO_ASM.is_file():
+if MONO_ASM is not None and MONO_ASM.is_file():
     try:
         bad = Index.open(MONO_ASM, cache_dir=CACHE, engine="il2cpp")
         # 如果没抛异常，至少要确认它没有伪装成成功

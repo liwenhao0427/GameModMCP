@@ -18,22 +18,34 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
 
 工具分层
 ------------------------------------------------------------
-    1. 发现层      : detect_games / find_game_processes / inspect_game
+    1. 发现层      : find_game_processes / inspect_game / inspect_binary
     2. 会话层      : open_game / get_session / close_session
     3. 静态查询层  : search_classes / class_detail / search_fields /
                      search_methods / class_hierarchy / find_derived_classes /
-                     find_monobehaviours / analyze_dependency / list_images
+                     analyze_dependency / list_images
     4. 结果句柄层  : read_query_result / search_query_result
-    5. 运行时层    : runtime_info / runtime_class_info / hook_method /
-                     unhook / drain_events / read_field_value /
-                     scan_pattern / eval_script / inject_process / launch_game
-    6. 诊断层      : get_diagnostics
+    5. 运行时层    : inject_process / launch_game / runtime_info /
+                     runtime_class_info / find_hook_target / hook_method /
+                     hook_address / unhook / hook_status / drain_events /
+                     read_memory / write_memory / read_field_value /
+                     scan_pattern / eval_script / gc_control
+    6. UE 层       : detect_ue / ue_profile / ue_list_entries /
+                     ue_script_objects / ue_manifest
+    7. 诊断层      : get_diagnostics
 
 关键约定
 ------------------------------------------------------------
     · 所有工具返回 dict，且**必定**带 `ok` 字段（成功 True / 失败 False）。
     · 失败时带 `error` 字段说明原因，绝不返回看似成功的空数据。
     · 日志一律走 stderr（见 logutil），因为 stdout 是 JSON-RPC 通道。
+
+静态与运行时的能力边界（**不许说反**）
+------------------------------------------------------------
+    静态元数据里有: 类 / 字段 / 方法的**存在与签名**、方法 token
+    静态元数据里没有: 字段字节偏移、方法 RVA/绝对地址
+    → 偏移与地址**只能**靠注入后的 runtime_class_info / find_hook_target 取。
+      class_detail 给出的 token 是连接两侧的钥匙：静态 token 与运行时
+      token 相等，才是「Hook 落点正确」的证据。
 """
 
 from __future__ import annotations
@@ -57,22 +69,26 @@ mcp = FastMCP(
         "GameMod MCP —— 游戏 Mod 开发的通用工具集。\n"
         "\n"
         "典型工作流（强烈建议按顺序走）：\n"
-        "  1. detect_games()           找到本机安装的游戏\n"
-        "  2. open_game(game_dir=...)  选定游戏并准备好元数据索引\n"
-        "  3. search_classes(...)      搜索类，拿到字段偏移与方法 RVA\n"
-        "  4. class_detail(...)        细看某个类的字段/方法/inheritance\n"
-        "  5. launch_game / inject_process  启动或注入游戏\n"
-        "  6. runtime_class_info(...)  取字段的**真实运行时偏移**与方法真实地址\n"
-        "  7. hook_method(...)         在目标方法上装 Hook\n"
-        "  8. drain_events()           读取 Hook 捕获到的调用事件\n"
+        "  1. open_game(game_dir=...)  选定游戏并准备好元数据索引\n"
+        "  2. search_classes(...)      搜索类，拿到 full_name\n"
+        "  3. class_detail(...)        细看字段/方法/token/inheritance；\n"
+        "                              给 method_name 可只看某个方法的重载\n"
+        "  4. inject_process / launch_game  注入运行中的游戏，或启动并注入\n"
+        "  5. runtime_class_info(...)  取字段的**真实运行时偏移**与方法真实地址\n"
+        "  6. hook_method(...)         在目标方法上装 Hook\n"
+        "  7. drain_events()           读取 Hook 捕获到的调用事件\n"
         "\n"
         "核心思路：**先用静态元数据定位，再用运行时确认**。\n"
-        "绝大多数 Hook 落点都能从元数据的 RVA 直接算出，不需要内存扫描；\n"
-        "scan_pattern 只是符号被剥离时的兜底手段。\n"
+        "但要注意两侧的能力边界（很容易记反）：\n"
+        "  · 静态元数据里有类/字段/方法的存在与签名、以及方法 token；\n"
+        "  · 静态元数据里**没有**字段字节偏移，**也没有**方法 RVA/绝对地址；\n"
+        "  · 偏移与地址**只能**靠注入后的运行时工具取。\n"
+        "  · class_detail 给的 token 是连接两侧的钥匙：静态 token == 运行时 token，\n"
+        "    才是「Hook 落点正确」的证据。\n"
         "\n"
-        "注意：静态查询（第 3、4 步）不需要启动游戏；\n"
-        "运行时工具（第 5~8 步）需要游戏可注入，且运行 agent 的进程\n"
-        "要有足够权限（Windows 上通常需要管理员）。"
+        "注意：第 1~3 步是纯静态查询，**不需要启动游戏**；\n"
+        "第 4~7 步需要游戏可注入，且运行 agent 的进程要有足够权限\n"
+        "（Windows 上通常需要管理员）。"
     ),
 )
 
@@ -121,46 +137,6 @@ def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
 # ================================================================
 
 
-@mcp.tool(
-    annotations={"title": "探测已安装的游戏", "readOnlyHint": True},
-)
-def detect_games(limit: int = 50) -> dict:
-    """扫描本机已安装的游戏（Steam 库 + 常见安装位置）。
-
-    这是工作流的起点。返回的每一项里 `install_dir` 就是后续
-    open_game 需要的参数。
-
-    Args:
-        limit: 最多返回多少个。
-
-    Returns:
-        {ok, count, games: [{name, install_dir, exe, appid, source, engine}]}
-    """
-    try:
-        games = discovery.list_steam_games(limit=0)
-    except Exception as exc:
-        return _err(f"扫描 Steam 库失败：{exc}")
-
-    out = []
-    for g in games[: max(1, limit)]:
-        rec = {
-            "name": g.name,
-            "install_dir": g.install_dir,
-            "exe": g.exe,
-            "appid": g.appid,
-            "source": g.source,
-        }
-        # 顺便识别引擎，方便 Agent 直接决定用哪套工具
-        try:
-            rec["engine"] = discovery.detect_engine(g.install_dir)
-        except Exception as exc:
-            rec["engine"] = "unknown"
-            rec["engine_error"] = str(exc)
-        out.append(rec)
-
-    return _ok(count=len(out), total_scanned=len(games), games=out)
-
-
 @mcp.tool(annotations={"title": "列出运行中的游戏进程", "readOnlyHint": True})
 def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
     """列出正在运行的游戏进程，并识别其运行时（il2cpp / mono / 其它）。
@@ -199,8 +175,8 @@ def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
 def inspect_game(game_dir: str) -> dict:
     """探测一个游戏目录：识别引擎、找出主程序与关键文件。
 
-    当 detect_games 没扫到你的游戏（比如非 Steam 安装）时，
-    直接用这个工具传入安装目录即可。
+    本项目的使用方式是「一次只针对一个游戏项目目录」，
+    所以不必去扫全机有哪些游戏 —— 直接把目录传进来即可。
 
     Args:
         game_dir: 游戏安装目录。
@@ -369,26 +345,75 @@ def search_classes(
 
 
 @mcp.tool(annotations={"title": "查看类的完整细节", "readOnlyHint": True})
-def class_detail(full_name: str, include_inherited: bool = False) -> dict:
+def class_detail(full_name: str, include_inherited: bool = False,
+                 method_name: str = "") -> dict:
     """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链。
 
-    **这是定位 Hook 落点的核心工具**：字段给出偏移、方法给出 token，
-    再配合 runtime_class_info 就能拿到真实的运行时地址。
+    **这是定位 Hook 落点的核心工具**：方法的 token 由这里给出，
+    再配合 runtime_class_info / find_hook_target 就能拿到真实的运行时地址。
+
+    重要：**静态元数据里没有字段偏移、也没有方法地址**（只有 token）。
+    字段偏移与方法真实地址必须靠注入后的运行时工具取。
 
     Args:
         full_name:         类的完整名（如 "PresetLoaderV2" 或
                            "TeamTapas.ProjectR.UserDatas.Service.UserData_Service"）。
         include_inherited: 是否包含继承来的字段/方法。
+        method_name:       只关心某个方法时填这里。填了就只返回该方法的
+                           全部重载（含 token / 参数表 / 是否静态），
+                           等价于旧的 get_method_source，省一轮往返。
     """
     idx, err = _need_index()
     if err:
         return err
     if not full_name:
         return _err("必须提供 full_name")
+    # 指定 method_name 时强制带上继承的方法：被合并的 get_method_source
+    # 原本就是 include_inherited=True，若不这样，查一个继承来的
+    # Update/OnEnable 会得到「未找到」的假否定。
+    want_inherited = include_inherited or bool(method_name)
     try:
-        res = idx.class_detail(full_name, include_inherited=include_inherited)
+        res = idx.class_detail(full_name, include_inherited=want_inherited)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
+
+    # 只要某个方法时，在这里收窄 —— 合并 get_method_source 的关键：
+    # 它原本就是「class_detail 结果里按名字过滤 methods」，独立成一个工具
+    # 只会让 Agent 犹豫该调哪个。
+    if method_name:
+        if not res.get("found"):
+            return _index_query(
+                res, f"方法：{full_name}.{method_name}",
+                hint="用 search_classes 先确认类名",
+            )
+        all_methods = res.get("methods") or []
+        hits = [x for x in all_methods if x.get("name") == method_name]
+        if not hits:
+            return _err(
+                f"类 {full_name} 中未找到方法 {method_name}",
+                available=sorted({x.get("name", "") for x in all_methods})[:80],
+                overload_count=0,
+            )
+        out = _ok(
+            class_full_name=res.get("full_name"),
+            method=method_name,
+            overload_count=len(hits),
+            methods=hits,
+        )
+        if len(hits) == 1:
+            # 唯一匹配：把常用字段提上来，避免 Agent 写 methods[0].token
+            for k in ("index", "name", "token", "return_type",
+                      "parameter_count", "parameters", "is_static",
+                      "is_virtual", "is_constructor", "flags"):
+                if k in hits[0]:
+                    out.setdefault(k, hits[0][k])
+        else:
+            out["note"] = (
+                f"{method_name} 有 {len(hits)} 个重载，请按 parameter_count "
+                f"选定目标；hook_method 的 args_type 也要与此对应。"
+            )
+        return out
+
     return _index_query(
         res, f"类：{full_name}",
         hint="用 search_classes 先确认名称；注意有些类型需要完整命名空间",
@@ -472,42 +497,35 @@ def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6) -> 
     return _index_query(res, f"类：{full_name}")
 
 
-@mcp.tool(annotations={"title": "查找派生类", "readOnlyHint": True})
-def find_derived_classes(base_full_name: str, limit: int = 200) -> dict:
-    """找出所有继承自某个基类的类型。
+@mcp.tool(annotations={"title": "查找继承自某类的类型", "readOnlyHint": True})
+def find_derived_classes(base_full_name: str, limit: int = 200,
+                         assembly: str = "") -> dict:
+    """找出所有继承自某个基类的类型（含间接继承）。
 
-    典型用途：找游戏里所有 MonoBehaviour、所有 UI 面板、所有数据服务。
+    两个最常见的用法：
+
+    · 找游戏自己写的 MonoBehaviour 脚本（Mod 最常 Hook 的目标）：
+      `find_derived_classes(base_full_name="UnityEngine.MonoBehaviour",
+                            assembly="Assembly-CSharp")`
+      传 assembly 比按程序集名前缀猜「哪些是引擎自带的」可靠。
+    · 找所有 UI 面板 / 数据服务：把 base_full_name 换成对应基类即可。
+
+    基类**不必**在当前索引的程序集里（如 UnityEngine.MonoBehaviour
+    属于框架程序集），这种情况结果依然有效，并在 note 里如实说明。
 
     Args:
         base_full_name: 基类完整名，如 "UnityEngine.MonoBehaviour"。
+        assembly:       只看该程序集（子串匹配，如 "TeamTapas"）。留空不限。
     """
     idx, err = _need_index()
     if err:
         return err
     try:
-        res = idx.find_derived_classes(base_full_name, limit=limit)
+        res = idx.find_derived_classes(base_full_name, limit=limit,
+                                       assembly=assembly)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
     return _index_query(res, f"基类：{base_full_name}")
-
-
-@mcp.tool(annotations={"title": "查找 MonoBehaviour 子类", "readOnlyHint": True})
-def find_monobehaviours(name_pattern: str = "", limit: int = 200) -> dict:
-    """列出游戏里的 MonoBehaviour 子类（即挂在 GameObject 上的脚本组件）。
-
-    这些是 Mod 最常 Hook 的目标：Update、Start、OnEnable 等。
-
-    Args:
-        name_pattern: 名称子串过滤。
-    """
-    idx, err = _need_index()
-    if err:
-        return err
-    try:
-        res = idx.find_monobehaviours(name_pattern=name_pattern, limit=limit)
-        return _ok(**res)
-    except Exception as exc:
-        return _err(f"查询失败：{exc}")
 
 
 @mcp.tool(annotations={"title": "分析类型依赖", "readOnlyHint": True})
@@ -555,46 +573,6 @@ def list_images(pattern: str = "", limit: int = 200) -> dict:
         return _ok(total=total, returned=len(items), items=items)
     except Exception as exc:
         return _err(f"查询失败：{exc}")
-
-
-@mcp.tool(annotations={"title": "取方法的静态信息", "readOnlyHint": True})
-def get_method_source(full_name: str, method_name: str) -> dict:
-    """取某个方法的静态信息（token、参数、返回类型、是否静态/虚方法）。
-
-    注意：本工具**不返回 C# 源码**（IL2CPP 元数据里没有 IL 指令体）。
-    Mono 游戏可以直接用 ILSpy/dnSpy 反编译拿源码。
-
-    **重载**：同名方法可能有多个（参数不同），因此结果主体是 `methods` 列表。
-    如果只有一个匹配，它的 token 等字段也会被提到顶层，省得 Agent 多下钻一层。
-
-    Args:
-        full_name:   类完整名。
-        method_name: 方法名。
-    """
-    idx, err = _need_index()
-    if err:
-        return err
-    try:
-        res = idx.get_method_source(full_name, method_name)
-    except Exception as exc:
-        return _err(f"查询失败：{exc}")
-    out = _index_query(res, f"方法：{full_name}.{method_name}")
-    if out.get("ok"):
-        ms = out.get("methods") or []
-        out["overload_count"] = len(ms)
-        if len(ms) == 1:
-            # 唯一匹配：把常用字段提上来，避免 Agent 写 methods[0].token
-            for k in ("index", "name", "token", "return_type",
-                      "parameter_count", "parameters", "is_static",
-                      "is_virtual", "is_constructor", "flags"):
-                if k in ms[0]:
-                    out.setdefault(k, ms[0][k])
-        elif len(ms) > 1:
-            out["note"] = (
-                f"{method_name} 有 {len(ms)} 个重载，请按 parameter_count "
-                f"选定目标；直接 hook_method 时也要给对参数类型。"
-            )
-    return out
 
 
 # ================================================================
@@ -721,7 +699,11 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
     res = ensure_runtime(spawn=True, launcher_exe=target,
                          preferred_module=preferred_module)
     if not res.get("ok"):
-        return _err(res.get("error", "启动失败"), target=target, argv=argv)
+        # 把下层的 hint 一起透传：例如「已有会话，先 close_session」
+        # 这类出路信息比单纯的 error 更有用，丢掉会让 Agent 无从下手。
+        extra = {k: v for k, v in res.items() if k not in ("ok", "error")}
+        return _err(res.get("error", "启动失败"), target=target, argv=argv,
+                    **extra)
     rt = res.get("runtime") or {}
     # 同 inject_process：res 里可能已有 pid/target/argv 键，先摘掉避免重复关键字
     body = {k: v for k, v in res.items()
@@ -1242,8 +1224,7 @@ def _ue_exe(exe: str) -> tuple[str, dict | None]:
 def detect_ue(exe: str = "") -> dict:
     """判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据。
 
-    与 detect_games 的区别：那个是「扫本机装了什么」，
-    这个是「判定这一个具体程序是不是 UE」。
+    只判定**这一个**程序，不做全机扫描。
 
     **UE 版本号拿不到是正常的**：实测两个样本中 exe 内 UE 版本模式 0 命中，
     Engine/Build/Build.version 也不存在。此时返回空串 + 原因，不猜测。
@@ -1462,14 +1443,19 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
 
 
 @mcp.tool(annotations={"title": "环境与能力诊断", "readOnlyHint": True})
-def get_diagnostics() -> dict:
-    """检查运行环境：Python、Frida、各引擎解析器是否可用、本机有无游戏在跑。
+def get_diagnostics(scan_processes: bool = False) -> dict:
+    """检查运行环境：Python、Frida、各引擎解析器是否可用。
 
     开始工作前建议先调一次，明确「这台机器上能做什么」。
     如果某项显示不可用，对应的工具会失败——这是环境问题，不是工具 bug。
+
+    Args:
+        scan_processes: 是否顺带列出本机正在运行的游戏。默认 **False**。
+            该扫描实测耗时约 2.7 秒，且与 `find_game_processes` 职责重复，
+            所以默认不扫 —— 要列运行中的游戏请直接调 `find_game_processes`。
     """
     try:
-        info = state.diagnostics()
+        info = state.diagnostics(scan_processes=scan_processes)
         info["version"] = __version__
         return _ok(**info)
     except Exception as exc:
