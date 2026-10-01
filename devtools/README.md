@@ -28,6 +28,7 @@ python devtools\verify_response_size.py    # 响应体积：P2-4 前后对比 + 
 python devtools\verify_cap.py              # 体积上限的机制：截断/句柄/字段诚实性/不丢数据（无需注入）
 python devtools\verify_mcp_resources.py    # MCP 资源层：gamemod://guide 与 SKILL.md 同源 + 找不到时如实说（无需注入）
 python devtools\verify_mcp_context.py      # P2-3 决策门禁：为什么不加进度/取消/tasks（无需注入，不需要游戏）
+python devtools\verify_cache.py            # P3-2 索引缓存生命周期：只删形状正确的 + 三条护栏 + 命中 touch（只需 Mono 样本）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）

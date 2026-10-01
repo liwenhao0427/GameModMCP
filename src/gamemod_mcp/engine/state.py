@@ -588,7 +588,10 @@ def diagnostics(scan_processes: bool = False) -> dict:
                 "capabilities": UE_CAPABILITIES,
             },
         },
-        "cache_dir": str(default_cache_dir_safe()),
+        # 缓存目录与**真实占用**（P3-2）。以前只报路径，于是「缓存涨到几 GB」
+        # 这件事在任何工具返回里都看不见。files/total_bytes 是现数现算的真数；
+        # 清理边界（2 GiB / 最近 4 个 / 7 天）写在 index.py 常量里，不在这里重复。
+        "cache": cache_stats_safe(),
         "session": _state.summary(),
     }
 
@@ -632,12 +635,22 @@ def diagnostics(scan_processes: bool = False) -> dict:
     return info
 
 
-def default_cache_dir_safe() -> str:
+def cache_stats_safe() -> dict[str, Any]:
+    """缓存目录的真实占用（P3-2）。
+
+    以前这里是 `default_cache_dir_safe()`，**只返回一个路径字符串** ——
+    于是「缓存涨到几 GB」这件事在任何工具的返回里都看不到，
+    而缓存文件名带元数据摘要、游戏一更新就换一个文件，只会一直涨。
+
+    统计失败不抛异常（诊断工具不该因为一个附加信息挂掉），
+    但要**如实报 error**，不拿 0 冒充「缓存是空的」。
+    """
     try:
-        from .index import default_cache_dir
-        return str(default_cache_dir())
-    except Exception:
-        return ""
+        from .index import cache_stats
+        return cache_stats()
+    except Exception as exc:
+        return {"dir": "", "files": 0, "total_bytes": 0,
+                "error": f"缓存目录统计失败：{exc}"}
 
 
 def _mono_ready() -> bool:

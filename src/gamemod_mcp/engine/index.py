@@ -46,7 +46,10 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import os
+import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -65,12 +68,183 @@ SCHEMA_VERSION = 2
 
 def default_cache_dir() -> Path:
     """默认缓存目录：用户主目录下的 .gamemod/cache。"""
-    import os
-
     base = os.environ.get("GAMEMOD_CACHE_DIR")
     if base:
         return Path(base)
     return Path.home() / ".gamemod" / "cache"
+
+
+# ---------------------------------------------------------------- 缓存生命周期
+#
+# 缓存文件名 = `<引擎>-<元数据 sha256 前 16 位>.sqlite`，于是：
+#   · 同一个游戏 + 同一份元数据 → 同一个文件（命中复用）；
+#   · 游戏一更新（元数据变了）→ **换一个新文件**，旧文件再也不会被命中。
+# 所以「玩过多少游戏」加上「游戏更新过多少次」都会永久堆在缓存目录里，
+# 既没人清理，也没有任何地方报告它占了多少 —— 一个 26 MB 起步的纯泄漏
+# （实测一个 IL2CPP 游戏的索引 25.7 MB，而且 Mod 开发本来就要反复更新游戏）。
+#
+# 这里补三件事：**看得到**（`cache_stats`）、**有边界**（`prune_cache`）、
+# **在用的不会被误删**（命中时 touch，让 mtime 成为真的「最后使用时间」）。
+
+#: 缓存文件名的形状。**只清理严格符合这个形状的文件**：缓存目录里可能有
+#: 别的东西（用户自己的笔记、别的工具的数据、半截的临时文件），
+#: 而删文件是不可逆的 —— 宁可漏删，不可错删。
+_CACHE_NAME_RE = re.compile(r"^(il2cpp|mono|ue)-[0-9a-f]{16}\.sqlite$")
+
+#: 自动清理的保守边界。刻意留得宽：删掉一个以后还要用的缓存，
+#: 代价是重新解析 0.5~12 秒；多留一个的代价只是 26 MB。
+#: 按这三个数，5 个游戏的 130 MB 永远不会被碰。
+CACHE_MAX_TOTAL_BYTES = 2 * 1024 ** 3   # 2 GiB
+CACHE_MIN_KEEP = 4                      # 无论超多少，最近用过的 4 个都不删
+CACHE_MIN_AGE_SECONDS = 7 * 86400       # 7 天内用过的都不删
+
+
+def _cache_files(cache_dir: str | Path | None = None) -> list[Path]:
+    """缓存目录里**形状正确**的索引文件，按 mtime 升序（最久没用的在前）。
+
+    目录不存在或读不了 → 返回空列表（这不是错误：缓存目录本来就允许不存在）。
+    """
+    cache = Path(cache_dir) if cache_dir else default_cache_dir()
+    try:
+        entries = list(cache.iterdir())
+    except OSError:
+        return []
+    out: list[Path] = []
+    for p in entries:
+        if not _CACHE_NAME_RE.match(p.name):
+            continue
+        try:
+            if p.is_file():
+                out.append(p)
+        except OSError:
+            continue
+
+    def _mtime(p: Path) -> float:
+        # 排序键也要能容错：iterdir 与 stat 之间文件可能正好被删掉。
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(out, key=_mtime)
+
+
+def cache_stats(cache_dir: str | Path | None = None) -> dict[str, Any]:
+    """缓存占用概况（**只读**，不删任何东西）。
+
+    给 `get_diagnostics` / `index_info` 用：缓存是个会一直长大的目录，
+    不报出来就等于让用户自己猜磁盘去哪了。
+    """
+    cache = Path(cache_dir) if cache_dir else default_cache_dir()
+    files = _cache_files(cache)
+    total = 0
+    for p in files:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return {"dir": str(cache), "files": len(files), "total_bytes": total}
+
+
+def _touch(path: Path) -> None:
+    """把 mtime 更新为「现在」，即「这个缓存刚被用过」。
+
+    为什么必须有：sqlite 的**读**不会改文件 mtime，而 `prune_cache` 的 LRU
+    完全依赖 mtime。不 touch 的话，一个天天在用的缓存，在 LRU 眼里永远是
+    「创建那一天用过的」，反而会先被删掉。
+    失败就算了：只影响清理精度，不值得让「开索引」失败。
+    """
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def prune_cache(
+    cache_dir: str | Path | None = None,
+    *,
+    protect: Iterable[str | Path] = (),
+    max_total_bytes: int = CACHE_MAX_TOTAL_BYTES,
+    min_keep: int = CACHE_MIN_KEEP,
+    min_age_seconds: float = CACHE_MIN_AGE_SECONDS,
+) -> dict[str, Any]:
+    """按「最久没用」的顺序删缓存，直到总大小回到 `max_total_bytes` 以内。
+
+    三条护栏（少任何一条都可能删掉还在用的东西）：
+
+    1. **只删形状正确的文件**（`_CACHE_NAME_RE`）——其它一律不碰；
+    2. `min_keep` 个最近用过的**永不删**，哪怕它们自己就超了上限；
+    3. `min_age_seconds` 内用过的**永不删**（mtime 由命中时的 `_touch` 维护）。
+
+    跳过某个文件不会让它后面的文件也失去机会（挨个判，不提前收工）。
+    删不掉（例如 Windows 上文件被另一个进程占着）就记进 `errors`，
+    **不**让整个操作失败 —— 已经有别的文件被删掉了，谎报成功更糟。
+
+    返回的是 dict 而不是 bool：删了哪几个、释放了多少，都要看得见。
+    """
+    cache = Path(cache_dir) if cache_dir else default_cache_dir()
+    files = _cache_files(cache)
+    protect_names = {Path(p).name for p in protect}
+
+    total = 0
+    for p in files:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "dir": str(cache),
+        "candidates": len(files),
+        "total_bytes_before": total,
+        "total_bytes_after": total,
+        "deleted": [],
+        "freed_bytes": 0,
+        "errors": [],
+        # 实际生效的边界（不是模块默认值）：调用方可能传了别的上限，
+        # 报告里必须说**这一次**用了什么，否则就是拿默认值冒充实况。
+        "max_total_bytes": max_total_bytes,
+        "min_keep": min_keep,
+        "min_age_seconds": min_age_seconds,
+    }
+    if total <= max_total_bytes:
+        out["skipped"] = (
+            f"总大小 {total} 字节未超过上限 {max_total_bytes}，无需清理")
+        return out
+
+    # 最后 min_keep 个（mtime 最大的）受保护。
+    # 注意 min_keep=0 时 `files[-0:]` 是整个列表 —— 那会把**所有**文件都保护起来，
+    # 一个也删不掉（看着像「护栏生效」，其实是 bug），所以这里显式分支。
+    keep_names = ({p.name for p in files[len(files) - min_keep:]}
+                  if min_keep > 0 else set())
+    now = time.time()
+
+    for p in files:                      # 已按 mtime 升序：最久没用的在最前
+        if out["total_bytes_after"] <= max_total_bytes:
+            break
+        if p.name in keep_names or p.name in protect_names:
+            continue
+        try:
+            st = p.stat()
+        except OSError as exc:
+            out["errors"].append(f"{p.name}: 读不到状态（{exc}）")
+            continue
+        if now - st.st_mtime < min_age_seconds:
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            # 最常见：Windows 上这个库正被另一个进程打开着
+            out["errors"].append(f"{p.name}: 删不掉（{exc}）")
+            continue
+        out["deleted"].append(p.name)
+        out["freed_bytes"] += st.st_size
+        out["total_bytes_after"] -= st.st_size
+
+    if not out["deleted"]:
+        out["skipped"] = "超过上限，但剩下的文件都受护栏保护（最近用过 / 太新 / 已保护）"
+    return out
 
 
 def _file_sha256(path: Path, chunk: int = 1 << 20) -> str:
@@ -298,6 +472,10 @@ class Index:
         # 构建一次约 6 ms（IL2CPP 20,072 类型），元数据本身是只读的，
         # 所以不需要失效逻辑。
         self._child_map: dict[str, list[Any]] | None = None
+        # 打开索引时顺带做的缓存清理结果（P3-2），由 `open()` 赋值。
+        # 默认 None = 「没清理过」（例如直接 `Index(meta, path)` 建的索引）——
+        # 不用空 dict 冒充「清理了但什么都没删」，两者含义不同。
+        self.cache_pruned: dict[str, Any] | None = None
 
     @property
     def meta(self) -> Any:
@@ -412,6 +590,10 @@ class Index:
             idx._attach(None, db_path,
                         metadata_path=metadata_path, engine=eng)
             idx.cache_hit = True          # ← 真的复用了缓存
+            # 「命中」就是「用过」：不刷新 mtime，prune_cache 的 LRU 会把这个
+            # 天天在用的缓存当成最久没用的那个。
+            _touch(db_path)
+            idx.cache_pruned = prune_cache(cache, protect=[db_path.name])
             return idx
 
         if db_path.is_file() and force_rebuild:
@@ -421,6 +603,7 @@ class Index:
         meta = cls._load_meta(metadata_path, engine)
         progress(f"构建索引 {db_path.name}（{adapt.engine_label(meta)}）...")
         idx = cls(meta, db_path)          # __init__ 里 cache_hit=False
+        idx.cache_pruned = prune_cache(cache, protect=[db_path.name])
         return idx
 
     @staticmethod
@@ -658,6 +841,24 @@ class Index:
         ).fetchone()[0]
         info["image_count"] = cur.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         info["cache_hit"] = bool(getattr(self, "cache_hit", False))
+        # 缓存占用（P3-2）：缓存目录会随「换游戏 / 游戏更新」一直长大，
+        # 报出来才看得见。这是**真数**（现数现算），不是配置里的上限。
+        info["cache"] = cache_stats(self.db_path.parent)
+        # 只在**真的删了东西**时才有这个字段：没删就不给，
+        # 免得客户端把「空列表」读成「缓存是干净的」这种恒定噪声。
+        pruned = getattr(self, "cache_pruned", None) or {}
+        if pruned.get("deleted"):
+            limit = pruned.get("max_total_bytes")
+            info["cache_evicted"] = {
+                "files": list(pruned["deleted"]),
+                "freed_bytes": pruned.get("freed_bytes", 0),
+                # 上限取**这一次实际用的**那个值，不写模块默认常量：
+                # 调用方可以传别的上限，写默认值就成了「报告说谎」。
+                "limit_bytes": limit,
+                "reason": f"缓存总大小超过 {limit} 字节上限，"
+                          f"按最久未用优先清理（保留最近 {pruned.get('min_keep')} 个"
+                          f"与 {int(pruned.get('min_age_seconds', 0)) // 86400} 天内用过的）",
+            }
         # 把「这个引擎在元数据层面能提供什么」一并透给 Agent，
         # 免得它把「IL2CPP 本来就没有字段 flags」误判成工具出错。
         #
