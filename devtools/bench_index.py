@@ -99,6 +99,11 @@ def bench_open(label: str, mpath: Path) -> None:
     db = idx.db_path
     print(f"  Index.open 缓存命中          {ms(t1, t2):9.1f} ms"
           f"   cache_hit={idx.cache_hit}")
+    # 这里给的是**确定性证据**，不是时间：缓存命中后 `_meta` 必须仍是 None。
+    # 时间会闪（机器负载、杀毒扫描），而这个布尔值不会 ——
+    # 它直接回答「命中缓存到底有没有解析元数据」。
+    parsed = idx._meta is not None
+    print(f"  缓存命中后是否已解析元数据：{'是 ← 仍在全量解析！' if parsed else '否（惰性生效）'}")
     idx.close()
 
     t2 = time.perf_counter()
@@ -117,8 +122,12 @@ def bench_open(label: str, mpath: Path) -> None:
     conn.close()
     print(f"  _is_valid（含一次 connect）  {ms(t3, t4):9.1f} ms   valid={valid}")
     print(f"  connect + COUNT(*)           {ms(t4, t5):9.1f} ms")
-    print(f"  → 缓存命中里可省的份额 ≈ "
-          f"{ms(t0, t1) / max(ms(t1, t2), 1e-9) * 100:.0f}%（P1-2 的目标）")
+    # 注意：不要用「解析耗时 / 缓存命中耗时」当收益比例 —— 那个式子只在
+    # **修复前**才有意义（那时命中路径里确实含解析）。修好之后它已经
+    # 不含解析，比值会算出 2000% 这种荒唐数字（实测过）。
+    # 收益要看的是「命中 vs 全量解析」这两个绝对值：
+    print(f"  → 每次缓存命中，比全量解析省下 ≈ {ms(t0, t1):.1f} ms"
+          f"（{ms(t1, t2):.1f} ms vs {ms(t0, t1):.1f} ms）")
     print(f"  → 缓存命中的理论下限 ≈ {ms(t3, t5):.1f} ms"
           f"（校验 + 连库，不碰解析器）")
 
@@ -128,6 +137,18 @@ def bench_query(label: str, mpath: Path) -> None:
     print(f"[P1-3] 单次查询成本  ——  {label}")
     print("-" * 76)
     idx = I.Index.open(mpath)
+
+    # P1-2 之后，缓存命中的索引**不解析**元数据；第一次碰 `meta` 才解析。
+    # 必须先预热：否则第一条查询会把那次全量解析（IL2CPP 实测约 500 ms）
+    # 算进「② 解析这一页」，看起来像查询本身慢得离谱 —— 实测确实会出现
+    # 「解析 20 条花 503 ms」这种假象。预热后下面的数字才是纯查询成本。
+    lazy_pending = idx._meta is None
+    t0 = time.perf_counter()
+    _ = idx.meta
+    t1 = time.perf_counter()
+    if lazy_pending:
+        print(f"  （预热：首次访问 meta 触发惰性解析 {ms(t0, t1):.1f} ms，"
+              f"不计入下面的查询耗时）")
 
     for tag, sql in (
         ("全表 pattern=''", "SELECT * FROM types ORDER BY nested_name"),

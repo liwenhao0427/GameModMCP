@@ -159,7 +159,9 @@ class Index:
         self.cache_hit = False
         self._build()
 
-    def _attach(self, meta: Any, db_path: Path) -> None:
+    def _attach(self, meta: Any, db_path: Path,
+                metadata_path: str | Path | None = None,
+                engine: str = "") -> None:
         """设置一个索引实例的**全部**共享字段（不解构建）。
 
         单独抽出来是因为 `open()` 的「命中缓存」快路径走 `cls.__new__(cls)`，
@@ -169,8 +171,23 @@ class Index:
         却报 `AttributeError: 'Index' object has no attribute '_child_map'`。
 
         现在字段只在这里列一次，两条路径都走它，不可能再漂移。
+
+        **meta 允许为 None**，表示「缓存命中、尚未解析」（见 `meta` 属性）。
+        这种惰性不是可有可无的优化：IL2CPP 20,072 类型的全量解析实测约
+        480 ms，而缓存命中路径本来只需要读 8 字节的引擎嗅探。
         """
-        self.meta = meta
+        # 注意：这里写的是 `_meta`，不是 `meta` —— 对外的 `meta` 是只读属性，
+        # 直接赋值会 `AttributeError`。外部（含验证脚本）照旧用 `idx.meta`。
+        self._meta = meta
+        self._meta_path = Path(metadata_path) if metadata_path else None
+        # 引擎名必须能在「没解析」时也知道，否则拼不出 db_path、也答不了能力问题。
+        if engine:
+            self.engine = engine
+        elif meta is not None:
+            self.engine = adapt.engine_of(meta)
+        else:
+            self.engine = ""
+        self._closed = False
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
@@ -180,7 +197,52 @@ class Index:
         # 所以不需要失效逻辑。
         self._child_map: dict[str, list[Any]] | None = None
 
+    @property
+    def meta(self) -> Any:
+        """元数据解析器，**按需解析**。
+
+        缓存命中时 `open()` 不做任何解析就直接返回，所以 `_meta` 是 None；
+        第一次访问本属性才真正载入解析器。这样「只想查索引」的调用
+        （`search_classes` / `index_info` 等）**完全不必**把整份元数据
+        读进内存。
+
+        需要全量类型的路径（`_direct_children`）照旧通过本属性取，
+        即「用到才付钱」，行为不变。
+        """
+        if self._meta is None:
+            if self._closed:
+                raise MetadataError(
+                    "索引已关闭，元数据不再可用（不能再惰性解析）"
+                )
+            if self._meta_path is None:
+                raise MetadataError("索引未记录元数据路径，无法惰性解析")
+            self._meta = self._load_meta(self._meta_path, self.engine)
+        return self._meta
+
     # ------------------------------------------------------ 生命周期
+
+    @staticmethod
+    def _resolve_engine(metadata_path: Path, engine: str = "") -> str:
+        """定出引擎名，**不解析元数据**。
+
+        显式传入的 engine 优先（不认识就报错，不静默回退）；
+        否则只读文件头 8 字节嗅探。
+
+        为什么单独抽出来：`open()` 需要引擎名来拼缓存文件路径，
+        而这件事**只需要文件名**。以前它是先 `_load_meta` 全量解析、
+        再 `adapt.engine_of` 反推引擎名 —— 为了一个字符串付了 480 ms。
+        实测嗅探结果与 `adapt.engine_of` 在两个真实样本上完全一致。
+        """
+        want = (engine or "auto").strip().lower()
+        if want in ("auto", "", "unknown"):
+            return Index._sniff_engine(metadata_path)
+        if want in ("il2cpp", "mono"):
+            return want
+        # 显式指定了不认识的引擎：直接报错，不要静默回退到某个解析器。
+        # 静默回退正是「Agent 拿到貌似成功但内容错乱的结果」的根源。
+        raise MetadataError(
+            f"不支持的引擎类型：{engine!r}（可用：il2cpp / mono / auto）"
+        )
 
     @staticmethod
     def _load_meta(metadata_path: Path, engine: str = "") -> Any:
@@ -190,20 +252,10 @@ class Index:
         global-metadata.dat 以 0xFAB11BAF 开头），不是 IL2CPP 就试 Mono。
         显式传入 engine 可以跳过嗅探、避免误判。
         """
-        want = (engine or "auto").strip().lower()
-        if want in ("auto", "", "unknown"):
-            want = Index._sniff_engine(metadata_path)
-
+        want = Index._resolve_engine(metadata_path, engine)
         if want == "il2cpp":
             return Metadata(metadata_path)
-        if want == "mono":
-            return MonoMetadata(metadata_path)
-
-        # 显式指定了不认识的引擎：直接报错，不要静默回退到某个解析器。
-        # 静默回退正是「Agent 拿到貌似成功但内容错乱的结果」的根源。
-        raise MetadataError(
-            f"不支持的引擎类型：{engine!r}（可用：il2cpp / mono / auto）"
-        )
+        return MonoMetadata(metadata_path)
 
     @staticmethod
     def _sniff_engine(metadata_path: Path) -> str:
@@ -234,10 +286,14 @@ class Index:
 
         缓存键 = 元数据文件 sha256，因此换游戏/换版本会自动重建，不会串数据。
         engine 为空时自动嗅探（IL2CPP / Mono）。
+
+        **缓存命中时完全不解析元数据**：只用 8 字节嗅探定出引擎名来拼
+        db_path，真正需要元数据时再由 `meta` 属性按需解析。
+        以前这里是无条件 `_load_meta` 全量解析，命中也白付 480 ms（IL2CPP）。
         """
         metadata_path = Path(metadata_path)
-        meta = cls._load_meta(metadata_path, engine)
-        eng = adapt.engine_of(meta)
+        # 只定引擎名，不解析。（显式 engine 非法时这里就会报错，与旧行为一致）
+        eng = cls._resolve_engine(metadata_path, engine)
 
         cache = Path(cache_dir) if cache_dir else default_cache_dir()
         cache.mkdir(parents=True, exist_ok=True)
@@ -250,13 +306,17 @@ class Index:
             progress(f"复用索引缓存 {db_path.name}")
             idx = cls.__new__(cls)
             # 走与 __init__ 相同的字段初始化，杜绝「只在命中缓存时缺字段」
-            idx._attach(meta, db_path)
+            # meta=None 是**刻意**的：命中缓存就不该解析，见 `meta` 属性。
+            idx._attach(None, db_path,
+                        metadata_path=metadata_path, engine=eng)
             idx.cache_hit = True          # ← 真的复用了缓存
             return idx
 
         if db_path.is_file() and force_rebuild:
             db_path.unlink()
 
+        # 只有确定要重建时才解析元数据。
+        meta = cls._load_meta(metadata_path, engine)
         progress(f"构建索引 {db_path.name}（{adapt.engine_label(meta)}）...")
         idx = cls(meta, db_path)          # __init__ 里 cache_hit=False
         return idx
@@ -280,10 +340,18 @@ class Index:
             return False
 
     def close(self) -> None:
+        """关闭连接与元数据。
+
+        元数据可能是**从未解析**的（缓存命中且没用到）—— 这正是我们想要的：
+        关闭时也不该为了「关掉它」而先花 480 ms 把它解析起来。
+        """
         try:
             self.conn.close()
         finally:
-            self.meta.close()
+            self._closed = True
+            meta, self._meta = self._meta, None
+            if meta is not None:
+                meta.close()
 
     def __enter__(self) -> Index:
         return self
@@ -490,7 +558,11 @@ class Index:
         info["cache_hit"] = bool(getattr(self, "cache_hit", False))
         # 把「这个引擎在元数据层面能提供什么」一并透给 Agent，
         # 免得它把「IL2CPP 本来就没有字段 flags」误判成工具出错。
-        info["capabilities"] = adapt.capabilities(self.meta)
+        #
+        # 用 capabilities_of(引擎名) 而不是 capabilities(self.meta)：
+        # 这个问题的答案**只取决于引擎名**，用 self.meta 会把整份元数据
+        # 解析起来（IL2CPP 约 480 ms）—— 「查个概况」不该付这个钱。
+        info["capabilities"] = adapt.capabilities_of(self.engine)
         return info
 
     # ------------------------------------------------------ 跨引擎解析收口

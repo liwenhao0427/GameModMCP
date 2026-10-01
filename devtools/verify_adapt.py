@@ -213,15 +213,33 @@ def run_engine(label: str, path: Path, expect_engine: str,
                   f"取回 {len(pg.get('items', []))} 条")
 
     # ---- 缓存复用
+    #
+    # 这里原来断言 `dt2 < dt`（「二次打开比首次快」）—— 那是个**假断言**：
+    # `dt` 那次也是缓存命中（CACHE 目录跨次运行是留着的），
+    # 所以比的是两个几乎相同的数，谁小全看抖动。实测 P1-2 之前就已经
+    # 在「49+1 警告」与「50+0 警告」之间来回闪；P1-2 之后两边都降到
+    # 0.00s，退化成 `0.00s < 0.00s`，更没有意义。
+    #
+    # 「缓存复用生效」本来就是**确定性事实**，不该拿时间去证。
+    # 而且 P1-2 之后命中路径根本不再解析元数据，时间上更没什么可比的了。
     idx.close()
-    t1 = time.time()
     idx2 = Index.open(path, cache_dir=CACHE, engine=expect_engine)
-    dt2 = time.time() - t1
-    print(f"     二次打开（走缓存）{dt2:.2f}s")
-    check(f"{label} 二次打开复用缓存", dt2 < dt, f"{dt2:.2f}s < {dt:.2f}s",
-          warn_only=True)
-    check(f"{label} 复用后引擎仍正确",
-          adapt.engine_of(idx2.meta) == expect_engine)
+    check(f"{label} 二次打开走的是缓存复用",
+          idx2.cache_hit is True, f"cache_hit={idx2.cache_hit}")
+    # 下面这条是 P1-2 的核心行为：命中缓存**不得**解析元数据。
+    # 必须在碰 `.meta` 之前查，否则测的就不是「命中时是否解析」了。
+    check(f"{label} 缓存命中不解析元数据（P1-2 惰性）",
+          idx2._meta is None,
+          "命中后已被解析" if idx2._meta is not None else "未解析")
+
+    # P1-2 敢用「读 8 字节嗅探」替换「全量解析反推引擎名」，前提是两者一致。
+    # 这条断言就是那个前提本身 —— 一旦某个引擎上不成立，P1-2 就会静默用错
+    # 解析器、拼错缓存文件名，所以必须显式守住。
+    sniffed = idx2.engine
+    parsed = adapt.engine_of(idx2.meta)
+    check(f"{label} 嗅探引擎 == 解析后引擎（P1-2 前提）",
+          sniffed == parsed == expect_engine,
+          f"嗅探={sniffed} 解析={parsed} 期望={expect_engine}")
     idx2.close()
 
 

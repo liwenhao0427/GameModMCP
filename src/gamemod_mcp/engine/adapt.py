@@ -215,14 +215,15 @@ def image_of_type(meta: Any, t: Any) -> str:
 
 # ---------------------------------------------------------------- 能力声明
 
-def capabilities(meta: Any) -> dict:
-    """本引擎在**元数据层面**能提供什么、不能提供什么。
+def capabilities_of(engine: str) -> dict:
+    """按**引擎名**给出能力声明，不需要解析器实例。
 
-    这份声明会透给 Agent，让它知道哪些字段是「真的没有」
-    而不是「工具坏了」。两个引擎的能力差异是客观存在的：
+    单独抽出来是为了让 `Index.index_info()` 能回答「这个引擎支不支持某能力」
+    而**不必把整份元数据解析起来**：这个问题的答案只取决于引擎名，
+    而 IL2CPP 20,072 类型的全量解析实测约 497 ms。
+    （缓存命中时索引本就是按需解析的，见 `Index.meta` 属性。）
     """
-    eng = engine_of(meta)
-    if eng == ENGINE_IL2CPP:
+    if engine == ENGINE_IL2CPP:
         return {
             "engine": ENGINE_IL2CPP,
             "label": "IL2CPP (Unity)",
@@ -249,3 +250,12 @@ def capabilities(meta: Any) -> dict:
             "可直接用 ILSpy/dnSpy 反编译拿到接近源码的 C#",
         ],
     }
+
+
+def capabilities(meta: Any) -> dict:
+    """本引擎在**元数据层面**能提供什么、不能提供什么。
+
+    这份声明会透给 Agent，让它知道哪些字段是「真的没有」
+    而不是「工具坏了」。两个引擎的能力差异是客观存在的：
+    """
+    return capabilities_of(engine_of(meta))
