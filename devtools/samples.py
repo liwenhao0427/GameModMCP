@@ -161,6 +161,76 @@ def find_mono_groundtruth() -> Path | None:
     return d if d.is_dir() else None
 
 
+def _game_root_count(root: Path, max_depth: int = 3) -> int:
+    """**独立**数一数：这个目录下有多少个「像游戏根」的子目录。
+
+    像游戏根 = 该子目录里有 `<X>_Data/il2cpp_data/Metadata/global-metadata.dat`
+    或 `<X>_Data/Managed`。
+
+    **故意不复用 `discovery` 的实现**：样本的可用性判定必须独立于被测代码，
+    否则被测代码一回归，样本查找也一起失效，测试就变成空转了
+    （「找不到样本」会被当成「无法验证」而不是「修坏了」）。
+    """
+    roots: set[Path] = set()
+    for depth in range(1, max_depth + 1):
+        pattern = "/".join(["*"] * (depth - 1) + ["*_Data"])
+        for data_dir in root.glob(pattern):
+            if not data_dir.is_dir():
+                continue
+            # Windows 上 glob 大小写不敏感，`*_Data` 会匹配到 `<X>_Data/il2cpp_data`
+            if data_dir.name.lower() in ("il2cpp_data", "mono_data"):
+                continue
+            if (data_dir / "il2cpp_data" / "Metadata"
+                    / "global-metadata.dat").is_file() \
+                    or (data_dir / "Managed").is_dir():
+                roots.add(data_dir.parent)
+    return len(roots)
+
+
+def find_container() -> Path | None:
+    """容器目录样本：**装着 ≥2 款游戏**的父目录（不是某一款游戏的目录）。
+
+    这是扫描报告 §3.2 那个缺陷的现场：把这种父目录当游戏传进去，
+    修复前会「挑中其中一个游戏」并返回 `ok: true`。
+    """
+    for root in SAMPLE_ROOTS:
+        if root.is_dir() and _game_root_count(root) >= 2:
+            return root
+    return None
+
+
+#: 本 MCP 不支持、但有明确标记文件的引擎家族（与报告里的判定规则一致）
+UNSUPPORTED_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("godot", ("*.pck", "data_*_windows_*")),
+    ("gamemaker", ("data.win",)),
+    ("electron", ("chrome_100_percent.pak", "resources/app.asar")),
+)
+
+
+def find_unsupported(max_depth: int = 2) -> tuple[Path, str] | None:
+    """不支持引擎的样本：返回 (目录, 家族)，取不到返回 None。
+
+    家族靠**标记文件**判定（Godot 的 .pck、GameMaker 的 data.win、
+    Electron 的 chrome_*.pak / app.asar），不靠目录名 —— 目录名会骗人。
+    """
+    for root in SAMPLE_ROOTS:
+        if not root.is_dir():
+            continue
+        candidates: list[Path] = [root]
+        for depth in range(1, max_depth + 1):
+            pattern = "/".join(["*"] * depth)
+            candidates.extend(p for p in root.glob(pattern) if p.is_dir())
+        for game in candidates:
+            for family, patterns in UNSUPPORTED_MARKERS:
+                for pattern in patterns:
+                    try:
+                        if next(iter(game.glob(pattern)), None) is not None:
+                            return game, family
+                    except OSError:
+                        continue
+    return None
+
+
 # ---------------------------------------------------------------- 便捷访问器
 
 def game_exe(game_dir: Path) -> Path | None:
@@ -198,6 +268,8 @@ if __name__ == "__main__":
         ("UE pak v11 (Dinoblade)", find_ue_pak_v11),
         ("IL2CPP 字段真值 (il2cpp_dump.cs)", find_il2cpp_dump),
         ("Mono 真值生成器", find_mono_groundtruth),
+        ("容器目录（装着多款游戏）", find_container),
+        ("不支持引擎的样本", lambda: (find_unsupported() or (None, ""))[0]),
     ]:
         p = fn()
         mark = "✅" if p is not None else "⚠️ "

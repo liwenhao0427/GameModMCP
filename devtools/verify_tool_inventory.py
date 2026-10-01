@@ -89,6 +89,8 @@ NON_TOOL_IDENTIFIERS = {
     "has_more", "cache_hit", "readOnlyHint", "destructiveHint",
     # P2-4a 起句柄失败时会返回它（可用句柄清单），是返回字段不是工具
     "available_handles",
+    # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
+    "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",

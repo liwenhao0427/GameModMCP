@@ -168,9 +168,15 @@ def part_real_switch(il2cpp: Path, mono: Path | None, ue: Path | None) -> None:
 
     if ue is not None:
         r_u = open_with(ue)
-        check("切到 UE 游戏后 exe 是它的 Shipping 程序",
-              r_u.get("exe", "").lower().endswith("-win64-shipping.exe"),
-              f"{r_u.get('exe')}")
+        # UE 上 `open_game` 现在**故意**返回 ok:false（UE 没有集中元数据，
+        # 见扫描报告 §3.3），所以 exe 要从 session 里读。
+        # 这一节要验的是「会话身份跟着换」，不是「open_game 成功」——
+        # 两件事分开断言，免得其中一件坏了把另一件一起掩盖。
+        exe_u = r_u.get("exe") or (r_u.get("session") or {}).get("exe", "")
+        check("切到 UE 游戏后 exe 是它的 Shipping 程序（UE 上 open_game 按设计返回 ok:false）",
+              r_u.get("ok") is False
+              and exe_u.lower().endswith("-win64-shipping.exe"),
+              f"ok={r_u.get('ok')} exe={exe_u!r}")
         r3 = open_with(il2cpp)
         check("UE → IL2CPP 之后 exe 不再是 UE 的 Shipping 程序",
               not r3.get("exe", "").lower().endswith("-win64-shipping.exe"),
