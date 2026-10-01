@@ -499,12 +499,14 @@ class RuntimeSession:
         return self._call("write_memory", address, hex_data)
 
     def scan_pattern(self, pattern: str, module: str = "",
-                     max_results: int = 32, scope: str = "") -> dict:
+                     max_results: int = 32) -> dict:
+        # 这里曾有一个 `scope` 参数：传下去放进 opts，但 agent.js 只读
+        # `opts.module` / `opts.max_results`，`scope` 从来没被看过一眼 ——
+        # 一个「收了参数却什么也不做」的形参比死代码更坏：调用方会以为
+        # 扫描范围真的被限制了。限定范围用 `module`。
         opts: dict[str, Any] = {"pattern": pattern, "max_results": max_results}
         if module:
             opts["module"] = module
-        if scope:
-            opts["scope"] = scope
         return self._call("scan_pattern", opts)
 
     def eval_js(self, code: str) -> dict:

@@ -78,6 +78,30 @@ def have(path) -> bool:
     return bool(path) and Path(path).is_file()
 
 
+def write_marker(offset: int, width: int, value: int) -> dict:
+    """在伪造实例的真实字段偏移处写入 width 字节的标记值。
+
+    只为 `read_field_value` 的**读取宽度**验收服务：把「这个字段自己的宽度」
+    交给内存，读回来多一个字节都说明实现读了别人的内存。
+    """
+    if width == 1:
+        expr = f"writeU8(0x{value:02x})"
+    elif width == 2:
+        expr = f"writeU16(0x{value:04x})"
+    elif width == 4:
+        expr = f"writeU32(0x{value:08x})"
+    else:
+        expr = f"writeU64(uint64('0x{value:016x}'))"
+    return S.eval_script(
+        "(function(){"
+        "  globalThis.__verify_buf = globalThis.__verify_buf"
+        " || Memory.alloc(512);"
+        f"  globalThis.__verify_buf.add({offset}).{expr};"
+        "  return globalThis.__verify_buf.toString();"
+        "})()"
+    )
+
+
 # ============================================================ 1. 纯静态工具
 section("1. find_game_processes —— 不依赖任何游戏")
 #
@@ -100,6 +124,29 @@ if fg.get("processes"):
           f"runtime={p0.get('runtime')}")
     check("进程条目带 pid 与 name",
           bool(p0.get("pid")) and bool(p0.get("name")))
+    # P2-5：`architectures` 是个**恒为空列表**的字段（process_arch 的第二个
+    # 返回值历来写死 []），已删除 —— 一个永远 `[]`、又长得像「没检测到任何
+    # 架构标记」的字段，比没有它更容易误导。位数看 is_64；
+    # None 表示**没测出来**（不是「32 位」）。
+    #
+    # 注意这里**不**用上面那个 `fg`：它的 only_games=True 在没开游戏时
+    # 会返回 0 条，断言就被整段跳过（空转）。改成按名字查本机的 python ——
+    # 本脚本自己就是个 python 进程，所以这一条一定有进程可断言。
+    fg2 = S.find_game_processes(name_filter="python", only_games=False)
+    procs2 = fg2.get("processes") or []
+    if procs2:
+        p = procs2[0]
+        print(f"     形状检查用的进程: {p.get('name')} pid={p.get('pid')}")
+        check("进程条目带 is_64（位数）", "is_64" in p,
+              f"is_64={p.get('is_64')!r}")
+        check("不再有恒为空的 architectures 字段",
+              "architectures" not in p, "已删除，位数看 is_64")
+        check("is_64 是 bool 或 None（不许拿 False 冒充「不知道」）",
+              p.get("is_64") is None or isinstance(p.get("is_64"), bool),
+              f"is_64={p.get('is_64')!r}")
+    else:
+        check("能查到本机 python 进程（上面两条断言的前提）", False,
+              f"count={fg2.get('count')} —— 这两条断言没被验证")
 
 
 section("2. inspect_binary —— PE 结构分析")
@@ -470,6 +517,102 @@ else:
             check("拒绝时列出可用字段（便于 Agent 自我纠正）",
                   bool(badf.get("available")),
                   f"{len(badf.get('available') or [])} 个")
+
+        # ---- read_field_value 读几个字节**随字段类型变化**（P2-5）
+        #
+        # 判据是「写几个字节，就读回几个字节」—— 这是**与实现无关**的真值：
+        # 原来固定读 8 字节的实现，在 1 字节的 bool 字段上会读回 16 个 hex
+        # 字符（自己的 1 字节 + 相邻字段的 7 字节），下面的 raw_hex 断言
+        # 必然失败。所以这条不是「断言应该如此」，而是真的能抓住旧写法。
+        #
+        # 每种宽度用**一个类型确定的自有字段**：
+        #   · `fieldsOf()` 只枚举类**自己的**字段（不走基类链），
+        #     所以 int32 那个不能借用 PresetLoaderV2 继承来的
+        #     OffsetOfInstanceIDInCPlusPlusObject —— 得换一个真有 int 字段的类。
+        #   · 实例是伪造的（在真实偏移上写标记值），所以不需要该类真有实例。
+        #   · 拿不到的用例记为「无法验证」并跳过，不算失败；但**至少要覆盖
+        #     两种宽度**，否则这条验收等于没跑（见最后的断言）。
+        print()
+        print("     read_field_value 的读取宽度（按字段类型，不再固定 8 字节）：")
+        WIDTH_PROBE = [
+            ("PresetLoaderV2", "_isLoading", "System.Boolean", 1, 0x01),
+            ("TeamTapas.ProjectR.Ingame.InteractionDetector",
+             "_blockInteractFrameCount", "System.Int32", 4, 0x11223344),
+            ("PresetLoaderV2", "userDataPresetFile", "UnityEngine.TextAsset", 8,
+             0xCAFEBABE12345678),
+        ]
+        widths_seen: set[int] = set()
+        probed = 0
+        w1: dict | None = None            # 1 字节字段的那次结果，循环后复查
+        for cls, fname, ftype, want_w, marker_val in WIDTH_PROBE:
+            rci = S.runtime_class_info(name=cls)
+            if not rci.get("ok"):
+                check(f"{cls} 可查（宽度验收 {want_w} 字节那例）", False,
+                      str(rci.get("error", ""))[:70], warn_only=True)
+                continue
+            fld = next((f for f in (rci.get("fields") or [])
+                        if f.get("name") == fname), None)
+            if not fld or fld.get("offset") is None:
+                check(f"{cls}.{fname} 可用于宽度验收", False,
+                      f"该类自身的 {len(rci.get('fields') or [])} 个字段里"
+                      f"没有它（或没有偏移）—— 样本变了", warn_only=True)
+                continue
+            check(f"{cls}.{fname} 的运行时类型是 {ftype}",
+                  fld.get("type") == ftype, f"实际 {fld.get('type')!r}")
+            wrote = write_marker(int(fld.get("offset")), want_w, marker_val)
+            if not wrote.get("ok"):
+                check(f"{fname} 写入 {want_w} 字节标记值", False,
+                      str(wrote.get("error", ""))[:70])
+                continue
+            time.sleep(0.3)                  # 别让两次 RPC 之间内存被回收
+            wf = S.read_field_value(instance=wrote.get("value"),
+                                    name=cls, field=fname)
+            if not wf.get("ok"):
+                check(f"{fname}（{want_w} 字节）读回成功", False,
+                      str(wf.get("error", ""))[:70])
+                continue
+            probed += 1
+            widths_seen.add(int(wf.get("read_width") or 0))
+            if want_w == 1:
+                w1 = wf
+            want_hex = marker_val.to_bytes(want_w, "little").hex()
+            got_hex = (wf.get("raw_hex") or "").lower()
+            print(f"       {fname:30} {ftype:24} "
+                  f"read_width={wf.get('read_width')} raw_hex={got_hex}")
+            check(f"{fname} 的 read_width == {want_w}",
+                  wf.get("read_width") == want_w,
+                  f"实际 {wf.get('read_width')}")
+            check(f"{fname}（{want_w} 字节）正好读回自己的 {want_w} 字节",
+                  got_hex == want_hex,
+                  f"读回={got_hex} 期望={want_hex}"
+                  + ("（多读的字节是相邻字段的内容）"
+                     if len(got_hex) > len(want_hex) else ""))
+
+        # 解释字段也要按宽度给：宽度不够就不该出现那个宽度的解释，
+        # 否则 Agent 会拿「本字段 + 邻居」拼出来的 as_int64 当真值。
+        if w1 is not None:
+            check("1 字节字段不给 4/8 字节解释（as_int32 会拼上邻居的字节）",
+                  "as_int32" not in w1 and "as_int64" not in w1,
+                  f"给出的解释键 = "
+                  f"{sorted(k for k in w1 if k.startswith('as_'))}")
+            check("1 字节字段给出 as_bool / as_uint8",
+                  "as_bool" in w1 and "as_uint8" in w1,
+                  f"as_bool={w1.get('as_bool')} "
+                  f"as_uint8={w1.get('as_uint8')}")
+        else:
+            check("拿到 1 字节字段的读取结果（解释键验收的前提）", False,
+                  "上面 1 字节那条没读成功 —— 这两条断言没被验证",
+                  warn_only=True)
+        # 「宽度随类型变」这件事只有在**至少两种宽度都实测到**时才算验过。
+        # 只跑通一种宽度的话，下面这条会报红 —— 不是产品坏了，而是这组
+        # 验收没跑起来（这正是「断言必须非空转」的要求）。
+        check("至少实测到两种不同宽度（否则这组验收是空转）",
+              len(widths_seen) >= 2 and probed >= 2,
+              f"成功 {probed}/{len(WIDTH_PROBE)} 例，"
+              f"实测宽度集合 = {sorted(widths_seen)}")
+        check("实测宽度都落在字段自己的宽度上（1/4/8 各自对得上）",
+              widths_seen <= {1, 4, 8},
+              f"实测宽度集合 = {sorted(widths_seen)}")
 
         # ---- gc_control（签名是 disable: bool，不是 action 字符串）
         gcd = S.gc_control(disable=True)

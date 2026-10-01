@@ -14,7 +14,7 @@ import ctypes.wintypes as wt
 import enum
 import os
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..logutil import warn
@@ -82,7 +82,12 @@ class ProcessInfo:
     window_title: str = ""
     runtime: str = "unknown"
     is_64: bool | None = None
-    architectures: list[str] = field(default_factory=list)
+    # 这里曾有一个 `architectures: list[str]` 字段，**永远是空列表**：
+    # process_arch 的第二个返回值历来都写死 `[]`，却被 find_game_processes
+    # 原样输出成 `"architectures": []`。一个恒为空、又长得像「没检测到任何
+    # 架构标记」的字段，比没有这个字段更容易误导 —— 已删除。
+    # 位数看 `is_64`（Wow64 判定；32 位系统上会把 32 位进程报成 True，
+    # 这是已知局限，本机与样本都是 64 位 Windows）。
 
     @property
     def image_name(self) -> str:
@@ -183,11 +188,16 @@ def enumerate_processes() -> list[tuple[int, str]]:
     return out
 
 
-def process_arch(pid: int) -> tuple[bool, list[str]]:
-    """判定进程位数与已加载的架构标记模块。
+def process_arch(pid: int) -> bool | None:
+    """判定进程是不是 64 位。拿不到就返回 None（不知道）。
 
-    返回 (is_64, modules_matched)。
-    依据：Wow64 判定 + 是否加载了 64 位运行时模块。
+    依据是 Wow64 判定：`IsWow64Process` 为真说明这是跑在 64 位系统上的
+    32 位进程，取反即位数。**已知局限**：32 位 Windows 上 32 位进程会被
+    报成 True（那时 IsWow64Process 返回假）。本项目样本与本机都是 64 位
+    Windows，真要严格判定应改用 `IsWow64Process2` 比对 nativeMachine。
+
+    这里**不再**返回第二个「架构标记模块」值 —— 它历来都写死 `[]`，
+    白白让调用方以为做过检测（见 ProcessInfo 上的说明）。
     """
     k32 = _kernel32()
     handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -200,10 +210,7 @@ def process_arch(pid: int) -> tuple[bool, list[str]]:
         finally:
             k32.CloseHandle(handle)
 
-    if is_64 is None:
-        return False, []
-
-    return is_64, []
+    return is_64
 
 
 def list_modules(pid: int, limit: int = 0) -> list[str]:
@@ -349,7 +356,7 @@ def find_processes(name_filter: str = "", only_games: bool = True) -> list[Proce
         else:
             title = window_title_for_pid(pid)
 
-        is_64, _ = process_arch(pid)
+        is_64 = process_arch(pid)
         out.append(
             ProcessInfo(
                 pid=pid,

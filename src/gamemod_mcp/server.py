@@ -197,6 +197,71 @@ def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
     return _ok(**res)
 
 
+def _split_argv(text: str) -> list[str]:
+    """按 Windows 习惯拆分命令行参数串。
+
+    规则：空白分隔；**双引号内保留空白**，引号本身去掉；反斜杠**不是**转义符。
+
+    为什么不用 `shlex.split`（本文件曾经的建议）：实测
+
+        shlex.split(r'--path C:\\Games\\My Game\\a.exe --x')
+        posix=True （默认）-> ['--path', 'C:GamesMy', 'Gamea.exe', '--x']   # 反斜杠被吃掉
+        posix=False        -> ['--path', 'C:\\\\Games\\\\My', 'Game\\\\a.exe', '--x']  # 引号没生效
+
+    默认的 posix 模式把 `\\` 当转义符，而 Windows 路径全是反斜杠 ——
+    照那条建议改下去会把 `C:\\Games\\Game\\a.exe` 变成 `C:GamesGamea.exe`，
+    是**引进**一个 bug 而不是修掉一个。`posix=False` 又会把引号留在 token 里。
+    所以这里自己拆：本项目只跑 Windows，参数就是「空格分隔 + 引号括路径」。
+
+    未闭合的引号按「一直引到串尾」处理（不报错，与多数启动器一致）；
+    空的 `""` 会被丢掉（不产生空 token）。
+    """
+    out: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+    for ch in text:
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch.isspace() and not in_quote:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+#: 字段类型名 → 读取宽度（字节）。
+#:
+#: 为什么需要它：`read_field_value` 原来**固定读 8 字节**。字段只有 4 字节时，
+#: 那 4 个「多读的」字节是**相邻字段**的内容 —— 既会给出无意义的
+#: `as_int64`（两个字段拼出来的数），又会在字段贴近页尾时把一次**本可成功**
+#: 的读取变成假失败。宽度按字段类型来，才不会读到别人的字节。
+#:
+#: 键同时收 IL2CPP 的 `il2cpp_type_get_name` 形式（`System.Int32`）与短名，
+#: 因为运行时返回的是前者；查不到就按 8 字节（**引用类型/指针**在 x64 上
+#: 就是 8 字节，且这是原来的行为，不会把没覆盖的类型改坏）。
+_FIELD_WIDTH: dict[str, int] = {
+    "System.Boolean": 1, "bool": 1,
+    "System.Byte": 1, "byte": 1, "System.SByte": 1, "sbyte": 1,
+    "System.Char": 2, "char": 2,
+    "System.Int16": 2, "short": 2, "System.UInt16": 2, "ushort": 2,
+    "System.Int32": 4, "int": 4, "System.UInt32": 4, "uint": 4,
+    "System.Single": 4, "float": 4,
+    "System.Int64": 8, "long": 8, "System.UInt64": 8, "ulong": 8,
+    "System.Double": 8, "double": 8, "System.IntPtr": 8, "System.UIntPtr": 8,
+}
+
+
+def _field_read_width(type_name: Any) -> int:
+    """字段类型名 → 要读几个字节。查不到按 8（指针宽度，也是原来的行为）。"""
+    if not type_name:
+        return 8
+    return _FIELD_WIDTH.get(str(type_name).strip(), 8)
+
+
 # ================================================================
 # 1. 发现层
 # ================================================================
@@ -212,7 +277,8 @@ def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
 
     Returns:
         {ok, count, processes: [{pid, name, exe_path, window_title,
-                                 runtime, architectures}]}
+                                 runtime, is_64}]}
+        `is_64` 为 None 表示**没测出来**（拿不到进程句柄），不是「32 位」。
     """
     try:
         procs = discovery.find_processes(name_filter=name_filter,
@@ -229,7 +295,7 @@ def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
                 "exe_path": p.exe_path,
                 "window_title": p.window_title,
                 "runtime": p.runtime,
-                "architectures": p.architectures,
+                "is_64": p.is_64,
             }
             for p in procs
         ],
@@ -902,7 +968,9 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
 
     Args:
         exe:  游戏可执行文件路径。留空则用当前会话识别出的主程序。
-        args: 附加命令行参数（空格分隔）。
+        args: 附加命令行参数。按 Windows 习惯拆：空白分隔，双引号内保留空白
+              （所以含空格的路径要写成 `-path "C:\\Games\\My Game\\a.txt"`）。
+              反斜杠**不是**转义符，Windows 路径可以直接写。
     """
     target = exe
     if not target:
@@ -914,7 +982,7 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
         return _err(f"可执行文件不存在：{target or '(未指定)'}",
                     hint="先用 open_game 或 inspect_game 确认主程序路径")
 
-    argv = args.split() if args else []
+    argv = _split_argv(args) if args else []
     res = ensure_runtime(spawn=True, launcher_exe=target,
                          preferred_module=preferred_module)
     if not res.get("ok"):
@@ -1277,7 +1345,15 @@ def read_field_value(
     """读取某个对象实例上某个字段的原始值。
 
     自动完成三步：运行时查字段偏移 → 算出字段地址 → 读内存。
-    返回原始字节与常见解释（int / float）。
+
+    **读几个字节由字段类型决定**（`_field_read_width`）：bool 读 1、int 读 4、
+    long/double/引用类型读 8。原来固定读 8 字节，4 字节字段会连带读到**相邻
+    字段**的 4 个字节 —— 既给出无意义的 `as_int64`（两个字段拼出来的数），
+    也会在字段贴近页尾时把一次本可成功的读取变成假失败。
+
+    返回里 `read_width` 是实际读取的字节数，解释字段也按宽度给：
+    1 → `as_int8`/`as_uint8`/`as_bool`；2 → `as_int16`/`as_uint16`；
+    4 → `as_int32`/`as_uint32`/`as_float`；8 → 再给 `as_int64`/`as_double`/`as_pointer`。
 
     局限：只适合**基础类型字段**（int/float/bool/enum 等）。
     引用类型字段读到的是指针，要读内容需再解引用（用 read_memory）。
@@ -1314,17 +1390,20 @@ def read_field_value(
             return _err(f"字段 {field} 没有运行时偏移（可能是静态字段）")
 
         # 字段地址 = 实例地址 + 偏移
-        import ctypes
         try:
             inst_val = int(instance, 16)
         except ValueError:
             return _err(f"instance 不是合法的十六进制地址：{instance}")
         field_addr = inst_val + int(off)
 
-        raw = st.runtime.read_memory(hex(field_addr), 8)
+        # 按字段类型决定读几个字节：只读这个字段自己的字节，
+        # 不把相邻字段的内容一起读进来（见 _field_read_width 的说明）。
+        read_width = _field_read_width(hit.get("type"))
+        raw = st.runtime.read_memory(hex(field_addr), read_width)
         if not raw.get("ok"):
             return _err(raw.get("error", "读取内存失败"),
-                        field_address=hex(field_addr))
+                        field_address=hex(field_addr),
+                        read_width=read_width)
 
         hexs = raw.get("hex") or ""
         out: dict[str, Any] = {
@@ -1335,9 +1414,20 @@ def read_field_value(
             "field_address": hex(field_addr),
             "raw_hex": hexs,
             "field_type": hit.get("type"),
+            "read_width": read_width,
         }
-        # 给出常见解释，方便判断
+        # 按**实际读到的宽度**给解释，不给这个宽度下没有意义的解释：
+        # 4 字节字段的 as_int64 是「本字段 + 下一个字段」拼出来的数，读它必然误判。
         import struct as _struct
+        if len(hexs) >= 2:
+            b1 = bytes.fromhex(hexs[:2])
+            out["as_int8"] = _struct.unpack("<b", b1)[0]
+            out["as_uint8"] = _struct.unpack("<B", b1)[0]
+            out["as_bool"] = b1[0] != 0
+        if len(hexs) >= 4:
+            b2 = bytes.fromhex(hexs[:4])
+            out["as_int16"] = _struct.unpack("<h", b2)[0]
+            out["as_uint16"] = _struct.unpack("<H", b2)[0]
         if len(hexs) >= 8:
             b4 = bytes.fromhex(hexs[:8])
             out["as_int32"] = _struct.unpack("<i", b4)[0]
