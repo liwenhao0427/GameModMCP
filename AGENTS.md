@@ -124,7 +124,7 @@ src/gamemod_mcp/
 `verify_tool_annotations.py` 会直接报红。
 
 **工具清单以代码为准，文档不许硬编码数量。**
-用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **8 处**：
+用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **9 处**：
 
 | 校验对象 | 强度 |
 |---|---|
@@ -136,13 +136,22 @@ src/gamemod_mcp/
 | 已删除 / 已合并的工具名 | 在**上面四处**都已清理（逐个点名，见 `REMOVED_TOOLS`） |
 | README「验证脚本」表 | 与 `devtools/verify_*.py` **双向完全一致** |
 | **所有 `*.md`**（排除 `agent_logs/`）提到已删工具时 | 同一行必须能看出「它已经没了」；否则 Agent 会照着去调 |
+| **已安装的 skill 副本** `~/.dsh/skills/` | 与仓库内 `skills/` **逐字节相同**；副本不存在时记为「无法验证」并跳过 |
 
-最后一行是 P1-3b 那轮补的：前七处只管「README 表 / docstring / instructions /
-SKILL.md」，而 `docs/项目梳理与优化建议.md` 长期写着「全部工具清单（41 个）」、
+「所有 `*.md` 提到已删工具必须标注」那一行是 P1-3b 那轮补的：它前面的七处只管
+「README 表 / docstring / instructions / SKILL.md」，而
+`docs/项目梳理与优化建议.md` 长期写着「全部工具清单（41 个）」、
 §三 的工作流还让 Agent 去调**已删除**的 `detect_games()` —— 没有任何检查覆盖 `docs/`。
 所以规则放宽到「提到可以，但必须同行标注」，并且扫描脚本自己要有
 **非空转保证**（确认这些名字确实还在文档里被提到、确认扫到了文件），
 否则「没有未标注的提及」可能只是因为扫了个空集合。
+
+**最后一行（已安装的 skill 副本）说明「仓库内全绿」并不等于「Agent 看到的没问题」**：
+运行时被加载的是 `~/.dsh/skills/` 下的**副本**，而它不在任何门禁范围内。
+实测该副本曾落后 **139 行**（16,107 vs 25,004 字节），开头第一句还写着
+「动手前第一步永远是 `detect_games()`（该工具已删除）」—— 也就是说
+**「仓库修好了、门禁全绿」与「Agent 照着已删除的工具去调」可以同时成立**。
+副本不存在时按 §5.3 记为「无法验证」并跳过，但要说出来，不许假装通过。
 
 **工具的语义标注**另由 `python devtools/verify_tool_annotations.py` 校验
 （4 个语义位必须显式有值、分组双向一致、只读 ⇒ 不破坏不副作用）。

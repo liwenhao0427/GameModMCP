@@ -3,24 +3,32 @@
 
 为什么必须有这个脚本
 ============================================================
-本项目有 5 个地方都在描述「有哪些工具」：
+「有哪些工具」这件事在本项目里有 9 个地方被描述或复制：
 
     1. src/gamemod_mcp/server.py   —— 代码本身（唯一真值）
     2. src/gamemod_mcp/server.py   —— 模块 docstring 的「工具分层」列表
     3. src/gamemod_mcp/server.py   —— FastMCP(instructions=...) 里的工作流
     4. README.md                   —— 「工具一览」表格
-    5. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
+    5. README.md                   —— 正文里的数量声明（「N 个工具」）
+    6. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
+    7. 任何 *.md                   —— 提到已删 / 已合并的工具名时必须**同行标注**
+    8. README.md                   —— 「验证脚本」表 vs devtools/verify_*.py
+    9. ~/.dsh/skills/              —— 已安装的 skill 副本 vs 仓库内（Agent 真正读的那份）
 
-外加第 6 处：它不属于「工具」，但属于同一类问题（手工维护的清单会漂移）：
+其中 7、8、9 不属于「工具」本身，但属于同一类问题：**手工维护的副本必然漂移**。
 
-    6. README.md                   —— 「验证脚本」表 vs devtools/verify_*.py
-
-经验证明靠人肉同步**必然漂移**（真实发生过的四起）：
+经验证明靠人肉同步**必然漂移**（真实发生过的六起）：
     · README 写了并不存在的 `unhook_all`
     · server.py 的 docstring 漏写了 13 个工具
     · README 的「41 个工具」与实际数量不符
     · README 写「10 个可复现的验证脚本」，而实际已有 20 多个，
       同一节的表格还漏了 9 个脚本 —— 当时**没有任何检查**会发现
+    · docs/ 里写着「全部工具清单（41 个）」（实际 38），§三 的工作流还让
+      Agent 去调已删除的 `detect_games()` —— 同样**没有任何检查**覆盖 docs/
+    · 已安装的 skill 副本落后仓库 139 行、开头还在教已删除的工具
+      —— 也就是说「仓库修好了、门禁全绿」与「Agent 照着删掉的工具去调」
+      可以**同时成立**（修好的那份不是被读的那份）
+
 所以用本脚本卡住：**不一致就非零退出**。
 
 校验规则
@@ -29,12 +37,16 @@
 
 - README 表格：必须是**双向完全一致**（不多、不少）。
   这是权威清单，Agent 与人都靠它了解全貌。
-- README 正文里的数量：「41 个工具」这类数字必须等于实际数量。
+- README 正文里的数量：「N 个工具」这类数字必须等于实际数量。
 - server.py docstring 分层列表：双向一致（它声明了每个工具的归属层）。
 - instructions：**只许提到存在的工具**（它是精简工作流，不必列全）。
 - SKILL.md：**只许提到存在的工具**（它是使用指南，不必列全），
   但要能识别出「曾经存在、现已删除」的名字。
+- 任何 *.md 提到已删工具：**同一行**必须能看出它已经没了
+  （历史记录有价值，但 Agent 会照着它去调）。
 - README 的「验证脚本」表：与 `devtools/verify_*.py` 双向一致。
+- 已安装的 skill 副本：与仓库内**逐字节相同**；副本不存在时记为
+  「无法验证」并跳过（见 AGENTS.md §5.3），但要说出来。
 
 用法
 ============================================================
@@ -46,6 +58,7 @@ from __future__ import annotations
 
 import io
 import os as _os
+import pathlib
 import re
 import sys as _sys
 
@@ -405,8 +418,36 @@ def main() -> int:
           mentions >= 5, f"{mentions} 处")
     check("提到已删工具的地方都做了标注（没有让 Agent 以为它还在）",
           not offenders,
-          f"{len(offenders)} 处未标注：" + "；".join(offenders[:4])
-          if offenders else "（全部有标注）")
+          (f"{len(offenders)} 处未标注（**把「已删/已合并」写到同一行**即可）："
+           + "；".join(offenders[:4])) if offenders else "（全部有标注）")
+
+    # ------------------------------------------------- 9. 已安装的 skill 副本
+    show("9. 已安装的 skill（~/.dsh/skills/）若存在，必须与仓库内一致")
+    # 仓库里的 `skills/` 是**源**，但运行时真正被 Agent 加载的是 `~/.dsh/skills`
+    # 下的**副本**。第 8 节只保证仓库内的文档干净 —— 而 Agent 读的是那份副本。
+    # 实测：这份副本曾落后 **139 行**（375 vs 514），开头第一句还写着
+    # 「动手前第一步永远是 `detect_games()`」，而那工具早已删除；
+    # 也就是说「仓库修好了、文档门禁全绿」与「Agent 照着删掉的工具去调」
+    # 可以同时成立。所以这里把它也卡住。
+    #
+    # 跳过规则遵循 AGENTS.md §5.3：副本不存在（没装过 / 别的机器）时记为
+    # **「无法验证」并跳过** —— 但要说出来，不许假装通过。
+    installed = pathlib.Path.home() / ".dsh" / "skills" / "gamemod-mod" / "SKILL.md"
+    if not installed.exists():
+        print(f"  ⚠️ {installed} 不存在 —— 无法验证，跳过（这不是通过）")
+    else:
+        src_bytes = SKILL.read_bytes()
+        dst_bytes = installed.read_bytes()
+        same = src_bytes == dst_bytes
+        detail = ""
+        if not same:
+            import hashlib
+            a = hashlib.sha256(src_bytes).hexdigest()[:16]
+            b = hashlib.sha256(dst_bytes).hexdigest()[:16]
+            detail = (f"仓库 {len(src_bytes)} 字节/{a} vs 已安装 "
+                      f"{len(dst_bytes)} 字节/{b} —— 把仓库内的 "
+                      f"skills/gamemod-mod/SKILL.md 重新复制过去")
+        check("已安装的 gamemod-mod skill 与仓库内逐字节相同", same, detail)
 
     # ------------------------------------------------------------ 汇总
     if "--list" in argv:

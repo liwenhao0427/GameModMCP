@@ -20,7 +20,7 @@ python devtools\samples.py                 # 只看本机样本可用性（不�
 也可以按需单独跑：
 
 ```powershell
-python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否一致（无需游戏）
+python devtools\verify_tool_inventory.py  # 9 处清单一致性（含已删工具名标注、已安装 skill 副本是否与仓库一致）
 python devtools\verify_tool_annotations.py # 38 个工具的语义标注（危险工具须声明，无需游戏）
 python devtools\verify_handle_scope.py     # 结果句柄作用域：跨游戏旧句柄必须失效（需两个样本）
 python devtools\verify_server_helpers.py   # server.py 的纯函数：命令行拆分 / 字段读取宽度（无需游戏）
