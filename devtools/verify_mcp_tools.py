@@ -615,7 +615,8 @@ if pid:
               f"一致={ri.get('image_count_matches')}")
         check("映像数一致", ri.get("image_count_matches") is True,
               "证明探针挂到的是同一个游戏实例")
-        check("可用导出 59 个", ri.get("api_available") == 59,
+        # 60 = 原 59 + il2cpp_class_get_declaring_type（定位嵌套类型所必需）
+        check("可用导出 60 个", ri.get("api_available") == 60,
               f"实际={ri.get('api_available')}")
 
     # ============================================================ 9. 运行时类信息
@@ -638,6 +639,88 @@ if pid:
               (rt_fields.get("userDataPresetFile") or {}).get("type")
               == "UnityEngine.TextAsset",
               "静态说它是 TextAsset，运行时说它在 0x20")
+
+    # ============================================================ 9b. 嵌套类型
+    # 运行时类定位曾**完全拿不到嵌套类型**：il2cpp_class_from_name 只查顶层
+    # 类型。实测本样本 20,072 个类型里 7,056 个（35%）是嵌套类型；
+    # 名为 State 的 131 个类型只有 1 个是顶层，在 TeamTapas.ProjectR.dll 里
+    # 遍历出的 118 个 State 用 from_name 逐个回查 —— 命中 0、漏 118。
+    # 而 Mod 最常 Hook 的恰是这类内部类（状态机、协程体、私有嵌套类）。
+    show("9b. runtime_class_info —— 嵌套类型必须能定位（曾 100% 不可达）")
+    _idx9 = state.state().index
+    # 选样本要同时满足三件事，否则断言会变成空转：
+    #   · 是嵌套类型（declaring_il2cpp 非空）且全名含外层链
+    #   · 有字段（否则「字段偏移都对」在 0 个字段上是假通过）
+    #   · 短名在样本里**不唯一**（这样才跑得到歧义拒绝分支）
+    _nested_row = _idx9.conn.execute(
+        "SELECT t.name, t.nested_name, t.image, t.field_count, t.method_count "
+        "FROM types t JOIN ("
+        "  SELECT name FROM types GROUP BY name HAVING COUNT(*) > 1"
+        ") d ON d.name = t.name "
+        "WHERE t.declaring_il2cpp NOT IN (-1) AND t.nested_name LIKE '%.%.%' "
+        "  AND t.field_count > 0 AND t.method_count > 0 "
+        "ORDER BY t.field_count DESC LIMIT 1").fetchone()
+    if _nested_row:
+        _nt = _nested_row["nested_name"]
+        print(f"     静态真值（嵌套类）: {_nt}  image={_nested_row['image']}")
+        # (1) 用完整嵌套名定位 —— 修复前必然 not_found
+        _rn = S.runtime_class_info(name=_nt, namespace="")
+        check("按完整嵌套名能定位到嵌套类", _rn.get("ok") is True,
+              f"{_nt} → {_rn.get('error')}")
+        if _rn.get("ok"):
+            # 真值比对：运行时拼出的全名必须等于静态嵌套名
+            check("运行时 full_name == 静态 nested_name",
+                  _rn.get("full_name") == _nt,
+                  f"运行时={_rn.get('full_name')!r} 静态={_nt!r}")
+            check("嵌套类拿到了真实字段偏移",
+                  bool(_rn.get("fields"))
+                  and all(f.get("offset") is not None
+                          for f in _rn["fields"]),
+                  f"字段数={_rn.get('field_count')}")
+            check("嵌套类拿到了方法地址（Hook 落点）",
+                  bool(_rn.get("methods"))
+                  and any(m.get("pointer") for m in _rn["methods"]),
+                  f"方法数={_rn.get('method_count')}")
+
+        # (2) 只给短名时必须**拒绝并给候选**，不许静默取第一个
+        _short = _nested_row["name"]
+        _n_short = _idx9.conn.execute(
+            "SELECT COUNT(*) c FROM types WHERE name=?", (_short,)).fetchone()["c"]
+        print(f"     静态同名类型数: {_short} → {_n_short} 个")
+        if _n_short > 1:
+            _ra = S.runtime_class_info(name=_short, namespace="")
+            check("短名歧义时拒绝而不是静默取第一个",
+                  _ra.get("ok") is False and _ra.get("ambiguous") is True,
+                  f"ok={_ra.get('ok')} ambiguous={_ra.get('ambiguous')} "
+                  f"err={str(_ra.get('error'))[:60]}")
+            check("拒绝时给出候选数（可操作）",
+                  (_ra.get("candidate_count") or 0) > 1,
+                  f"candidate_count={_ra.get('candidate_count')}")
+            check("候选平铺在顶层（与静态侧拒绝形状一致）",
+                  isinstance(_ra.get("candidates"), list)
+                  and len(_ra["candidates"]) > 0,
+                  "Agent 不必按工具记两套读法")
+            # 候选里的 full_name 必须真能回灌定位（否则等于空头支票）
+            _cand0 = (_ra.get("candidates") or [{}])[0]
+            if _cand0.get("full_name"):
+                _rc2 = S.runtime_class_info(name=_cand0["full_name"],
+                                            namespace="")
+                check("候选 full_name 回灌即可唯一定位",
+                      _rc2.get("ok") is True
+                      and _rc2.get("full_name") == _cand0["full_name"],
+                      f"回灌 {_cand0['full_name']!r} → ok={_rc2.get('ok')}")
+            check("候选有上限（不许把上百条全倒出来）",
+                  len(_ra["candidates"]) <= 30,
+                  f"返回 {len(_ra['candidates'])} 条，"
+                  f"truncated={_ra.get('candidates_truncated')}")
+
+        # (3) 修嵌套不许把顶层类型弄坏
+        _rt = S.runtime_class_info(name="PresetLoaderV2", namespace="")
+        check("顶层类型仍然正常（没为修嵌套而回归）",
+              _rt.get("ok") is True and _rt.get("full_name") == "PresetLoaderV2",
+              f"full_name={_rt.get('full_name')!r}")
+    else:
+        print("     ⚠️  本样本没有可用的嵌套类，无法验证 —— 如实记录，不算通过")
 
     # ============================================================ 10. Hook 落点
     show("10. find_hook_target —— 定位落点并比对 token")

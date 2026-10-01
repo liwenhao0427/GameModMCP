@@ -911,8 +911,16 @@ def runtime_class_info(
         · 静态元数据里的方法只有 token，**没有地址**
         · 这里给出的是运行时真实值 —— 这才是能直接用来 Hook 的落点
 
+    **嵌套类型请传完整嵌套名**：IL2CPP 的 namespace 只属于最外层类型，
+    嵌套类型（状态机 State、协程体 <Xxx>d__0、私有内部类）的命名空间是空的、
+    只有短名。实测 IL2CPP 样本 20,072 个类型里 7,056 个（35%）是嵌套类型，
+    名为 State 的类型有 131 个而只有 1 个是顶层。所以查嵌套类型时 `name`
+    要写成完整嵌套名（如 "TeamTapas.ProjectR.UI2.RUI_FloatingUI.State"，
+    从 search_classes 的 `nested_name` 直接抄）。只传短名而命中多个时，
+    本工具返回 `ok: false` + `ambiguous: true` + `candidates`，不会替你猜。
+
     Args:
-        name:          类名（短名）。
+        name:          类名（短名；嵌套类型请传完整嵌套名）。
         namespace:     命名空间（可选，用于精确匹配）。
         image:         程序集名（可选，如 "TeamTapas.ProjectR.dll"）。
         method_filter: 只看名字含该子串的方法（类方法很多时用）。

@@ -155,8 +155,8 @@ Agent 会自动：
 | `inject_process` | 注入已在运行的进程 |
 | `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**） |
 | `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检 |
-| `runtime_class_info` | **真实字段偏移**与**方法真实地址** |
-| `find_hook_target` | 定位 Hook 落点并比对 token |
+| `runtime_class_info` | **真实字段偏移**与**方法真实地址**。嵌套类型请传完整嵌套名（`search_classes` 的 `nested_name`）；短名命中多个时拒绝并给 `candidates` |
+| `find_hook_target` | 定位 Hook 落点并比对 token（同样支持完整嵌套名，歧义时拒绝） |
 | `hook_method` | 按类名+方法名装 Hook（用 `token` 指定重载；多候选未指定则拒绝） |
 | `hook_address` | 按绝对地址装 Hook |
 | `unhook` / `hook_status` | 卸载与查看 Hook（`unhook` 不带参数即卸载全部） |

@@ -56,6 +56,7 @@
         'il2cpp_class_get_name',
         'il2cpp_class_get_namespace',
         'il2cpp_class_get_parent',
+        'il2cpp_class_get_declaring_type',
         'il2cpp_class_get_image',
         'il2cpp_class_get_flags',
         'il2cpp_class_get_type',
@@ -215,12 +216,39 @@
         return null;
     }
 
-    /** 由类拼出完整名（嵌套类型由调用方再补外层）。 */
+    /** 由类拼出完整名（嵌套类型会补上外层链）。 */
     function fullNameOf(klass) {
-        var n = className(klass);
-        if (n === null) { return null; }
-        var ns = classNamespace(klass);
-        return (ns && ns.length) ? (ns + '.' + n) : n;
+        return nestedFullName(klass);
+    }
+
+    /**
+     * 拼出含嵌套外层的完整名。
+     *
+     * 为什么必须走 declaring_type：IL2CPP 里 `namespace` 只属于**最外层**类型，
+     * 嵌套类型的 namespace 是空的、名字只有短名。实测样本 20,072 个类型里
+     * 7,056 个（35%）是嵌套类型，131 个叫 `State` 的类型只有 1 个是顶层 ——
+     * 直接 `ns + '.' + name` 会把 130 个 `State` 全拼成同一个错名。
+     *
+     * 自底向上收集短名，遇到第一个非空 namespace 就补上并停止。
+     * `il2cpp_class_get_declaring_type` 缺失时退化为原来的行为。
+     */
+    function nestedFullName(klass) {
+        var parts = [];
+        var cur = klass;
+        var guard = 0;
+        while (cur && !cur.isNull() && guard++ < 32) {
+            var nm = className(cur);
+            if (nm) { parts.unshift(nm); }
+            var ns = classNamespace(cur);
+            if (ns && ns.length) { parts.unshift(ns); break; }
+            if (!funcs.il2cpp_class_get_declaring_type) { break; }
+            var outer;
+            try { outer = funcs.il2cpp_class_get_declaring_type(cur); }
+            catch (e) { break; }
+            if (!outer || outer.isNull()) { break; }
+            cur = outer;
+        }
+        return parts.length ? parts.join('.') : null;
     }
 
     /** 把绝对地址换算成「模块内 RVA + 十六进制」——Hook 落点就用这个。 */
@@ -290,12 +318,18 @@
             il2cpp_image_get_name: ['pointer', ['pointer']],
             il2cpp_image_get_filename: ['pointer', ['pointer']],
             il2cpp_image_get_class_count: ['pointer', ['pointer']],
-            il2cpp_image_get_class: ['pointer', ['pointer', 'pointer']],
+            // 注意：第二个参数是**序号 size_t**，不是指针。写成 'pointer'
+            // 会直接抛 "expected a pointer"（已实测）。
+            il2cpp_image_get_class: ['pointer', ['pointer', 'size_t']],
 
             il2cpp_class_from_name: ['pointer', ['pointer', 'pointer', 'pointer']],
             il2cpp_class_get_name: ['pointer', ['pointer']],
             il2cpp_class_get_namespace: ['pointer', ['pointer']],
             il2cpp_class_get_parent: ['pointer', ['pointer']],
+            // 嵌套类型的**外层类**。别和 il2cpp_class_get_parent（基类）搞混：
+            // 对 MonoBehaviour 的子类，get_parent 给基类，
+            // get_declaring_type 给外层嵌套类（顶层类为 NULL）。
+            il2cpp_class_get_declaring_type: ['pointer', ['pointer']],
             il2cpp_class_get_image: ['pointer', ['pointer']],
             il2cpp_class_get_flags: ['pointer', ['pointer']],
             il2cpp_class_get_type: ['pointer', ['pointer']],
@@ -372,6 +406,8 @@
 
         resolveExports();
         buildFunctions();
+        // 重新绑定导出后，之前按旧函数指针建的类索引必须作废
+        classIndex = null;
 
         if (!funcs.il2cpp_domain_get) {
             return fail('模块存在但缺少 il2cpp_domain_get 导出，' +
@@ -455,17 +491,170 @@
 
     // ---------------------------------------------------------------- 类 / 字段 / 方法
 
-    /** 用 image + 命名空间 + 名 取类；image 为空则在全部映像里搜。 */
-    function findClass(imageName, namespace, name) {
-        var img = imageName ? findImage(imageName) : null;
-        var imgs = img ? [img] : allImages();
-        var nsBuf = Memory.allocUtf8String(namespace || '');
-        var nmBuf = Memory.allocUtf8String(name);
-        for (var i = 0; i < imgs.length; i++) {
-            var k = funcs.il2cpp_class_from_name(imgs[i].image, nsBuf, nmBuf);
-            if (k && !k.isNull()) { return { klass: k, image: imgs[i] }; }
+    /**
+     * 运行时类索引（惰性构建一次，之后复用）。
+     *
+     * 为什么不能只用 `il2cpp_class_from_name`：那个 API **只查得到顶层类型**，
+     * 嵌套类型一个都拿不到。实测样本（Garden of Witches）：
+     *   · 20,072 个类型里 7,056 个（35%）是嵌套类型；
+     *   · 名为 `State` 的类型有 131 个，其中**只有 1 个是顶层**；
+     *   · 在 `TeamTapas.ProjectR.dll` 里遍历出 118 个 `State`，
+     *     用 `il2cpp_class_from_name` 逐个回查 —— **命中 0 个、漏掉 118 个**。
+     * 也就是说「嵌套类在运行时根本查不到」，而 Mod 最常 Hook 的
+     * 恰恰是这类内部类（状态机、协程体、私有嵌套类）。
+     *
+     * 全量枚举实测 94 个映像 / 20,072 个类 / 119 ms，一次构建即可长期复用。
+     */
+    var classIndex = null;
+
+    function buildClassIndex() {
+        if (!funcs.il2cpp_image_get_class_count || !funcs.il2cpp_image_get_class) {
+            return null;   // 缺 API，调用方退化为 from_name 快路径
         }
-        return null;
+        var byFull = {};
+        var byShort = {};
+        var imgs = allImages();
+        var n = 0;
+        for (var i = 0; i < imgs.length; i++) {
+            var cnt;
+            try {
+                cnt = funcs.il2cpp_image_get_class_count(
+                    imgs[i].image).toInt32();
+            } catch (e) { continue; }
+            for (var j = 0; j < cnt; j++) {
+                var k;
+                try { k = funcs.il2cpp_image_get_class(imgs[i].image, j); }
+                catch (e) { continue; }
+                if (!k || k.isNull()) { continue; }
+                var shortName = className(k);
+                if (!shortName) { continue; }
+                var ent = {
+                    klass: k,
+                    image: imgs[i],
+                    name: shortName,
+                    namespace: classNamespace(k) || '',
+                    full_name: nestedFullName(k)
+                };
+                if (ent.full_name) {
+                    if (!byFull[ent.full_name]) { byFull[ent.full_name] = []; }
+                    byFull[ent.full_name].push(ent);
+                }
+                if (!byShort[shortName]) { byShort[shortName] = []; }
+                byShort[shortName].push(ent);
+                n++;
+            }
+        }
+        return { byFull: byFull, byShort: byShort, count: n };
+    }
+
+    function classIndexOf() {
+        if (classIndex === null) { classIndex = buildClassIndex(); }
+        return classIndex;
+    }
+
+    /**
+     * 解析类。返回以下之一：
+     *   {ok: true,  klass, image, entry}
+     *   {ok: false, not_found: true}
+     *   {ok: false, ambiguous: true, candidates: [...], candidate_count, want_full}
+     *
+     * **歧义一律拒绝**，绝不「取第一个」。理由与静态侧同名类消歧同源：
+     * 挂到错误的重载/类上，Hook 照样会成功，错误要到很久以后才以
+     * 「数据不对」的形式暴露 —— 那比直接报错危险得多。
+     */
+    function resolveClass(imageName, namespace, name) {
+        var img = null;
+        if (imageName) {
+            img = findImage(imageName);
+            if (!img) {
+                return { ok: false, error: '未找到映像 ' + imageName };
+            }
+        }
+        var wantFull = namespace ? (namespace + '.' + name) : String(name);
+        var idx = classIndexOf();
+        if (!idx) {
+            // 退化路径：只有 from_name 可用（顶层类型 + 第一个命中）
+            var imgs0 = img ? [img] : allImages();
+            var nsBuf = Memory.allocUtf8String(namespace || '');
+            var nmBuf = Memory.allocUtf8String(name);
+            for (var i0 = 0; i0 < imgs0.length; i0++) {
+                var k0 = funcs.il2cpp_class_from_name(imgs0[i0].image, nsBuf,
+                                                     nmBuf);
+                if (k0 && !k0.isNull()) {
+                    return { ok: true, klass: k0, image: imgs0[i0],
+                             degraded: '缺少 il2cpp_image_get_class，' +
+                                       '嵌套类型无法定位' };
+                }
+            }
+            return { ok: false, not_found: true };
+        }
+
+        // 候选来源两处，都要看：
+        //   · byShort[name] —— 调用方给的是「命名空间 + 短名」（静态索引的口径）
+        //   · byFull[wantFull] —— 调用方直接给了含嵌套外层的完整名
+        var pool = (idx.byShort[name] || []).concat(idx.byFull[wantFull] || []);
+        var seen = {};
+        var hits = [];
+        for (var i = 0; i < pool.length; i++) {
+            var e = pool[i];
+            if (img && e.image.name !== img.name) { continue; }
+            // 命中条件：完整名相等，或（命名空间 + 短名）相等
+            var byFullName = (e.full_name === wantFull);
+            var byNsShort = (e.namespace === (namespace || '') &&
+                             e.name === String(name));
+            if (!byFullName && !byNsShort) { continue; }
+            var key = e.full_name + '@' + e.image.name;
+            if (seen[key]) { continue; }
+            seen[key] = 1;
+            hits.push(e);
+        }
+        if (!hits.length) { return { ok: false, not_found: true }; }
+        if (hits.length > 1) {
+            return {
+                ok: false,
+                ambiguous: true,
+                candidate_count: hits.length,
+                want_full: wantFull,
+                candidates: hits.slice(0, 30).map(function (e) {
+                    return {
+                        full_name: e.full_name,
+                        name: e.name,
+                        namespace: e.namespace,
+                        image: e.image.name
+                    };
+                }),
+                candidates_truncated: hits.length > 30
+            };
+        }
+        return { ok: true, klass: hits[0].klass, image: hits[0].image,
+                 entry: hits[0] };
+    }
+
+    /** 把 resolveClass 的失败转成统一的可操作错误返回。 */
+    function resolveClassOrFail(imageName, namespace, name) {
+        var r = resolveClass(imageName, namespace, name);
+        if (r.ok) { return r; }
+        var label = (namespace ? namespace + '.' : '') + name;
+        if (r.error) { return fail(r.error, { image: imageName }); }
+        if (r.ambiguous) {
+            // 候选与计数**平铺在顶层**（不用 fail 的 detail 包裹）：
+            // 静态侧 class_detail/search_fields 的同类拒绝就是这个形状，
+            // 两侧返回结构一致，Agent 才不用按工具记两套读法。
+            return {
+                ok: false,
+                error: '类名有歧义：' + label + ' 在运行时匹配到 ' +
+                       r.candidate_count + ' 个类。请用 image= 或' +
+                       '**完整嵌套名**（candidates[].full_name）指定唯一目标。',
+                ambiguous: true,
+                candidate_count: r.candidate_count,
+                want_full: r.want_full,
+                candidates: r.candidates,
+                candidates_truncated: r.candidates_truncated,
+                hint: '嵌套类型（如 Xxx.State）在静态索引里 namespace 为空，' +
+                      '要定位它请把 name 传成完整的嵌套名。'
+            };
+        }
+        return fail('未找到类 ' + label, { image: imageName || '(全部映像)' });
     }
 
     function fieldOffset(fieldInfo) {
@@ -751,11 +940,8 @@
             var ready = ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = findClass(opts.image, opts.namespace, opts.name);
-            if (!found) {
-                return fail('未找到类 ' + (opts.namespace ? opts.namespace + '.' : '') +
-                            opts.name, { image: opts.image || '(全部映像)' });
-            }
+            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            if (!found.ok) { return found; }
             var k = found.klass;
             var out = {
                 ok: true,
@@ -806,11 +992,8 @@
             var ready = ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = findClass(opts.image, opts.namespace, opts.name);
-            if (!found) {
-                return fail('未找到类 ' + (opts.namespace ? opts.namespace + '.' : '') +
-                            opts.name);
-            }
+            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            if (!found.ok) { return found; }
             var ms = methodsOf(found.klass);
             var hits = ms.filter(function (x) {
                 return x.name === opts.method;
@@ -837,11 +1020,8 @@
             var ready = ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = findClass(opts.image, opts.namespace, opts.name);
-            if (!found) {
-                return fail('未找到类 ' + (opts.namespace ? opts.namespace + '.' : '') +
-                            opts.name);
-            }
+            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            if (!found.ok) { return found; }
             var want = (opts.static_only === true) ? true
                      : (opts.instance_only === true) ? false : null;
             var fs = fieldsOf(found.klass, want);

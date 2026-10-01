@@ -312,11 +312,22 @@ search_methods(pattern="Update", owner="PlayerController")
 
 > **想逐层看继承树用 `class_hierarchy(direction="down")`。**
 > 它给的是**直接**继承关系：每条的 `parent` 是它真实的直接父类，
-> `depth` 是它所在的层。`find_derived_classes` 则是**传递式**的
+> `depth` 是它所在的那层。`find_derived_classes` 则是**传递式**的
 > （含间接继承，适合一次捞全所有脚本），两者用途不同，别混用。
 > 某一层超过 500 条时 `down_has_more=true`，这时改用 `find_derived_classes` 拿全量。
 > 这样做是因为「拿错类」比「报错」危险得多 —— 拿到的是**另一个类的整份字段表**，
 > 据此算出的偏移必然错，而且要到运行时才暴露。
+
+> **嵌套类型要用完整名查，短名查不到或会报歧义。**
+> IL2CPP 的 `namespace` 只属于**最外层**类型，嵌套类型（状态机 `State`、
+> 协程体 `<Xxx>d__0`、私有内部类）的命名空间是空的、只有短名。
+> 实测 IL2CPP 样本 20,072 个类型里 **7,056 个（35%）是嵌套类型**，
+> 名为 `State` 的类型有 131 个而**只有 1 个是顶层**。
+> 所以：查嵌套类型请把 `name` 传成完整嵌套名
+> （如 `name="TeamTapas.ProjectR.UI2.RUI_FloatingUI.State"`），
+> 这个写法从 `search_classes` 返回的 `nested_name` 直接抄即可。
+> 只传短名而命中多个时，`runtime_class_info` / `find_hook_target` 会返回
+> `ok: false` + `ambiguous: true` + `candidates`，**不会**替你取第一个。
 
 ### 配方 4：确认 Hook 落点是对的（重要）
 
@@ -468,6 +479,8 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 |---|---|---|
 | `search_classes` 返回空 | 名字拼错 / 需求完整命名空间 | 放宽 pattern（只搜一部分词）；试 `assembly` 过滤 |
 | `class_detail` 说找不到 | 用了短名但库里有同名嵌套类型 | 用 `search_classes` 拿到完整 `nested_name` 再查 |
+| `runtime_class_info` 报「类名有歧义」 | 短名对应多个嵌套类型（如 `State` 有 131 个） | 从 `candidates[].full_name` 里挑一个当 `name` 回灌；或补 `image=` |
+| `runtime_class_info` 报「未找到类」而静态明明有 | 传的是短名，而嵌套类型必须用完整名 | 用 `search_classes` 的 `nested_name` 作为 `name`（见上方嵌套类型说明） |
 | 字段类型是 `None` | 该字段类型在元数据里无法解析 | 正常现象（约 10% 字段）；用偏移 + 内存读确认实际用途 |
 | `inject_process` 失败 | 权限不足 / 反调试 / 进程刚启动 | 试管理员；或改用 `launch_game` |
 | `runtime_class_info` 报错 | 类在游戏里还没被加载 | 先让游戏运行到相关场景（进游戏、打开对应界面） |
