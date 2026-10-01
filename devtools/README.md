@@ -32,6 +32,7 @@ python devtools\verify_cache.py            # P3-2 索引缓存生命周期：只
 python devtools\verify_lazy_meta.py        # 解析何时发生：P1-3b 的决策门禁 + 「载入失败不许被降级成没有基类」（只需 IL2CPP 样本）
 python devtools\verify_stdio_entry.py      # 进程级入口：脚本形式（不带 PYTHONPATH）与模块形式都要能用，含惰性导入工具的真调用（无需游戏）
 python devtools\verify_session_switch.py   # 切换游戏时上一个游戏的 exe 不许留下来（纯函数 + 真实切换 + 进程级，需 Mono/IL2CPP/UE 样本）
+python devtools\verify_mcp_discovery.py    # 目录布局：容器目录不许被当成游戏 + UE/不支持引擎要给出口（真实样本 + 合成布局 + 进程级，需 IL2CPP/Mono/UE 样本）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）
@@ -172,6 +173,8 @@ python devtools\bench_index.py --only-dup   # 只量重复解析
 | CatapultHero | UE（pak v12 / utoc v8） |
 | Dinoblade | UE（pak v11 / utoc v8） |
 | `il2cpp_dump.cs` | IL2CPP 字段类型真值（33 万行） |
+| **容器目录**（装着 ≥2 款游戏的父目录，本机是 `D:\Projects`） | 布局判定：不许被当成某一个游戏 |
+| **不支持引擎的样本**（本机是 `IGNOBLE`，GameMaker） | 引擎家族提示（`engine_family`） |
 
 具体路径不在这里写死 —— 跑 `python devtools\samples.py` 看本机实际情况。
 

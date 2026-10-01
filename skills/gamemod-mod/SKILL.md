@@ -512,3 +512,7 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 | Hook 装上但 0 次触发 | 目标方法在当前场景/状态不会被调 | 换个确实会执行的方法；或 `launch_game` 早期挂钩 |
 | token 两边对不上 | 挂到了同名的重载 | 用 `token=` 精确指定；或 `param_count=`（见配方 5） |
 | AOB 扫描 0 命中 | 特征码写错 / 段不可读 | 优先改用元数据定位；确认特征码格式（`48 8B ?? ??`） |
+| `open_game` 报「这个目录下有 N 个可识别的游戏」 | 传进去的是**父目录**（如 `D:\Projects`），不是某一款游戏的目录 | 把 `game_dir` 改成返回里 `container.candidates` 里的某一个；不要指望它替你挑 |
+| `open_game` 报「Unreal 游戏没有集中元数据」 | 正常行为（不是错误） | UE 不走索引：直接用 `detect_ue` / `ue_profile` / `ue_list_entries`（会话已按这个游戏选好） |
+| `open_game` 报「没能识别出可支持的引擎」 | 引擎不在支持范围（Godot / GameMaker / Electron 等） | 看返回里 `engine_family.label`；本 MCP 不解析这类容器 |
+| `open_game` 报「这个目录本身不是游戏，它下面的 X 是」 | 游戏外面套了一层目录 | 把 `game_dir` 指到返回里 `game_root` 的路径 |
