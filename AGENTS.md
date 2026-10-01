@@ -111,7 +111,7 @@ src/gamemod_mcp/
 | 4 | `devtools/verify_mcp_*.py` | 覆盖该工具的验收断言 |
 
 **工具清单以代码为准，文档不许硬编码数量。**
-用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **5 处**：
+用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **6 处**：
 
 | 校验对象 | 强度 |
 |---|---|
@@ -120,12 +120,17 @@ src/gamemod_mcp/
 | `server.py` docstring 的「工具分层」列表 | 双向完全一致 |
 | `FastMCP(instructions=...)` | 只许提到存在的工具 |
 | `SKILL.md`（含**代码块里的调用形式**） | 只许提到存在的工具 |
+| README「验证脚本」表 | 与 `devtools/verify_*.py` **双向完全一致** |
+
+最后一行不属于「工具」，但属于同一类问题：**手工维护的清单必然漂移**，
+所以一并卡住（README 曾写「10 个可复现的验证脚本」而实际已有 20 多个）。
 
 不一致时返回非零退出码，是判断「文档是否实时更新」的唯一依据。
 
 > 历史教训：`README.md:159` 曾列出并不存在的 `unhook_all`；
 > `server.py:19-30` 的 docstring 漏写了 13 个工具；
 > README 写「41 个工具」而实际已变；
+> README 同一节写「10 个验证脚本」而表格已有 13 行、实际 20 多个；
 > SKILL.md 的配方里留着已删除的 `find_monobehaviours` 与 `detect_games`
 > ——最后这个当时**没被任何检查发现**，因为它在 ```python 代码块里、不带反引号。
 > **所以校验脚本必须扫代码块，不能只扫反引号。**

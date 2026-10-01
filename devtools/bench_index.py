@@ -8,12 +8,15 @@
 
 它量三件事，对应三个不同的优化方向：
 
-1. **开索引**（P1-2）—— `Index.open` 命中缓存时仍然全量解析元数据。
+1. **开索引**（P1-2，已完成）—— `Index.open` 命中缓存时仍然全量解析元数据。
    这里把 `_load_meta` / 缓存命中 / 强制重建 / 纯 SQL 下限分开量，
    差额就是「不加载解析器」能省下的部分。
-2. **查询**（P1-3）—— `search_*` 会把**全量**结果解析一遍塞进句柄，
-   与 `limit` 无关。这里把 ① SQL 取回 ② 解析这一页 ③ 解析全部进句柄
-   分开量，用来判断「惰性句柄」值不值得做。
+2. **查询**（P1-3，已完成）—— `search_*` 原先把**全量**结果解析一遍塞进
+   句柄，与 `limit` 无关。这里把 ① SQL 取回 ② 解析这一页
+   ③ 修改前要多付的「全量进句柄」分开量。
+   > 时间只用来**量化收益**；「确实没再全量解析」这件事由
+   > `devtools/verify_lazy_handles.py` 用**计数断言**证明（解析条数
+   > 恰好等于 limit），因为时间会闪、计数不会。
 3. **继承过滤**（P1-4）—— 核实文档里 `subtype_of` 的耗时说法。
 
 用法：
@@ -158,18 +161,32 @@ def bench_query(label: str, mpath: Path) -> None:
         t0 = time.perf_counter()
         rows = list(idx.conn.execute(sql))
         t1 = time.perf_counter()
+        # ② 解析这一页：P1-3 之后，工具路径**只**做这一步
         [idx._row_to_type(r) for r in rows[:20]]
         t2 = time.perf_counter()
+        # ③ 修改前会额外把全部行解析进句柄；现在不再发生，
+        #    这里只是把「已省掉的那部分」量出来做对照。
         [idx._row_to_type(r) for r in rows]
         t3 = time.perf_counter()
-        total = ms(t0, t3)
+        before = ms(t0, t3)
+        after = ms(t0, t2)
+        saved = ms(t2, t3)
         print(f"  {tag}   行数 {len(rows):,}")
         print(f"    ① SQL 取回                 {ms(t0, t1):9.1f} ms")
-        print(f"    ② 解析这一页（20 条）      {ms(t1, t2):9.1f} ms")
-        print(f"    ③ 解析全部进句柄           {ms(t2, t3):9.1f} ms"
-              f"   ← 与 limit 无关")
-        print(f"    合计                       {total:9.1f} ms"
-              f"   （③ 占 {ms(t2, t3) / max(total, 1e-9) * 100:.0f}%）")
+        print(f"    ② 解析这一页（20 条）      {ms(t1, t2):9.1f} ms"
+              f"   ← P1-3 之后只剩这一步")
+        print(f"    ③ 全量进句柄               {saved:9.1f} ms"
+              f"   ← P1-3 已省掉（原占 {saved / max(before, 1e-9) * 100:.0f}%）")
+        print(f"    修改前合计 ≈ ①+②+③        {before:9.1f} ms")
+        print(f"    现在合计   ≈ ①+②          {after:9.1f} ms"
+              f"   （省 {saved / max(before, 1e-9) * 100:.0f}%）")
+
+    # 真实工具路径：耗时应 ≈ ①+②，与结果集大小基本无关
+    dt, r = best(lambda: idx.search_classes("", limit=20))
+    print(f"  真实 search_classes('', limit=20)  {dt:9.1f} ms"
+          f"   命中 {r['total']:,}")
+    print(f"    （「只解析 20 条而非 {r['total']:,} 条」由 "
+          f"devtools/verify_lazy_handles.py 计数断言把关）")
 
     print("-" * 76)
     print(f"[P1-4] 继承过滤成本  ——  {label}")

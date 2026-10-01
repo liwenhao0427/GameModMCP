@@ -43,6 +43,8 @@ SRC: Path = ROOT / "src"
 CACHE_TEST: Path = ROOT / ".cache-test"
 #: 跨引擎测试缓存（已被 .gitignore 排除）
 CACHE_ADAPT_TEST: Path = ROOT / ".cache-adapt-test"
+#: 惰性句柄测试缓存（已被 .gitignore 排除）
+CACHE_LAZY_TEST: Path = ROOT / ".cache-lazy-test"
 
 
 def add_src_to_path() -> None:
@@ -60,6 +62,7 @@ def ensure_cache_dirs() -> None:
     """确保测试缓存目录存在。"""
     CACHE_TEST.mkdir(parents=True, exist_ok=True)
     CACHE_ADAPT_TEST.mkdir(parents=True, exist_ok=True)
+    CACHE_LAZY_TEST.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------- 样本根目录

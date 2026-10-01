@@ -29,7 +29,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from ..logutil import progress, warn
 from . import adapt
@@ -66,6 +66,40 @@ def _file_sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 # ---------------------------------------------------------------- 查询结果句柄
+#
+# P1-3：句柄背后的结果**惰性物化**。
+#
+# 原来 `search_*` 会把命中的**全部**行都解析成 dict 塞进句柄，与 `limit`
+# 无关 —— 实测 IL2CPP `search_classes('')` 里这一步占 45%（54.8 ms / 121.7 ms），
+# 宽查询下纯属白干：调用方通常只要前 20 条。
+#
+# 现在句柄只登记「怎么取」（原始行 + 一个解析函数），翻页时才解析这一页。
+# 注意：**不是**「把解析结果缓存起来」—— 那没省掉解析，只是挪了位置。
+
+
+class _RowSource:
+    """句柄背后的结果来源：数据库行 + 解析函数（P1-3 的主力）。
+
+    行本身是廉价的（`sqlite3.Row` 只是个元组），昂贵的是把它解析成 dict：
+    要查类型名、算字段类型置信度、解析方法返回值……所以只解析取到的那一页。
+
+    契约就三条：`len()` 给条数，`slice()` 给一页，`all()` 全量物化
+    （**只在** `pattern` 跨结果过滤时才会被调用 —— 即「用到才付钱」）。
+    """
+
+    def __init__(self, rows: list[sqlite3.Row],
+                 convert: Callable[[sqlite3.Row], dict[str, Any]]):
+        self._rows = rows
+        self._convert = convert
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def slice(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        return [self._convert(r) for r in self._rows[offset : offset + limit]]
+
+    def all(self) -> list[dict[str, Any]]:
+        return [self._convert(r) for r in self._rows]
 
 
 @dataclass
@@ -77,8 +111,12 @@ class QueryResult:
 
     handle: str
     kind: str
-    total: int
-    items: list[dict[str, Any]]
+    source: _RowSource
+
+    @property
+    def total(self) -> int:
+        """结果集条数（受句柄上限约束的那一份，与工具顶层的全局 total 不同）。"""
+        return len(self.source)
 
     def page(self, offset: int, limit: int,
              pattern: str = "") -> dict[str, Any]:
@@ -86,17 +124,25 @@ class QueryResult:
 
         合并了原来的 page / search 两个方法（契约第 3 条：一个是另一个的
         特例就合成一个，用参数区分）。`pattern=""` 时不过滤，即纯翻页。
+
+        注意两条路径的成本**不一样**，这是刻意的：
+        - `pattern=""` 只解析这一页（P1-3 的收益就在这条路上）；
+        - `pattern=...` 要看每一条的值才能过滤，必须全量物化 —— 即
+          「用到才付钱」。别把它当成「免费的二次过滤」。
         """
-        hits = self.items
+        offset = max(0, offset)
+        limit = max(1, min(limit, 2000))
         if pattern:
             needle = pattern.lower()
             hits = [
-                it for it in hits
+                it for it in self.source.all()
                 if needle in " ".join(str(v) for v in it.values()).lower()
             ]
-        offset = max(0, offset)
-        limit = max(1, min(limit, 2000))
-        chunk = hits[offset : offset + limit]
+            chunk = hits[offset : offset + limit]
+            total = len(hits)
+        else:
+            chunk = self.source.slice(offset, limit)
+            total = len(self.source)
         return {
             "handle": self.handle,
             "kind": self.kind,
@@ -104,8 +150,8 @@ class QueryResult:
             "offset": offset,
             "limit": limit,
             "returned": len(chunk),
-            "total": len(hits),
-            "has_more": offset + len(chunk) < len(hits),
+            "total": total,
+            "has_more": offset + len(chunk) < total,
             "items": chunk,
         }
 
@@ -118,11 +164,11 @@ class ResultStore:
         self._items: dict[str, QueryResult] = {}
         self._counter = 0
 
-    def put(self, kind: str, items: list[dict[str, Any]]) -> QueryResult:
-        """登记一份结果，返回句柄。"""
+    def put(self, kind: str, source: _RowSource) -> QueryResult:
+        """登记一份结果来源，返回句柄（**不物化**，见模块上方说明）。"""
         self._counter += 1
         handle = f"{kind}-{self._counter}"
-        qr = QueryResult(handle=handle, kind=kind, total=len(items), items=items)
+        qr = QueryResult(handle=handle, kind=kind, source=source)
         self._items[handle] = qr
 
         # 淘汰最旧的
@@ -670,10 +716,13 @@ class Index:
         total = len(rows)
         limit = max(1, min(limit, 2000))
         offset = max(0, offset)
-        page = rows[offset : offset + limit]
-        items = [self._row_to_type(r) for r in page]
 
-        qr = self.results.put("classes", [self._row_to_type(r) for r in rows])
+        # P1-3：句柄登记「原始行 + 解析函数」，不提前把 2 万行全解析成 dict。
+        # 这里原来对全部 rows 调一次 _row_to_type（只为了塞进句柄），
+        # 同时又对 page 调一次 —— 前者在 width 查询里占 41%。
+        source = _RowSource(rows, self._row_to_type)
+        qr = self.results.put("classes", source)
+        items = source.slice(offset, limit)
 
         return {
             "handle": qr.handle,
@@ -946,7 +995,7 @@ class Index:
         return out
 
     def _paged(
-        self, kind: str, total: int, items: list[dict[str, Any]],
+        self, kind: str, total: int, source: _RowSource,
         offset: int, limit: int, handle_truncated: bool, **extra: Any
     ) -> dict[str, Any]:
         """组装统一的分页返回（`total` 是真值，`has_more` 如实标注）。
@@ -955,12 +1004,15 @@ class Index:
         早期实现在 SQL 里写死 `LIMIT 20000` 再令 `total = len(items)`，
         于是「'a' 命中 49286 个字段」被报成 20000（实测），
         而且是**静默**的：Agent 会以为全局只有 2 万个匹配，据此判断覆盖率。
+
+        P1-3：入参从 `items` 改为 `source` —— 只解析这一页，不再把整个
+        结果集提前物化（见 `_RowSource`）。
         """
         limit = max(1, min(limit, 2000))
         offset = max(0, offset)
-        page = items[offset : offset + limit]
+        page = source.slice(offset, limit)
         out = {
-            "handle": self.results.put(kind, items).handle,
+            "handle": self.results.put(kind, source).handle,
             "total": total,
             "offset": offset,
             "limit": limit,
@@ -972,7 +1024,7 @@ class Index:
             out["handle_truncated"] = True
             out["handle_note"] = (
                 f"匹配数 {total} 超过句柄上限 {self._HANDLE_CAP}，"
-                f"句柄只保留了前 {len(items)} 条；翻页请用本工具的 offset/limit，"
+                f"句柄只保留了前 {len(source)} 条；翻页请用本工具的 offset/limit，"
                 f"不要依赖 read_query_result 拿到全集。"
             )
         out.update(extra)
@@ -1005,26 +1057,25 @@ class Index:
             f"SELECT * FROM fields WHERE {where} ORDER BY name LIMIT ?",
             (*params, self._HANDLE_CAP)))
 
-        items = []
-        for r in rows:
+        # P1-3：只登记来源，不在这里把最多 2 万条全解析成 dict。
+        def _convert_field(r: sqlite3.Row) -> dict[str, Any]:
+            # 字段的类型引用与其它成员不是同一套索引，必须走字段专用解析
             dt = adapt.resolve_field(self.meta, r["type_index"])
-            items.append(
-                {
-                    "index": r["idx"],
-                    "name": r["name"],
-                    "owner": (
-                        self.meta.types[r["owner"]].nested_name
-                        if r["owner"] is not None
-                        else None
-                    ),
-                    # 字段的类型引用与其它成员不是同一套索引，必须走字段专用解析
-                    "field_type": dt.get("name"),
-                    "type_confidence": dt.get("confidence"),
-                    "type_index": r["type_index"],
-                }
-            )
-        return self._paged("fields", total, items, offset, limit,
-                           total > len(items))
+            return {
+                "index": r["idx"],
+                "name": r["name"],
+                "owner": (
+                    self.meta.types[r["owner"]].nested_name
+                    if r["owner"] is not None
+                    else None
+                ),
+                "field_type": dt.get("name"),
+                "type_confidence": dt.get("confidence"),
+                "type_index": r["type_index"],
+            }
+
+        return self._paged("fields", total, _RowSource(rows, _convert_field),
+                           offset, limit, total > len(rows))
 
     def search_methods(
         self, pattern: str, offset: int = 0, limit: int = 50, owner: str = "",
@@ -1050,8 +1101,8 @@ class Index:
             f"SELECT * FROM methods WHERE {where} ORDER BY name LIMIT ?",
             (*params, self._HANDLE_CAP)))
 
-        items = [
-            {
+        def _convert_method(r: sqlite3.Row) -> dict[str, Any]:
+            return {
                 "index": r["idx"],
                 "name": r["name"],
                 "owner": self.meta.types[r["owner"]].full_name if r["owner"] is not None else None,
@@ -1061,10 +1112,10 @@ class Index:
                 "flags": r["flags"],
                 "token": f"0x{r['token']:08X}",
             }
-            for r in rows
-        ]
-        return self._paged("methods", total, items, offset, limit,
-                           total > len(items))
+
+        # P1-3：同上，句柄惰性化（方法返回值的解析比类型行更贵）
+        return self._paged("methods", total, _RowSource(rows, _convert_method),
+                           offset, limit, total > len(rows))
 
     def class_detail(self, full_name: str, include_inherited: bool = False,
                      assembly: str = "") -> dict[str, Any]:

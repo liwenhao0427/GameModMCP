@@ -9,6 +9,7 @@
 .cache/
 .cache-test/
 .cache-adapt-test/
+.cache-lazy-test/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

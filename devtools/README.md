@@ -23,6 +23,7 @@ python devtools\samples.py                 # 只看本机样本可用性（不�
 python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否一致（无需游戏）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
+python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）
 python devtools\verify_fieldtypes.py   # 字段类型解析率与精度
 python devtools\verify_mono.py         # Mono 解析器（对官方 .NET 库真值）
 python devtools\verify_adapt.py        # 跨引擎（IL2CPP + Mono）
@@ -70,7 +71,7 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 异常原样抛出。它记录每次调用的 `ok`、`error` 与返回体字节数，
 因此还能顺带暴露「哪个工具在返回超大结果」（对应契约 §3.1 第 5 条）。
 
-当前实测：**39 / 39 全部在 MCP 层真实调用过**。
+当前实测：**38 / 38 全部在 MCP 层真实调用过**。
 
 > 这个门禁不是摆设：曾把 `inject_process` 注入失败放宽成警告后，
 > 覆盖率立刻掉到 **35/38**（`hook_address` / `read_field_value` /

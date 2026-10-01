@@ -758,6 +758,12 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
     - 只看第 500~550 条 → 只给 `offset`/`limit`；
     - 在这一批结果里再找含某子串的 → 再加 `pattern`（大小写不敏感）。
 
+    > 两者的成本**不一样**：纯翻页只解析取到的那一页（结果集是惰性物化的，
+    > 见 `engine/index.py` 的 `_RowSource`）；而 `pattern` 要看每条的值才能
+    > 过滤，必须把整个结果集解析一遍。所以在几万条的句柄上，
+    > 纯翻页是毫秒级，带 `pattern` 会明显更慢 —— 缩小范围优先用
+    > `search_*` 的参数（`pattern` / `subtype_of` / `owner` / `assembly`）。
+
     > 原先另有一个 `search_query_result`，实测它在 `pattern=""` 时与本工具
     > 输出完全相同 —— 它就是本工具的特例。按契约第 3 条（单一职责：
     > 一个是另一个的特例就合并）已删除，并入 `pattern` 参数。

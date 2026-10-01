@@ -3,7 +3,7 @@
 
 为什么必须有这个脚本
 ============================================================
-本项目有 4 个地方都在描述「有哪些工具」：
+本项目有 5 个地方都在描述「有哪些工具」：
 
     1. src/gamemod_mcp/server.py   —— 代码本身（唯一真值）
     2. src/gamemod_mcp/server.py   —— 模块 docstring 的「工具分层」列表
@@ -11,10 +11,16 @@
     4. README.md                   —— 「工具一览」表格
     5. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
 
-经验证明靠人肉同步**必然漂移**（真实发生过的三起）：
+外加第 6 处：它不属于「工具」，但属于同一类问题（手工维护的清单会漂移）：
+
+    6. README.md                   —— 「验证脚本」表 vs devtools/verify_*.py
+
+经验证明靠人肉同步**必然漂移**（真实发生过的四起）：
     · README 写了并不存在的 `unhook_all`
     · server.py 的 docstring 漏写了 13 个工具
     · README 的「41 个工具」与实际数量不符
+    · README 写「10 个可复现的验证脚本」，而实际已有 20 多个，
+      同一节的表格还漏了 9 个脚本 —— 当时**没有任何检查**会发现
 所以用本脚本卡住：**不一致就非零退出**。
 
 校验规则
@@ -28,6 +34,7 @@
 - instructions：**只许提到存在的工具**（它是精简工作流，不必列全）。
 - SKILL.md：**只许提到存在的工具**（它是使用指南，不必列全），
   但要能识别出「曾经存在、现已删除」的名字。
+- README 的「验证脚本」表：与 `devtools/verify_*.py` 双向一致。
 
 用法
 ============================================================
@@ -304,6 +311,31 @@ def main() -> int:
             spots.append("代码")
         check(f"`{name}` 已清理", not spots,
               f"仍出现在 {spots}（{why}）" if spots else f"（{why}）")
+
+    # --------------------------------------------------- 7. README 验证脚本表
+    show("7. README「验证脚本」表 vs devtools/（必须双向完全一致）")
+    # 本节与工具无关，但和「工具清单」是同一类问题：**手工维护的清单会漂移**。
+    # README 曾写「devtools 下有 10 个可复现的验证脚本」而实际已有 20 多个，
+    # 同节表格还漏了 9 个脚本 —— 而且没有任何检查会发现。
+    on_disk = {p.name for p in (ROOT / "devtools").glob("verify_*.py")}
+    in_readme = set(re.findall(r"`(verify_[A-Za-z0-9_]+\.py)`", rtext))
+    print(f"  devtools 实际 {len(on_disk)} 个，README 表格列出 {len(in_readme)} 个")
+
+    miss_scripts = sorted(on_disk - in_readme)
+    extra_scripts = sorted(in_readme - on_disk)
+    check("devtools 里的验收脚本都被 README 收录", not miss_scripts,
+          f"{miss_scripts}" if miss_scripts else "（无遗漏）")
+    check("README 写了、devtools 里没有的脚本为 0", not extra_scripts,
+          f"{extra_scripts}" if extra_scripts else "（无多余）")
+
+    script_nums = {int(x) for x in
+                   re.findall(r"(\d+)\s*个可复现的验证脚本", rtext)}
+    for n in sorted(script_nums):
+        check(f"README 写的「{n} 个可复现的验证脚本」与实际 {len(on_disk)} 一致",
+              n == len(on_disk), "" if n == len(on_disk) else f"实际是 {len(on_disk)}")
+    if not script_nums:
+        check("README 声明了验证脚本总数", False,
+              "没找到「N 个可复现的验证脚本」字样")
 
     # ------------------------------------------------------------ 汇总
     if "--list" in argv:

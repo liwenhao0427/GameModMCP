@@ -244,24 +244,37 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 10 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑：
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 22 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 21 个进自动套件，
+`verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
 |---|---|
-| `verify_parser.py` | IL2CPP 元数据表结构与记录布局（5 道闸） |
-| `verify_index.py` | 索引层 15 项检查（构建/复用/查询/句柄） |
+| `verify_parser.py` | IL2CPP 元数据表结构与记录布局 |
+| `verify_index.py` | 索引层：构建 / 缓存复用 / 各类查询 / 结果句柄 |
+| `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |
 | `verify_fieldtypes.py` | 字段类型解析率与**精度**（对 27,264 条 dump 真值） |
 | `verify_adapt.py` | **跨引擎**：同一套查询 API 吃 IL2CPP + Mono |
-| `verify_mono.py` | Mono 解析器 150 断言，对官方 .NET 库真值 |
-| `verify_ue.py` | UE 提取器对两个真实样本（pak/utoc，对打包清单） |
-| `verify_runtime.py` | Frida 运行时层 6 个分组 |
+| `verify_mono.py` | Mono 解析器，对官方 `System.Reflection.Metadata` 真值 |
+| `verify_mono_coverage.py` | Mono 覆盖到的表 / 特性范围 |
+| `verify_mono_robust.py` | Mono 对畸形输入的健壮性 |
+| `verify_ue.py` | UE 提取器对两个真实样本（pak / utoc，对打包清单） |
+| `verify_runtime.py` | Frida 运行时层 |
+| `verify_runtime_target.py` | 运行时定位 Hook 落点（token 对账） |
 | `verify_il2cpp_runtime.py` | 静态 token ↔ 运行时 token 交叉验证 |
-| `verify_mcp_tools.py` | **通过 MCP 工具层**跑完整流程（IL2CPP，57 项） |
-| `verify_mcp_mono.py` | **通过 MCP 工具层**跑完整流程（Mono，40 项） |
-| `verify_mcp_ue.py` | **通过 MCP 工具层**验证 UE 能力真的接上了（60 项） |
-| `verify_mcp_extra.py` | 补全主流程没覆盖到的工具（41 项） |
+| `verify_mcp_tools.py` | **通过 MCP 工具层**跑完整流程（IL2CPP） |
+| `verify_mcp_mono.py` | **通过 MCP 工具层**跑完整流程（Mono） |
+| `verify_mcp_ue.py` | **通过 MCP 工具层**验证 UE 能力真的接上了 |
+| `verify_mcp_decompile.py` | `decompile` 工具（`ilspycmd` 薄封装） |
+| `verify_mcp_extra.py` | 补全主流程没覆盖到的工具 |
+| `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
+| `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
+| `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
+| `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
+
+> 上表与 `devtools/verify_*.py` 的一致性由 `verify_tool_inventory.py` 校验，
+> 所以它不会像以前那样悄悄腐坏（本节曾写「10 个脚本」而实际已有 20 多个）。
 
 几个关键的「硬证据」：
 
@@ -272,17 +285,21 @@ GameModMCP/
 - **运行时映像数 94 == 静态映像数 94** → 证明探针挂到的是同一个游戏实例。
 - **字段类型 27,264 条与 dump 比对 0 错** → 证明 `derived` 那一档没有蒙错。
 
-跑法：
+跑法（**一条命令跑全部**，自带垫片、开跑前清空旧日志、结束时卡覆盖率门禁）：
 
 ```powershell
-$env:PYTHONPATH = "$PWD\src"
-python devtools\verify_mcp_tools.py     # IL2CPP 端到端（57 项）
-python devtools\verify_mcp_mono.py      # Mono 端到端（40 项）
-python devtools\verify_adapt.py         # 跨引擎（49 项）
+python devtools\run_all_verify.py
+```
+
+只跑一两个排查时用 `--only`（注意此时会**跳过**覆盖率门禁，因为子集不可能覆盖全部工具）：
+
+```powershell
+python devtools\run_all_verify.py --only verify_lazy_handles
 ```
 
 > `verify_mcp_tools.py` 会**真的启动一个游戏**并在结束时结束它。
 > 它需要 Frida 和管理员权限，且本机要有 Garden of Witches。
+> 样本不存在的脚本会记为「无法验证」并跳过 —— **跳过不算通过**。
 
 ---
 
