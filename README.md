@@ -311,8 +311,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 32 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 31 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 34 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 33 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -321,6 +321,7 @@ GameModMCP/
 | `verify_index.py` | 索引层：构建 / 缓存复用 / 各类查询 / 结果句柄 |
 | `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |
 | `verify_handle_scope.py` | 结果句柄的**作用域**：跨游戏/重开索引的旧句柄必须被拒绝，不许读到另一个结果集 |
+| `verify_session_switch.py` | **会话身份**：切换游戏时上一个游戏的 `exe` 不许留下来（纯函数注入 + 真实 Mono→IL2CPP→UE 切换 + 进程级 stdio，含非空转反证） |
 | `verify_subtype.py` | 继承过滤反过来查：**与旧的逐条判定逐条相等** + 邻接表只建一次 |
 | `verify_fieldtypes.py` | 字段类型解析率与**精度**（对 27,264 条 dump 真值） |
 | `verify_adapt.py` | **跨引擎**：同一套查询 API 吃 IL2CPP + Mono |
@@ -341,6 +342,7 @@ GameModMCP/
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
 | `verify_mcp_context.py` | **P2-3 的决策门禁**（不是行为测试）：钉住「进度无消费方、取消够不着、tasks 会弄坏」这三条否决依据，变了就报红 |
+| `verify_stdio_entry.py` | **进程级入口**：脚本形式（`python <repo>/src/gamemod_mcp/server.py`，且不带 `PYTHONPATH`）与模块形式都能握手；两种形式的工具清单一致；stdout 只有 JSON-RPC；脚本形式下真调 `ue_*` / `decompile`（惰性导入曾在这里炸） |
 | `verify_cache.py` | **索引缓存的生命周期**（P3-2）：只许删形状正确的文件（含反证）、三条护栏、命中时 touch、`cache` 统计与磁盘一致 |
 | `verify_lazy_meta.py` | **元数据解析何时发生**（P1-3b 的决策门禁）：命中不解析不许退化、解析每次 open 只发生一次、逐题量哪些查询会逼出解析器、以及「载入失败不许被降级成『没有基类』」（含把旧写法搬回来的反证） |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |

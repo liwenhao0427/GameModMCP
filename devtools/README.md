@@ -30,6 +30,8 @@ python devtools\verify_mcp_resources.py    # MCP 资源层：gamemod://guide 与
 python devtools\verify_mcp_context.py      # P2-3 决策门禁：为什么不加进度/取消/tasks（无需注入，不需要游戏）
 python devtools\verify_cache.py            # P3-2 索引缓存生命周期：只删形状正确的 + 三条护栏 + 命中 touch（只需 Mono 样本）
 python devtools\verify_lazy_meta.py        # 解析何时发生：P1-3b 的决策门禁 + 「载入失败不许被降级成没有基类」（只需 IL2CPP 样本）
+python devtools\verify_stdio_entry.py      # 进程级入口：脚本形式（不带 PYTHONPATH）与模块形式都要能用，含惰性导入工具的真调用（无需游戏）
+python devtools\verify_session_switch.py   # 切换游戏时上一个游戏的 exe 不许留下来（纯函数 + 真实切换 + 进程级，需 Mono/IL2CPP/UE 样本）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）
@@ -178,6 +180,8 @@ python devtools\bench_index.py --only-dup   # 只量重复解析
 ```
 devtools/
 ├── samples.py             样本路径的集中定义（唯一真值）
+├── mcp_stdio.py           裸 JSON-RPC 的 stdio 客户端（给入口/会话类验收共用：
+│                          能验 stdout 纯度，也能把子进程 stderr 的失败原因带回来）
 ├── run_all_verify.py      一条命令跑全部 + 覆盖率门禁（崩溃重试并留痕）
 ├── verify_*.py            验收脚本（上面那批）
 ├── bench_index.py         性能基准（开索引 / 单次查询 / 重复解析）

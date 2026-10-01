@@ -78,14 +78,42 @@ from __future__ import annotations
 import functools
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__, cap
-from .engine import discovery, state
-from .engine.state import ensure_index, ensure_runtime, select_game
+# 两种启动方式都必须能用（文档与客户端配置里两种都出现过）：
+#   1. `python -m gamemod_mcp.server`（配 PYTHONPATH=<repo>/src）
+#   2. `python <repo>/src/gamemod_mcp/server.py`
+# 第 2 种方式下没有父包，`__package__` 是空串，相对导入会当场炸：
+#   ImportError: attempted relative import with no known parent package
+# 而这个报错**发生在任何工具注册之前**，客户端只会看到
+# `McpError: Connection closed` —— 完全看不出是入口写法的问题。
+# 所以这里先把包所在目录（src/）塞进 sys.path，再按包名做绝对导入。
+if __package__ in (None, ""):  # 直接当脚本跑
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from gamemod_mcp import __version__, cap
+    from gamemod_mcp.engine import decompile as dc
+    from gamemod_mcp.engine import discovery, state
+    from gamemod_mcp.engine import ue as ue_mod
+    from gamemod_mcp.engine.state import ensure_index, ensure_runtime, select_game
+    from gamemod_mcp.logutil import progress, warn
+else:  # 正常作为包被导入
+    from . import __version__, cap
+    from .engine import decompile as dc
+    from .engine import discovery, state
+    from .engine import ue as ue_mod
+    from .engine.state import ensure_index, ensure_runtime, select_game
+    from .logutil import progress, warn
+
+# 注意：上面这些导入原本有一部分写在**函数体里**（`from .engine import ue`、
+# `from .logutil import warn`）。惰性导入本身没问题，但用相对形式就有问题：
+# 以脚本方式启动时没有父包，`from .x import y` 会在**调用那个工具时**才炸
+# （initialize 与 tools/list 都能过，看起来一切正常，一用就 ImportError）。
+# 入口要同时支持两种形式，所以这些导入都收敛到这里 ——
+# 两个模块只依赖标准库与同包模块，提前导入没有额外代价。
 
 # ---------------------------------------------------------------- 服务器实例
 
@@ -185,7 +213,6 @@ def _cap_response(fn: Any) -> Any:
             # 上限检查是**附加**保护，绝不能因为它自己出问题就让一个
             # 本来正常的工具失败（那会把「省上下文」变成「功能坏了」）。
             # 但也不许静默：打到 stderr，让人看得见。
-            from .logutil import warn
             warn(f"响应体积上限检查失败，已按原样返回：{type(exc).__name__}: {exc}")
             return payload
 
@@ -926,7 +953,6 @@ def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
                     True 出 800+ 个小文件（实测 3.5 秒），便于按需读取；
                     False 出单个大文件（实测 11.5 秒），便于整体搜索。
     """
-    from .engine import decompile as dc
 
     probe = dc.available()
     if not probe["available"]:
@@ -1716,7 +1742,6 @@ def detect_ue(exe: str = "") -> dict:
     Args:
         exe: 游戏可执行文件路径。留空则用当前会话的主程序。
     """
-    from .engine import ue as ue_mod
 
     target, err = _ue_exe(exe)
     if err:
@@ -1741,7 +1766,6 @@ def ue_profile(exe: str = "", output_path: str = "") -> dict:
         exe:         游戏可执行文件路径。留空则用当前会话的主程序。
         output_path: 可选，把完整 profile 写成 JSON 文件的路径。
     """
-    from .engine import ue as ue_mod
 
     target, err = _ue_exe(exe)
     if err:
@@ -1772,7 +1796,6 @@ def ue_list_entries(container: str, kind: str = "auto",
         limit:     最多返回多少条。
         offset:    从第几条开始（配合 total 翻页）。
     """
-    from .engine import ue as ue_mod
 
     p = Path(container)
     if not p.is_file():
@@ -1860,7 +1883,6 @@ def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
         exe:   游戏可执行文件路径。留空则用当前会话的主程序。
         limit: 每类最多返回多少条。
     """
-    from .engine import ue as ue_mod
 
     target, err = _ue_exe(exe)
     if err:
@@ -1909,7 +1931,6 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
         offset:   从第几条开始（翻页用）。
         limit:    本页最多多少条。被截断时 `has_more` 为 true。
     """
-    from .engine import ue as ue_mod
 
     target = path
     if not target:
@@ -2055,7 +2076,6 @@ def guide_resource() -> str:
 
 def main() -> None:
     """以 stdio 方式启动 MCP 服务器（MCP 客户端的标准接入方式）。"""
-    from .logutil import progress
     progress(f"GameMod MCP v{__version__} 启动（stdio）")
     mcp.run(transport="stdio")
 

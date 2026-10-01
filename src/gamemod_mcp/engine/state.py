@@ -112,6 +112,29 @@ class SessionState:
             warn(f"运行时会话未完全关闭：{res.get('error')}")
         return res
 
+    # ------------------------------------------------ 切换游戏
+
+    def reset_target(self) -> None:
+        """清空「当前游戏是谁」的身份信息（切换游戏时调用）。
+
+        必须**显式清空**，而不是指望每个分支各自把字段写对：
+        `select_game` 的 IL2CPP 分支只写 `metadata_path`、不写 `exe`，
+        于是上一个会话的 `exe` 会原样留下来 —— 实测同一进程内
+
+            open_game(某个 Mono 游戏)   → exe = <Mono 游戏>\\Xxx_Data\\Managed
+            open_game(某个 IL2CPP 游戏) → exe 仍然是上面那个 Mono 目录
+
+        而 `exe` 正是 `launch_game` / `ue_profile` / `detect_ue` 不传参时
+        默认使用的目标，等于**可能对另一个游戏动手**（最坏是启动并注入错游戏）。
+        新进程首次 open_game 看不出这个问题，只有切游戏时才暴露，
+        所以固定在这里清一次。
+        """
+        self.game_dir = ""
+        self.engine = ""
+        self.exe = ""
+        self.metadata_path = ""
+        self.opened_at = 0.0
+
     # ------------------------------------------------ 概要
 
     def summary(self) -> dict[str, Any]:
@@ -228,6 +251,9 @@ def select_game(
         _state.close_runtime()
         _state.close_index()
         _state.notes.clear()
+        # 身份信息也必须清 —— 否则「上一个游戏的 exe」会被当成这个游戏的
+        # （IL2CPP 分支不写 exe），详见 reset_target 的注释。
+        _state.reset_target()
 
         if metadata_path:
             mp = Path(metadata_path)
