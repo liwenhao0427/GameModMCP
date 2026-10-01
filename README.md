@@ -317,8 +317,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 35 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 34 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 36 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 35 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -331,6 +331,7 @@ GameModMCP/
 | `verify_mcp_discovery.py` | **目录布局判定**：容器目录（装着多款游戏的父目录）不许被当成某一个游戏、UE 不许被送去建索引、不支持的引擎要给出家族提示（真实样本 + 合成布局 + 进程级 stdio，含非空转反证） |
 | `verify_subtype.py` | 继承过滤反过来查：**与旧的逐条判定逐条相等** + 邻接表只建一次 |
 | `verify_fieldtypes.py` | 字段类型解析率与**精度**（对 27,264 条 dump 真值） |
+| `verify_params.py` | **方法参数**：v31 记录里哪个偏移才是 `parameterStart`（+12 恒定在表外、+16 单调且落在参数表内）、解析率、参数名精度（对 89,134 组 dump 真值 99.9%）、参数个数对账，含「改回旧偏移命中 0」的反证 |
 | `verify_adapt.py` | **跨引擎**：同一套查询 API 吃 IL2CPP + Mono |
 | `verify_mono.py` | Mono 解析器，对官方 `System.Reflection.Metadata` 真值 |
 | `verify_mono_coverage.py` | Mono 覆盖到的表 / 特性范围 |

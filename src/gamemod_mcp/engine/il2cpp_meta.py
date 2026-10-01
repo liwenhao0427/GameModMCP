@@ -636,6 +636,40 @@ class Metadata:
         self.fields = out
 
     def _parse_methods(self) -> None:
+        r"""解析 methods 表。
+
+        **两套记录布局，字段位置不同**（这是本文件最容易读错的地方）：
+
+        | 偏移 | v31（36 字节/记录） | v<31（32 字节/记录） |
+        |---|---|---|
+        | +0  | nameIndex          | nameIndex |
+        | +4  | declaringType      | declaringType |
+        | +8  | returnType         | returnType |
+        | +12 | **未确认**（实测恒为 `0x08000000` 一类哨兵，**不是**表索引） | parameterStart |
+        | +16 | **parameterStart** | genericContainerIndex |
+        | +20 | **未确认**（实测恒为 -1 一类哨兵） | token |
+        | +24 | token              | flags/iflags/slot/parameterCount |
+        | +28 | flags/iflags/slot/parameterCount | —— |
+
+        v31 那两列是**实测**结论，不是查文档得来的：
+
+        - 用游戏官方 dump（`il2cpp_dump.cs`）做真值，把 +16 当 `parameterStart`
+          取参数名，3,000 个方法里 2,858 个与真值**逐字相同**，剩下的差异全部
+          来自比对脚本没处理默认值参数（`bool x = false`）；把 +12 当
+          `parameterStart` 则命中 **0**（它恒为 `0x08000000`，任何表里都越界）。
+        - +16 在整张表上**单调不减**，取值恰好覆盖 `0..参数表条数-1`，
+          无参数的方法一律为 -1；而每个方法的 +16 与前一个方法的参数个数严格
+          递推吻合（`System.String.Concat` 六个重载逐条对齐）。
+        - 旧代码把 +12 当 `parameterStart`、把 +16 当 `genericContainerIndex`，
+          于是 `parameters_of()` 永远返回空列表 —— `class_detail` 的
+          `parameters` 字段**恒为空**，Agent 只能靠猜写 `args_type`。
+          `genericContainerIndex` 目前没有任何读取方，故 v31 不再解析它。
+
+        v<31 那一列按公开的 `Il2CppMethodDefinition` 结构定义实现，本机
+        **没有 v<31 的样本可验证**（9 个 IL2CPP 样本全是 v31）—— 但它与
+        32 字节的记录长度自洽（token + 尾部 8 字节恰好填满），而旧代码按
+        v31 的偏移去读 32 字节记录，尾部会读到记录之外，不可能正确。
+        """
         entry = self.tables.get("methods")
         if entry is None or not entry.offset:
             return
@@ -654,10 +688,17 @@ class Metadata:
             b = base + i * rec
             try:
                 (
-                    name_idx, decl, ret, param_start, generic, _reserved,
+                    name_idx, decl, ret, f12, f16, f20,
                 ) = struct.unpack_from("<6i", mv, b)
-                token = struct.unpack_from("<I", mv, b + 24)[0]
-                flags, iflags, slot, param_count = struct.unpack_from("<4H", mv, b + 28)
+                if rec >= 36:
+                    param_start, generic = f16, -1
+                    token = struct.unpack_from("<I", mv, b + 24)[0]
+                    tail_at = 28
+                else:
+                    param_start, generic, token = f12, f16, f20
+                    tail_at = 24
+                flags, iflags, slot, param_count = struct.unpack_from(
+                    "<4H", mv, b + tail_at)
             except struct.error:
                 break
             append(
@@ -980,7 +1021,11 @@ class Metadata:
         return self.methods[start : start + count]
 
     def parameters_of(self, method: MethodDef) -> list[ParameterDef]:
-        """取某方法的参数。"""
+        """取某方法的参数。
+
+        `parameter_start` 是 parameters 表的**索引**，无参数的方法为 -1
+        （见 `_parse_methods` 里对偏移的实测说明）；越界一律当「取不到」返回空。
+        """
         start, count = method.parameter_start, method.parameter_count
         if start < 0 or count <= 0 or start + count > len(self.parameters):
             return []

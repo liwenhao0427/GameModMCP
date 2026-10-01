@@ -161,6 +161,41 @@ def find_mono_groundtruth() -> Path | None:
     return d if d.is_dir() else None
 
 
+def find_param_dump() -> tuple[Path, Path] | None:
+    """带**参数名**的 IL2CPP dump 真值：`<游戏>/Decompiled/dump.cs`。
+
+    为什么不复用 `find_il2cpp_dump()`：那一份（aiMod 的 `il2cpp_dump.cs`）
+    只写参数**类型**，参数名位置是空的 ——
+
+        /*0x1beef40*/ System.Void .ctor(System.Byte );
+
+    它核不了「参数名解析对不对」。这一份是 Il2CppDumper 的完整输出：
+
+        public static float Abs(float value) { }
+
+    带参数名，可以用来核对 `parameters_of()` 取到的名字。
+
+    Returns:
+        (dump 路径, 它对应的游戏安装目录)；找不到返回 None。
+        返回游戏目录是因为真值必须**同源**：拿 A 游戏的 dump 去核 B 游戏的
+        元数据毫无意义。
+    """
+    for root in SAMPLE_ROOTS:
+        if not root.is_dir():
+            continue
+        for cand in sorted(root.glob("*/Decompiled/dump.cs")):
+            game = cand.parent.parent
+            if list(game.glob("*_Data/il2cpp_data/Metadata/global-metadata.dat")):
+                return cand, game
+    return None
+
+
+def metadata_of(game: Path) -> Path | None:
+    """从游戏安装目录找出 `global-metadata.dat`（IL2CPP）。"""
+    hits = sorted(game.glob("*_Data/il2cpp_data/Metadata/global-metadata.dat"))
+    return hits[0] if hits else None
+
+
 def _game_root_count(root: Path, max_depth: int = 3) -> int:
     """**独立**数一数：这个目录下有多少个「像游戏根」的子目录。
 
