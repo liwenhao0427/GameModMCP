@@ -304,8 +304,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 29 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 28 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 30 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 29 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -333,6 +333,7 @@ GameModMCP/
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
+| `verify_mcp_context.py` | **P2-3 的决策门禁**（不是行为测试）：钉住「进度无消费方、取消够不着、tasks 会弄坏」这三条否决依据，变了就报红 |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
@@ -371,6 +372,25 @@ python devtools\run_all_verify.py --only verify_lazy_handles
 ---
 
 ## 设计取舍
+
+### 为什么不做 MCP 的进度、取消与 tasks
+
+这三样都是**协议里有、但这个客户端不消费**的东西，量过之后才决定不做：
+
+| 协议面 | 实测 | 结论 |
+|---|---|---|
+| `notifications/progress` | 客户端调工具时只传 `{signal, timeout}`，**从不传 `onprogress`** → 请求里没有 `progressToken` → `report_progress` 是静默 no-op；而且它是 `async`，同步工具根本调不了 | 不做 |
+| `notifications/cancelled` | 客户端**确实**会传取消信号，但服务器这一侧够不着：FastMCP 对同步工具是**内联调用**（`return fn(...)`，不开线程），事件循环被占满，连取消通知都读不到 | 不做 |
+| `notifications/message`（MCP logging） | 同样只有通用 SDK 里有，没有任何客户端包消费 | 不做 |
+| tasks 扩展（`taskSupport`） | 客户端桥**直接抛错**：`requires task-based execution, which this bridge does not support` | 不做（声明 `required` 会主动弄坏） |
+
+**代价是诚实的**：一个 60 秒的 `launch_game` 期间，这个服务器什么都干不了
+（同步工具占着事件循环），用户在客户端上只能看着转圈。
+要改就得把三个长任务改成 `async` + `anyio.to_thread.run_sync` 包一层 ——
+那是结构性改造，而协议那头的收益恰好是没人消费的。
+
+这三条依据由 `devtools/verify_mcp_context.py` 钉住：**变了就报红**，
+提醒重读判断，而不是让断言变绿。
 
 ### 为什么引擎解析器全部手写，不用现成库
 
