@@ -32,6 +32,12 @@ obj/
 .coverage
 htmlcov/
 
+# ---- 一次性侦察/量数脚本 ----
+# 这类脚本是「为了回答一个具体问题临时写的」，结论应沉淀进
+# docs/ 或 devtools/bench_index.py，脚本本身不入库。
+# 教训：本轮曾留下 11 个 _probe_*.py 待提交，靠人工记得删是不可靠的。
+devtools/_probe_*.py
+
 # ---- 编辑器 / 操作系统杂项 ----
 .vscode/
 .idea/

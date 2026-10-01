@@ -115,6 +115,28 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 而 `get_diagnostics` 还报 `ue.ready = true` —— 那是最糟的状态：
 Agent 以为能用，一调就撞墙。只有 MCP 层的脚本能抓到这种问题。
 
+### 还有第三类：基准（`bench_index.py`）
+
+它**不是验收**，没有「通过/失败」，只有实测数字，所以不叫 `verify_*`，
+也不进 `run_all_verify.py`。存在的理由是：性能改动最容易变成「我觉得快了」，
+而本项目的规矩是「数字必须是跑出来的」。
+
+量三件事，对应三个不同的优化方向：
+
+| 段落 | 量什么 | 用来判断 |
+|---|---|---|
+| `[P1-2]` | `_load_meta` / 缓存命中 / 强制重建 / 纯 SQL 下限 | 缓存命中里有多少是白付的解析 |
+| `[P1-3]` | ① SQL 取回 ② 解析这一页 ③ 解析全部进句柄 | 惰性句柄值不值得做 |
+| `[P1-5]` | PE 与 UE 容器的重复解析占比 | 重复解析值多少钱 |
+
+```powershell
+python devtools\bench_index.py              # 两个引擎都量
+python devtools\bench_index.py --engine il2cpp
+python devtools\bench_index.py --only-dup   # 只量重复解析
+```
+
+**性能改动的验收方式是「改前改后各跑一次并对比」**，不是看它变绿。
+
 ## 需要的样本清单（实际路径见 samples.py）
 
 | 样本 | 用于 |
@@ -135,9 +157,10 @@ devtools/
 ├── samples.py             样本路径的集中定义（唯一真值）
 ├── run_all_verify.py      一条命令跑全部 + 覆盖率门禁（崩溃重试并留痕）
 ├── verify_*.py            验收脚本（上面那批）
+├── bench_index.py         性能基准（开索引 / 单次查询 / 重复解析）
 ├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
-├── probes/                一次性逆向侦察脚本（30 个）
+├── probes/                一次性逆向侦察脚本（31 个）
 └── groundtruth/           真值来源
     ├── mono/
     │   ├── MonoGroundTruth.csproj   .NET 真值生成器（用官方
