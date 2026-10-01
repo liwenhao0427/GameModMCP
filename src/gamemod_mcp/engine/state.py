@@ -207,7 +207,6 @@ def select_game(
     game_dir: str = "",
     engine: str = "",
     metadata_path: str = "",
-    exe: str = "",
 ) -> dict:
     """选定一个游戏作为后续操作的上下文。
 
@@ -216,20 +215,29 @@ def select_game(
 
     **重复选中同一个游戏不会重建会话** —— 否则每次 open_game
     都会把已经建好的索引和已注入的探针扔掉，Agent 反复调用就会反复重建。
+
+    主程序 exe 一律自动挑（`discovery.pick_main_exe`），本函数不接受指定：
+    需要换一个 exe 启动时用 `launch_game(exe=...)`，那才是启动参数该待的地方。
+    （原先这里有个 `exe` 形参，但没有任何调用方传过它 —— 见扫描报告 §3.7。）
     """
     with _state.lock:
         # 先判断这次是不是在选同一个游戏；是的话直接复用，什么都不动
         want_meta = metadata_path
         want_dir = game_dir
+        # `*_Data` 目录只列一次，后面几个判断（引擎识别 / 找元数据）都复用它。
+        # 容器目录上列一遍要 ~130 ms，一个 open_game 里问四遍没有必要。
+        want_data_dirs = (discovery.list_data_dirs(Path(want_dir))
+                          if want_dir and Path(want_dir).is_dir() else [])
         if not want_meta and want_dir:
             # 目录模式下先解析出元数据路径，才能判断是否同一个游戏
             try:
-                det = engine or discovery.detect_engine(want_dir)
+                det = engine or discovery.detect_engine(want_dir, want_data_dirs)
                 if det == "il2cpp":
-                    want_meta = discovery.il2cpp_paths(want_dir).get("metadata", "")
+                    want_meta = discovery.il2cpp_paths(
+                        want_dir, want_data_dirs).get("metadata", "")
                 elif det == "mono":
                     # Mono 的索引对象是单个程序集，同样要解析出来才能比对
-                    mono = discovery.mono_paths(want_dir)
+                    mono = discovery.mono_paths(want_dir, want_data_dirs)
                     want_meta = _pick_mono_assembly(mono.get("assemblies") or [])
             except Exception:
                 want_meta = ""
@@ -265,7 +273,10 @@ def select_game(
             # 显式指定引擎就用它；否则按文件内容嗅探（global-metadata.dat 的
             # magic vs .NET 程序集的 MZ 头），不要一律当成 il2cpp。
             _state.engine = engine or _sniff_engine_for(mp)
-            _state.exe = exe
+            # 只知道元数据文件、不知道游戏目录时不去猜主程序：
+            # 猜错会让 launch_game 拿着一个跑不起来的 exe 去启动。
+            # 需要启动就用 launch_game(exe=...)。
+            _state.exe = ""
             _state.opened_at = time.time()
             _state.note(f"选定元数据文件 {mp.name}（引擎 {_state.engine}）")
             return {"ok": True, **_state.summary()}
@@ -277,46 +288,68 @@ def select_game(
         if not gd.is_dir():
             return {"ok": False, "error": f"游戏目录不存在：{game_dir}"}
 
-        detected = engine or discovery.detect_engine(gd)
+        detected = engine or discovery.detect_engine(gd, want_data_dirs)
         _state.game_dir = str(gd)
         _state.engine = detected
         _state.opened_at = time.time()
 
         # 按引擎类型定位关键文件
         if detected == "il2cpp":
-            paths = discovery.il2cpp_paths(gd)
+            paths = discovery.il2cpp_paths(gd, want_data_dirs)
             _state.metadata_path = paths.get("metadata", "")
             if not _state.metadata_path:
                 # 允许用户手工指定（有些游戏目录结构不标准）
-                return {
+                out = {
                     "ok": False,
                     "engine": detected,
                     "error": "识别为 IL2CPP，但没找到 global-metadata.dat。"
                              "请用 metadata_path 参数直接指定该文件的路径。",
-                    "hint": discovery.il2cpp_paths(gd),
+                    "hint": paths,
                 }
+                # 多个候选游戏根 → 这是个容器目录。必须说清楚，否则调用方
+                # 只会看到「没找到元数据」，然后在错误的目录上继续折腾。
+                container = discovery.container_candidates(gd, want_data_dirs)
+                if container:
+                    out["error"] = (
+                        f"这个目录下有 {container['count']} 个各带 IL2CPP 元数据的游戏，"
+                        "它本身不是某一个游戏的安装目录 —— 请把 game_dir 指向其中某一个。"
+                    )
+                    out["container"] = container
+                return out
         elif detected == "mono":
-            mono = discovery.mono_paths(gd)
+            mono = discovery.mono_paths(gd, want_data_dirs)
             managed = mono.get("managed_dir", "")
-            _state.exe = managed or mono.get("exe", "")
+            # 这里**不**把 Managed 目录塞进 `_state.exe`：Mono 游戏的主程序
+            # 仍然是游戏 exe。旧写法把目录当 exe，导致 inject_process
+            # 按主程序名找进程时拿 "Managed" 去比对，永远匹配不上。
+            # 留空后由下面统一的 `pick_main_exe` 兜底。
+            _state.exe = ""
             # Mono 的元数据单位是**单个程序集**而不是目录，
             # 所以这里挑出「游戏自己的代码」那个 dll 作为索引对象。
             # 通常就是 Assembly-CSharp.dll；找不到则退到最大的非框架程序集。
             _state.metadata_path = _pick_mono_assembly(mono.get("assemblies") or [])
             if not _state.metadata_path:
-                return {
+                out = {
                     "ok": False,
                     "engine": detected,
                     "error": "识别为 Mono，但没找到可索引的托管程序集。"
                              "请用 metadata_path 参数直接指定某个 .dll。",
                     "hint": {"managed_dir": managed},
                 }
+                container = discovery.container_candidates(gd, want_data_dirs)
+                if container:
+                    out["error"] = (
+                        f"这个目录下有 {container['count']} 个 Mono 游戏，"
+                        "它本身不是某一个游戏的安装目录 —— 请把 game_dir 指向其中某一个。"
+                    )
+                    out["container"] = container
+                return out
         elif detected == "ue":
             ue = discovery.ue_paths(gd)
             _state.exe = ue.get("exe", "")
 
         if not _state.exe:
-            _state.exe = exe or discovery.pick_main_exe(gd)
+            _state.exe = discovery.pick_main_exe(gd)
 
         _state.note(f"选定游戏 {gd.name}（引擎 {detected}）")
         out = {"ok": True, **_state.summary()}

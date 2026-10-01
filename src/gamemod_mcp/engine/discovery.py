@@ -412,14 +412,239 @@ def pick_main_exe(game_dir: str | Path) -> str:
     return candidates[0][2]
 
 
-def il2cpp_paths(game_dir: str | Path) -> dict:
+# ---------------------------------------------------------------- 目录布局判定
+#
+# 这里的三个常量的来历见 `docs/多游戏兼容性扫描报告.md` §3.2：
+# 原先 `il2cpp_paths` / `mono_paths` 都有一条 `game_dir.glob("*/*_Data")` 兜底，
+# 用来支持「游戏外面还套一层目录」的布局。但那个兜底**无法区分**
+#     <dir>/<游戏>/<游戏>_Data      ← 外面套了一层，要支持
+#     <dir>/<游戏A>/<A>_Data + <游戏B>/<B>_Data + ...  ← 父目录，必须拒绝
+# 实测把 `D:\Projects`（装着十几款游戏）传进来时，它挑中了 Echoes 的元数据、
+# 返回 `ok: true`，于是 Agent 以为在分析 `D:\Projects`，实际全程在读另一个游戏。
+# 判据只能是「候选游戏根有几个」，所以下面的函数会把候选根一并返回。
+
+#: 主程序体积超过这个值、又和所在目录不同名时，多半是安装包而不是游戏主程序。
+#: 实测 `D:\Projects` 里挑出来的是 3.3 GB 的自解压安装包 `Pass The Fear(5).exe`。
+SUSPICIOUS_MAIN_EXE_BYTES = 1024 ** 3
+
+#: 找 `*_Data` / `global-metadata.dat` 时的最大深度（相对 game_dir）。
+#: 原来最后那段是无深度限制的 `rglob("global-metadata.dat")`；而 `*_Data`
+#: 原先只看到第 2 层。取 3 是「比原来略宽、但仍然有界」。
+MARKER_SEARCH_MAX_DEPTH = 3
+
+#: 候选清单最多回传多少个（容器目录可能有几十个游戏，回传全部没有意义）
+MAX_CANDIDATES = 20
+
+#: Mono 程序集目录名（`<游戏>_Data/Managed`）
+_MONO_MANAGED = "Managed"
+
+#: IL2CPP 元数据的相对路径（`<游戏>_Data/il2cpp_data/Metadata/...`）
+_IL2CPP_META_REL = Path("il2cpp_data") / "Metadata" / "global-metadata.dat"
+
+
+def _depth_patterns(name: str, max_depth: int) -> list[str]:
+    """生成 depth 1..max_depth 的「按名字找」glob 模式。
+
+    形如 `["*_Data", "*/*_Data", "*/*/*_Data"]`：
+    depth 1 表示**就在 game_dir 里**，所以通配层数是 `depth - 1`。
+    """
+    return ["/".join(["*"] * (depth - 1) + [name]) for depth in range(1, max_depth + 1)]
+
+
+def list_data_dirs(game_dir: Path) -> list[Path]:
+    """列出 game_dir 之下（深度 ≤ `MARKER_SEARCH_MAX_DEPTH`）所有 `*_Data` 目录。
+
+    **用按深度展开的 glob，而不是递归遍历**：递归遍历会走进游戏的每一层
+    子目录，实测在 Godot 游戏（`Sovereign Tower`）上要 8.3 s，
+    而 glob 只按模式逐层列目录，同样的目录 20 ms 内返回。
+    命中 `*_Data` 之后也不往下走（那是游戏数据，翻它没有意义）。
+
+    `il2cpp_data` / `mono_data` 要排除：Windows 上 glob 大小写不敏感，
+    `*_Data` 会把 `<X>_Data/il2cpp_data` 这个**子目录**也匹配进来
+    （名字以 `_data` 结尾），它显然不是一个游戏的 Data 目录。
+    """
+    skip = {"il2cpp_data", "mono_data"}
+    out: list[Path] = []
+    for pattern in _depth_patterns("*_Data", MARKER_SEARCH_MAX_DEPTH):
+        try:
+            out.extend(p for p in game_dir.glob(pattern)
+                       if p.is_dir() and p.name.lower() not in skip)
+        except OSError:  # 权限不足/路径过长：跳过这一层，不要中断整次探测
+            continue
+    return sorted(set(out))
+
+
+def _rel_depth(root: Path, target: Path) -> int:
+    """target 在 root 之下第几层（root 自己算 0）；算不出来返回 -1。"""
+    try:
+        return len(target.relative_to(root).parts) - 1
+    except ValueError:
+        return -1
+
+
+def _find_bounded(root: Path, filename: str, max_depth: int) -> Path | None:
+    """按文件名做**有深度上限**的搜索，找到即返回。
+
+    替代原来的无界 `rglob`：同一次探测里既要兼容「元数据埋得比较深」的
+    非标准布局，又不能让一次 `inspect_game` 把整棵树递归翻一遍。
+    """
+    for pattern in _depth_patterns(filename, max_depth):
+        try:
+            for hit in root.glob(pattern):
+                if hit.is_file():
+                    return hit
+        except OSError:
+            continue
+    return None
+
+
+def _same_dir(a: str | Path, b: str | Path) -> bool:
+    """两个路径是否指向同一个目录（容错大小写与相对路径）。"""
+    try:
+        return os.path.normcase(os.path.abspath(str(a))) == \
+               os.path.normcase(os.path.abspath(str(b)))
+    except Exception:  # noqa: BLE001 - 路径非法时按「不同」处理
+        return False
+
+
+def _marked_roots(game_dir: Path, marker: str,
+                  data_dirs: list[Path] | None = None) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """找出「带着某个标记的游戏根」。
+
+    marker 取 `"il2cpp"`（看 `<X>_Data/il2cpp_data/Metadata/global-metadata.dat`）
+    或 `"mono"`（看 `<X>_Data/Managed`）。
+
+    返回 (命中列表, 候选根清单)：
+      · 命中列表元素是 (游戏根, 标记路径)，**按深度再按路径**排序 ——
+        离 game_dir 越近的越优先（游戏自己那一层的 `X_Data` 必须先于
+        子目录里另一个游戏的 `Y_Data`，否则「外面套了一层」的目录会挑错）；
+      · 候选根清单是**去重后**的游戏根。
+
+    `data_dirs` 可以传外部已经列好的 `*_Data` 列表 —— 一次探测里要问好几遍
+    「这个目录像不像某个引擎的游戏」，每次都重新列一遍目录没有必要。
+    """
+    hits: list[tuple[Path, Path]] = []
+    for data_dir in (list_data_dirs(game_dir) if data_dirs is None else data_dirs):
+        marker_path = (data_dir / _IL2CPP_META_REL if marker == "il2cpp"
+                       else data_dir / _MONO_MANAGED)
+        try:
+            ok = marker_path.is_file() if marker == "il2cpp" else marker_path.is_dir()
+        except OSError:
+            continue
+        if ok:
+            hits.append((data_dir.parent, marker_path))
+    hits.sort(key=lambda item: (_rel_depth(game_dir, item[1]), str(item[1])))
+    roots = sorted({str(root) for root, _ in hits})
+    return hits, roots
+
+
+def nested_game_roots(game_dir: str | Path,
+                      data_dirs: list[Path] | None = None) -> list[str]:
+    """列出 game_dir **自己之外**、看起来是游戏根的候选目录（按路径排序）。
+
+    判据只有一条：**子目录里带着 `*_Data`**（Unity 的布局常量）。
+    不额外要求「后端标记存在」—— 一个被裁剪过的、或后端信息缺失的构造
+    也是「一个游戏」，把它排除掉就会退回「从一堆游戏里挑一个」的老问题。
+
+    这是「容器目录」与「外面套了一层目录」的**唯一判据**：
+      · 1 个候选 → 合法的套层布局，按它来定位元数据；
+      · ≥2 个候选 → 装着很多游戏的容器目录，**一律拒绝**（不挑、不猜）。
+
+    两种布局在文件系统上长得一模一样，只能靠候选个数区分 ——
+    原先 `glob("*/*_Data")` 兜底挑第一个，才会把 `D:\\Projects` 当成
+    Echoes 这个游戏（扫描报告 §3.2）。
+
+    （UE 游戏没有 `*_Data`，不参与计数；多 UE 游戏的父目录当前判定为
+    unknown 而不是被误当成某个 UE 游戏，见扫描报告 §5 的已知边界。）
+    """
+    gd = Path(game_dir)
+    if not gd.is_dir():
+        return []
+    if data_dirs is None:
+        data_dirs = list_data_dirs(gd)
+    roots: set[str] = set()
+    for data_dir in data_dirs:
+        if not _same_dir(data_dir.parent, gd):
+            roots.add(str(data_dir.parent))
+    return sorted(roots)
+
+
+def container_candidates(game_dir: str | Path,
+                         data_dirs: list[Path] | None = None) -> dict:
+    """这个目录是不是「装着很多游戏的容器目录」？
+
+    返回 {} 表示不像容器；否则给出候选清单与建议。
+    """
+    gd = Path(game_dir)
+    if not gd.is_dir():
+        return {}
+    roots = nested_game_roots(gd, data_dirs)
+    if len(roots) < 2:
+        return {}
+    return {
+        "container": True,
+        "count": len(roots),
+        "candidates": roots[:MAX_CANDIDATES],
+        "note": (f"这个目录下有 {len(roots)} 个可识别的游戏，它本身不是某一个游戏的"
+                 "安装目录。请把 game_dir 指向其中某一个（见 candidates）。"),
+    }
+
+
+#: 不支持的引擎的特征文件 → 家族名。判定只依赖「某个文件/目录存在」，
+#: 成本极低、误报率低（扫描里 4 款不支持的**真实游戏**全部命中）。
+#: 注意这是**给人看的提示**，不是声明的支持能力：引擎仍然是 `unknown`。
+_UNSUPPORTED_MARKERS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("godot", ("*.pck", "data_*_windows_*"), "Godot"),
+    ("gamemaker", ("data.win",), "GameMaker Studio"),
+    ("electron", ("chrome_100_percent.pak", "resources/app.asar"), "Electron / Chromium"),
+)
+
+
+def engine_family(game_dir: str | Path) -> dict:
+    """在**不支持**的引擎上给出家族猜测（有标记文件为证）。
+
+    产品只声明支持 IL2CPP / Mono / UE，所以引擎字段照旧是 `unknown`；
+    但对使用者来说「Godot」与「完全没认出来」是两件事 —— 前者能立刻
+    下结论「不归它管」，后者只会让人反复重试。
+    """
+    gd = Path(game_dir)
+    if not gd.is_dir():
+        return {}
+    evidence: list[str] = []
+    for family, patterns, label in _UNSUPPORTED_MARKERS:
+        for pattern in patterns:
+            try:
+                hit = next(iter(gd.glob(pattern)), None)
+            except OSError:
+                hit = None
+            if hit is not None:
+                evidence.append(Path(hit).name)
+                return {
+                    "family": family,
+                    "label": label,
+                    "evidence": sorted(set(evidence)),
+                    "note": (f"看标记像是 {label}，本 MCP 不支持该引擎"
+                             "（只支持 IL2CPP / Mono / UE）。"),
+                }
+    return {}
+
+
+def il2cpp_paths(game_dir: str | Path, data_dirs: list[Path] | None = None) -> dict:
     """定位 IL2CPP 的关键文件。
 
-    返回 {"game_assembly":..., "metadata":..., "unity_player":..., "data_dir":...}
-    缺失项为 ""。
+    返回 {"game_assembly":..., "metadata":..., "data_dir":...,
+          "ambiguous_roots":[...], "metadata_depth": int}
+    缺失项为 ""（`metadata_depth` 为 -1）。
+
+    `ambiguous_roots` **非空**表示：这个目录下有多个各带 IL2CPP 元数据的游戏，
+    即它是个容器目录而不是某个游戏。此时 `metadata` 一律留空 ——
+    宁可让上层报错并给出候选，也不能挑一个来分析（见文件顶部注释）。
     """
     game_dir = Path(game_dir)
-    result = {"game_assembly": "", "metadata": "", "data_dir": ""}
+    result = {"game_assembly": "", "metadata": "", "data_dir": "",
+              "ambiguous_roots": [], "metadata_depth": -1}
+    if not game_dir.is_dir():
+        return result
 
     # GameAssembly.dll 通常在游戏根目录（与 exe 同级）
     for candidate in (
@@ -430,47 +655,60 @@ def il2cpp_paths(game_dir: str | Path) -> dict:
             result["game_assembly"] = str(candidate)
             break
 
-    # *_Data 目录：可能是 <exe名>_Data 或 UnityPlayer 相关
-    data_dirs = [d for d in game_dir.glob("*_Data") if d.is_dir()]
-    if not data_dirs:
-        # 有时 Data 目录在子目录里
-        data_dirs = [d for d in game_dir.glob("*/*_Data") if d.is_dir()]
+    # 先判「是不是容器」：≥2 个候选游戏根时一律不挑（见 nested_game_roots）
+    nested = nested_game_roots(game_dir, data_dirs)
+    if len(nested) > 1:
+        result["ambiguous_roots"] = nested[:MAX_CANDIDATES]
+        return result
 
-    for data_dir in data_dirs:
-        meta = data_dir / "il2cpp_data" / "Metadata" / "global-metadata.dat"
-        if meta.is_file():
-            result["metadata"] = str(meta)
-            result["data_dir"] = str(data_dir)
-            break
+    hits, _roots = _marked_roots(game_dir, "il2cpp", data_dirs)
+    if hits:
+        _root, meta = hits[0]
+        result["metadata"] = str(meta)
+        result["data_dir"] = str(meta.parent.parent.parent)
+        result["metadata_depth"] = _rel_depth(game_dir, meta)
+        return result
 
-    if not result["metadata"]:
-        # 全局兜底搜索
-        for meta in game_dir.rglob("global-metadata.dat"):
-            if meta.is_file():
-                result["metadata"] = str(meta)
-                result["data_dir"] = str(meta.parent.parent.parent)
-                break
+    # 兜底：按文件名有界搜索（原名是 rglob，没有深度上限）
+    meta = _find_bounded(game_dir, "global-metadata.dat", MARKER_SEARCH_MAX_DEPTH)
+    if meta is not None:
+        result["metadata"] = str(meta)
+        result["data_dir"] = str(meta.parent.parent.parent)
+        result["metadata_depth"] = _rel_depth(game_dir, meta)
 
     return result
 
 
-def mono_paths(game_dir: str | Path) -> dict:
-    """定位 Mono 的程序集目录与程序集列表。"""
-    game_dir = Path(game_dir)
-    result = {"managed_dir": "", "assemblies": []}
+def mono_paths(game_dir: str | Path, data_dirs: list[Path] | None = None) -> dict:
+    """定位 Mono 的程序集目录与程序集列表。
 
-    for data_dir in list(game_dir.glob("*_Data")) + list(game_dir.glob("*/*_Data")):
-        managed = data_dir / "Managed"
-        if managed.is_dir():
-            result["managed_dir"] = str(managed)
-            # 不截断：glob 顺序不确定，截断可能正好丢掉 Assembly-CSharp.dll。
-            # 目录里通常也就一两百个 dll，全收下没有代价。
-            result["assemblies"] = sorted(str(p) for p in managed.glob("*.dll"))
-            # 顺便找一下 Mono 运行时本体（有它才说明是 Mono 后端）
-            for rt in ("mono-2.0-bdwgc.dll", "mono-2.0-sgen.dll", "mono.dll"):
-                if (data_dir.parent / rt).is_file() or (game_dir / rt).is_file():
-                    result["runtime"] = rt
-                    break
+    与 `il2cpp_paths` 同一套容器判据：多个候选根时 `managed_dir` 留空，
+    只回传 `ambiguous_roots`。
+    """
+    game_dir = Path(game_dir)
+    result = {"managed_dir": "", "assemblies": [], "ambiguous_roots": []}
+    if not game_dir.is_dir():
+        return result
+
+    # 与 il2cpp_paths 同一套容器判据
+    nested = nested_game_roots(game_dir, data_dirs)
+    if len(nested) > 1:
+        result["ambiguous_roots"] = nested[:MAX_CANDIDATES]
+        return result
+
+    hits, _roots = _marked_roots(game_dir, "mono", data_dirs)
+    if not hits:
+        return result
+
+    data_dir, managed = hits[0]
+    result["managed_dir"] = str(managed)
+    # 不截断：glob 顺序不确定，截断可能正好丢掉 Assembly-CSharp.dll。
+    # 目录里通常也就一两百个 dll，全收下没有代价。
+    result["assemblies"] = sorted(str(p) for p in managed.glob("*.dll"))
+    # 顺便找一下 Mono 运行时本体（有它才说明是 Mono 后端）
+    for rt in ("mono-2.0-bdwgc.dll", "mono-2.0-sgen.dll", "mono.dll"):
+        if (data_dir.parent / rt).is_file() or (game_dir / rt).is_file():
+            result["runtime"] = rt
             break
 
     return result
@@ -537,16 +775,23 @@ def ue_paths(game_dir: str | Path) -> dict:
     return result
 
 
-def detect_engine(game_dir: str | Path) -> str:
-    """自动识别游戏引擎。返回 il2cpp / mono / ue / unknown。"""
+def detect_engine(game_dir: str | Path, data_dirs: list[Path] | None = None) -> str:
+    """自动识别游戏引擎。返回 il2cpp / mono / ue / unknown。
+
+    容器目录（`<dir>/<游戏A>/<A>_Data` + `<dir>/<游戏B>/<B>_Data` + ...）
+    一律返回 `unknown` —— 见 `il2cpp_paths` 上方的注释。
+    """
     game_dir = Path(game_dir)
     if not game_dir.is_dir():
         return "unknown"
 
-    if il2cpp_paths(game_dir)["metadata"]:
+    if data_dirs is None:
+        data_dirs = list_data_dirs(game_dir)
+
+    if il2cpp_paths(game_dir, data_dirs)["metadata"]:
         return "il2cpp"
 
-    if mono_paths(game_dir)["managed_dir"]:
+    if mono_paths(game_dir, data_dirs)["managed_dir"]:
         return "mono"
 
     # UE 特征：*.pak 与 shipped exe
@@ -558,8 +803,11 @@ def detect_engine(game_dir: str | Path) -> str:
     if (game_dir / "Engine").is_dir():
         return "ue"
 
-    # 纯 Unity（无脚本后端信息）
-    if list(game_dir.glob("*_Data")) and not il2cpp_paths(game_dir)["metadata"]:
+    # 纯 Unity（无脚本后端信息）：**同级**就有 *_Data 才算
+    # （`_rel_depth(...) == 0` 表示那个 `X_Data` 直接躺在 game_dir 里）。
+    # 这里不再看子目录：子目录里一堆 `<游戏>_Data` 说明它是容器目录，
+    # 报成 unity 会让调用方以为「这目录是个 Unity 游戏，只是缺元数据」。
+    if any(_rel_depth(game_dir, d) == 0 for d in data_dirs):
         return "unity"
 
     return "unknown"
@@ -568,7 +816,9 @@ def detect_engine(game_dir: str | Path) -> str:
 def describe_game(game_dir: str | Path) -> dict:
     """给出游戏目录的完整探测报告。"""
     game_dir = Path(game_dir)
-    engine = detect_engine(game_dir)
+    # 列一次 `*_Data` 就够：下面每个判断都复用它（容器目录上这能省好几遍目录遍历）
+    data_dirs = list_data_dirs(game_dir) if game_dir.is_dir() else []
+    engine = detect_engine(game_dir, data_dirs)
     info: dict = {
         "install_dir": str(game_dir),
         "exists": game_dir.is_dir(),
@@ -578,10 +828,10 @@ def describe_game(game_dir: str | Path) -> dict:
 
     if engine == "il2cpp":
         info["il2cpp"] = {
-            k: v for k, v in il2cpp_paths(game_dir).items() if k != "data_dir"
+            k: v for k, v in il2cpp_paths(game_dir, data_dirs).items() if k != "data_dir"
         }
     elif engine == "mono":
-        mono = mono_paths(game_dir)
+        mono = mono_paths(game_dir, data_dirs)
         picked = pick_mono_assembly(mono["assemblies"])
         info["mono"] = {
             "managed_dir": mono["managed_dir"],
@@ -593,6 +843,26 @@ def describe_game(game_dir: str | Path) -> dict:
         }
     elif engine == "ue":
         info["ue"] = ue_paths(game_dir)
+    else:
+        # 认不出来时要说清「为什么」：是容器目录、是套了一层的目录，
+        # 还是引擎不在支持范围。只说 `unknown` 会让 Agent 反复重试
+        # （见扫描报告 §3.4）。
+        nested = nested_game_roots(game_dir, data_dirs)
+        if len(nested) > 1:
+            container = container_candidates(game_dir, data_dirs)
+            info["container"] = container
+            info["hint"] = container.get("note", "")
+        elif len(nested) == 1:
+            # 外面套了一层：目录本身不是游戏，但下面恰好有一个。
+            # 这不是错误，只要把 game_dir 指到它就行。
+            info["hint"] = (f"这个目录本身不是游戏，它下面的 "
+                            f"{Path(nested[0]).name} 是；请把 game_dir 指向它。")
+            info["game_root"] = nested[0]
+        else:
+            family = engine_family(game_dir)
+            if family:
+                info["engine_family"] = family
+                info["hint"] = family["note"]
 
     # 顺带报一下主程序的运行时
     exe = info.get("main_exe")
@@ -603,5 +873,17 @@ def describe_game(game_dir: str | Path) -> dict:
             info["main_exe_is_64"] = pinfo["is_64"]
         except Exception as exc:  # noqa: BLE001 - 探测失败不影响整体报告
             warn(f"解析主程序失败: {exc}")
+        # 安装包常常是这个目录里最大的 exe（实测 3.3 GB 的自解压包），
+        # 把它当「游戏主程序」报出去，会让 Agent 拿一个跑不起来的 exe 去启动。
+        try:
+            size = Path(exe).stat().st_size
+        except OSError:
+            size = 0
+        if size >= SUSPICIOUS_MAIN_EXE_BYTES and \
+                Path(exe).stem.lower() != game_dir.name.lower():
+            info["main_exe_hint"] = (
+                f"这个 exe 有 {size / 1024 ** 3:.1f} GB、且与目录不同名，"
+                "很可能是安装包而不是游戏主程序；启动游戏请自带 exe 参数。"
+            )
 
     return info

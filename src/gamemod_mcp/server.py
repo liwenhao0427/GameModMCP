@@ -124,7 +124,7 @@ mcp = FastMCP(
         "\n"
         "典型工作流（强烈建议按顺序走）：\n"
         "  1. open_game(game_dir=...)  选定游戏并准备好元数据索引\n"
-        "  2. search_classes(...)      搜索类，拿到 full_name\n"
+        "  2. search_classes(...)      搜索类，拿到 full_name / nested_name\n"
         "  3. class_detail(...)        细看字段/方法/token/inheritance；\n"
         "                              给 method_name 可只看某个方法的重载\n"
         "  4. inject_process / launch_game  注入运行中的游戏，或启动并注入\n"
@@ -140,6 +140,10 @@ mcp = FastMCP(
         "  · class_detail 给的 token 是连接两侧的钥匙：静态 token == 运行时 token，\n"
         "    才是「Hook 落点正确」的证据。\n"
         "\n"
+        "类名怎么传给下一个工具：**嵌套类型用 nested_name**。\n"
+        "`full_name` 对嵌套类型只是短名（如 `State`），机器里有 100 多个同名类型；\n"
+        "`nested_name`（如 `Outer.Inner`）才是能唯一定位的那个。\n"
+        "\n"
         "注意：第 1~3 步是纯静态查询，**不需要启动游戏**；\n"
         "第 4~7 步需要游戏可注入，且运行 agent 的进程要有足够权限\n"
         "（Windows 上通常需要管理员）。\n"
@@ -153,6 +157,16 @@ mcp = FastMCP(
         "gamemod://guide —— 它与 skills/gamemod-mod/SKILL.md 同源。"
     ),
 )
+
+# serverInfo.version 默认报的是 **mcp 库自己的版本**（`pkg_version("mcp")`），
+# 客户端看到的会是「1.26.0」而不是本项目的版本 —— 排查「Agent 装的是哪个
+# 版本的 GameMod MCP」时完全没用（扫描报告 §3.7）。
+# FastMCP 没有暴露 version 参数，但底层 `Server.version` 是公开属性，
+# 这里补上；拿不到就保持原样，不为了一个显示字段去冒险。
+try:
+    mcp._mcp_server.version = __version__  # noqa: SLF001 - SDK 未提供公开入口
+except Exception as exc:  # noqa: BLE001
+    warn(f"设置 MCP serverInfo.version 失败: {exc}")
 
 
 # ---------------------------------------------------------------- 小工具
@@ -513,6 +527,53 @@ def open_game(
                       engine=engine)
     if not sel.get("ok"):
         return sel
+
+    # 走到这里说明游戏已选中。但除了 IL2CPP / Mono，其余引擎**没有集中元数据**，
+    # 「建索引」这一步本来就不适用 —— 必须在这里给出出口，不能让它落到
+    # ensure_index 去报「当前会话没有元数据文件」（实测报告 §3.3：
+    # 那句话会让调用方去翻 metadata_path，而游戏其实已经选好了）。
+    eng = str(sel.get("engine") or "").lower()
+    if not metadata_path and eng not in ("il2cpp", "mono"):
+        gd = sel.get("game_dir") or game_dir
+        info: dict[str, Any] = {}
+        try:
+            info = discovery.describe_game(gd)
+        except Exception as exc:  # noqa: BLE001 - 提示信息拿不到也不能再抛
+            warn(f"补充探测失败: {exc}")
+        if eng == "ue":
+            return _err(
+                "Unreal 游戏没有集中元数据，不需要（也无法）建索引 —— "
+                "请直接使用 ue_* 工具：detect_ue / ue_profile / ue_list_entries / "
+                "ue_script_objects / ue_manifest（会话已按这个游戏选好）。",
+                engine="ue",
+                engine_label=sel.get("engine_label", ""),
+                game_dir=gd,
+                ue=info.get("ue", {}),
+                next_tools=["detect_ue", "ue_profile", "ue_list_entries",
+                            "ue_script_objects", "ue_manifest"],
+                session=sel,
+            )
+        hint = info.get("hint", "")
+        if eng == "unity":
+            return _err(
+                "识别为 Unity，但既没有 IL2CPP 的 global-metadata.dat、也没有 "
+                "Mono 的 Managed 程序集（可能是被裁剪的构建或被删过文件）；"
+                "若元数据在别处，请用 metadata_path 直接指定。",
+                engine=eng, game_dir=gd, hint=hint, session=sel,
+            )
+        return _err(
+            "没能识别出可支持的引擎（本 MCP 只支持 IL2CPP / Mono / UE）。"
+            + (f" {hint}" if hint else ""),
+            engine=eng or "unknown",
+            game_dir=gd,
+            hint=hint,
+            container=info.get("container"),
+            engine_family=info.get("engine_family"),
+            # 「外面套了一层」的情况：直接给出该指向哪里，省掉一轮试错
+            game_root=info.get("game_root"),
+            session=sel,
+        )
+
     res = ensure_index(cache_dir=cache_dir, force_rebuild=force_rebuild)
     if not res.get("ok"):
         return res
@@ -587,6 +648,13 @@ def search_classes(
     返回结果里带 `handle`，结果集较大时可用 read_query_result 翻页，
     并可用它的 `pattern` 参数在结果内再过滤。
 
+    **下游工具该用哪个名字**：用 `nested_name`，不要用 `full_name`。
+    嵌套类型（状态机 `State`、协程体 `<Xxx>d__0`、私有内部类）的
+    `full_name` 只是**短名**（IL2CPP 的 namespace 只属于最外层类型），
+    实测 20,072 个类型里有 131 个叫 `State`，只有 1 个是顶层。
+    拿短名去查，会命中一堆同名类型，或直接被判为歧义而拒绝。
+    `nested_name`（如 `Outer.Inner`）才是能唯一定位的那个。
+
     Args:
         pattern:    名称子串（大小写不敏感）。空表示不过滤。
         subtype_of: 只要继承自该类型的（如 "UnityEngine.MonoBehaviour"）。
@@ -628,9 +696,14 @@ def class_detail(full_name: str, include_inherited: bool = False,
     请改用完整名或补 `assembly=` —— 因为返回的是「这个类的全部字段表」，
     选错类不是少几条数据，而是整份结果都是别的类的。
 
+    查**嵌套类型**时，`full_name` 传 search_classes 给的 `nested_name`
+    （如 `Outer.Inner`）：嵌套类型的 `full_name` 只是短名，多个类会撞名，
+    本工具会因歧义而拒绝（这不是故障，是防止你拿到另一个类的字段表）。
+
     Args:
-        full_name:         类的完整名（如 "PresetLoaderV2" 或
-                           "TeamTapas.ProjectR.UserDatas.Service.UserData_Service"）。
+        full_name:         类的完整名（如 "PresetLoaderV2"、
+                           "TeamTapas.ProjectR.UserDatas.Service.UserData_Service"，
+                           或嵌套类型的 "Outer.Inner"）。
         include_inherited: 是否包含继承来的字段/方法。
         method_name:       只关心某个方法时填这里。填了就只返回该方法的
                            全部重载（含 token / 参数表 / 是否静态），
