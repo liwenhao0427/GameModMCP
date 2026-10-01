@@ -244,8 +244,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 23 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 22 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 24 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 23 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -271,6 +271,7 @@ GameModMCP/
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
+| `verify_tool_annotations.py` | 38 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
 

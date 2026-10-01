@@ -111,10 +111,32 @@ def show(title: str) -> None:
 
 
 def code_tools() -> set[str]:
-    """从 server.py 抽出所有 @mcp.tool 装饰的函数名 —— 唯一真值。"""
-    src = SERVER.read_text(encoding="utf-8")
-    return set(re.findall(
-        r"@mcp\.tool\([^)]*\)\s*\ndef\s+(\w+)\(", src, re.S))
+    """从 server.py 抽出所有 @mcp.tool 装饰的函数名 —— 唯一真值。
+
+    做法是**逐行看「装饰器 + 紧随的 def」**，而不是用正则去配对括号：
+
+    P2-5 把标注从字面量 dict 换成 `_ann(...)` 调用后，旧正则
+    `@mcp\\.tool\\([^)]*\\)\\s*\\ndef` 里的 `[^)]*` 会在 `_ann(...)` 的
+    **第一个** `)` 上停下，接着要求 `\\ndef` 而实际是第二个 `)`，
+    于是**一个工具都抽不出来**。当时靠本文件的「解析出 0 个工具 = 解析规则
+    失效」这条自检才发现 —— 否则会退化成「两边都是空集，所以完全一致」。
+
+    按行判断则与括号层数无关（本项目的装饰器都写成一行）。
+    """
+    lines = SERVER.read_text(encoding="utf-8").splitlines()
+    out: set[str] = set()
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("@mcp.tool("):
+            continue
+        for nxt in lines[i + 1:]:
+            s = nxt.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.match(r"def\s+([A-Za-z_]\w*)\s*\(", s)
+            if m:
+                out.add(m.group(1))
+            break
+    return out
 
 
 def backticked(text: str) -> set[str]:

@@ -104,6 +104,63 @@ def _err(msg: str, **kw: Any) -> dict:
     return {"ok": False, "error": msg, **kw}
 
 
+# ------------------------------------------------------- MCP 工具语义标注
+#
+# MCP 的 `annotations` 有 4 个语义位，**默认值不是「都关」**：
+#   readOnlyHint 默认 False、destructiveHint 默认 **True**、
+#   idempotentHint 默认 False、openWorldHint 默认 **True**。
+# 也就是说：不写 `destructiveHint`，客户端只能按「它会破坏东西」处理；
+# 不写 `openWorldHint`，只能按「它与外部世界交互」处理。默认值是**保守**的，
+# 但用在本项目上会把 `search_classes`（只读本地 SQLite）也说成危险操作。
+# 所以这里**每个**工具都显式表态，不把语义留给默认值。
+#
+# 几个**曾经写错 / 容易写错**的点（改工具时回头看）：
+#   · `drain_events` 曾标 `readOnlyHint=True`，但它是「**取走即消费**」——
+#     事件被消费掉就没了，所以是 readOnly=False + destructiveHint=True。
+#   · `decompile` / `ue_profile` 给了 output_dir / output_path 就会**落盘**，
+#     所以不是只读（但它们只写自己的产物、可覆盖，不算破坏）。
+#   · 纯查索引的工具只读本地 SQLite，既不碰游戏进程也不联网
+#     → openWorldHint=False；一碰活着的游戏进程就是 True。
+
+
+def _ann(title: str, *, read_only: bool, open_world: bool = False,
+         destroy: bool | None = None,
+         idempotent: bool | None = None) -> dict:
+    """构造 MCP 工具的 `annotations`，把 4 个语义位写全。
+
+    Args:
+        title:      给人看的标题。
+        read_only:  不改动任何东西（不写内存、不装 Hook、不落盘、不消费缓冲）。
+        open_world: 依赖本进程之外的东西（运行中的游戏进程）。默认 False。
+        destroy:    结果不可逆 / 可能让游戏崩 / 数据被消费掉。
+                    **只读工具不允许为 True**（会直接抛错，避免自相矛盾的标注）；
+                    非只读工具默认 True（沿用 MCP 的保守默认）。
+        idempotent: 同样参数再调一次不产生额外影响。只读工具恒为 True
+                    （没有任何副作用），非只读默认 False。
+
+    为什么用函数而不是到处写 dict：只读与「不破坏 / 无副作用」是**蕴含关系**，
+    写成函数就能在**导入期**就把 `read_only=True` + `destroy=True` 这种
+    自相矛盾的组合打出来，而不是等客户端看到怪标注。
+    """
+    if read_only:
+        if destroy is True:
+            raise ValueError(
+                f"工具「{title}」声明为只读，却又声明 destructiveHint=True —— "
+                f"两者矛盾：只读工具不可能破坏任何东西")
+        destroy = False
+        idempotent = True if idempotent is None else idempotent
+    else:
+        destroy = True if destroy is None else destroy
+        idempotent = False if idempotent is None else idempotent
+    return {
+        "title": title,
+        "readOnlyHint": read_only,
+        "destructiveHint": destroy,
+        "idempotentHint": idempotent,
+        "openWorldHint": open_world,
+    }
+
+
 def _need_index() -> tuple[Any, dict | None]:
     """取当前索引；没有就返回错误响应。"""
     st = state.state()
@@ -145,7 +202,7 @@ def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "列出运行中的游戏进程", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("列出运行中的游戏进程", read_only=True, open_world=True))
 def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
     """列出正在运行的游戏进程，并识别其运行时（il2cpp / mono / 其它）。
 
@@ -179,7 +236,7 @@ def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
     )
 
 
-@mcp.tool(annotations={"title": "探测游戏安装目录", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("探测游戏安装目录", read_only=True))
 def inspect_game(game_dir: str) -> dict:
     """探测一个游戏目录：识别引擎、找出主程序与关键文件。
 
@@ -203,7 +260,7 @@ def inspect_game(game_dir: str) -> dict:
     return _ok(**info)
 
 
-@mcp.tool(annotations={"title": "分析可执行文件结构", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("分析可执行文件结构", read_only=True))
 def inspect_binary(path: str) -> dict:
     """分析 PE 文件（exe/dll）：架构、节区、导出表、导入表、运行时类型。
 
@@ -235,7 +292,7 @@ def inspect_binary(path: str) -> dict:
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "选定游戏并准备索引"})
+@mcp.tool(annotations=_ann("选定游戏并准备索引", read_only=False, destroy=False, idempotent=True))
 def open_game(
     game_dir: str = "",
     metadata_path: str = "",
@@ -281,7 +338,7 @@ def open_game(
     return res
 
 
-@mcp.tool(annotations={"title": "查看当前会话状态", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查看当前会话状态", read_only=True))
 def get_session() -> dict:
     """查看当前会话状态：选中的游戏、索引统计、运行时注入情况。
 
@@ -291,7 +348,7 @@ def get_session() -> dict:
     return _ok(**st.summary())
 
 
-@mcp.tool(annotations={"title": "关闭会话"})
+@mcp.tool(annotations=_ann("关闭会话", read_only=False, destroy=False, idempotent=True))
 def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
     """关闭当前会话：卸载所有 Hook、断开注入、关闭索引。
 
@@ -327,7 +384,7 @@ def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "搜索类/结构/枚举", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("搜索类/结构/枚举", read_only=True))
 def search_classes(
     pattern: str = "",
     offset: int = 0,
@@ -367,7 +424,7 @@ def search_classes(
         return _err(f"搜索失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "查看类的完整细节", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查看类的完整细节", read_only=True))
 def class_detail(full_name: str, include_inherited: bool = False,
                  method_name: str = "", assembly: str = "") -> dict:
     """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链。
@@ -459,7 +516,7 @@ def class_detail(full_name: str, include_inherited: bool = False,
     )
 
 
-@mcp.tool(annotations={"title": "搜索字段", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("搜索字段", read_only=True))
 def search_fields(
     pattern: str,
     offset: int = 0,
@@ -504,7 +561,7 @@ def search_fields(
     return _ok(**res)
 
 
-@mcp.tool(annotations={"title": "搜索方法", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("搜索方法", read_only=True))
 def search_methods(
     pattern: str,
     offset: int = 0,
@@ -541,7 +598,7 @@ def search_methods(
     return _ok(**res)
 
 
-@mcp.tool(annotations={"title": "查看类继承关系", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查看类继承关系", read_only=True))
 def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
                     assembly: str = "") -> dict:
     """查看类的继承体系（向上找基类、向下找派生类）。
@@ -565,7 +622,7 @@ def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
     return _index_query(res, f"类：{full_name}")
 
 
-@mcp.tool(annotations={"title": "查找继承自某类的类型", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查找继承自某类的类型", read_only=True))
 def find_derived_classes(base_full_name: str, limit: int = 200,
                          assembly: str = "") -> dict:
     """找出所有继承自某个基类的类型（含间接继承）。
@@ -604,7 +661,7 @@ def find_derived_classes(base_full_name: str, limit: int = 200,
     return _index_query(res, f"基类：{base_full_name}")
 
 
-@mcp.tool(annotations={"title": "分析类型依赖", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("分析类型依赖", read_only=True))
 def analyze_dependency(full_name: str, assembly: str = "") -> dict:
     """分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。
 
@@ -626,7 +683,7 @@ def analyze_dependency(full_name: str, assembly: str = "") -> dict:
     return _index_query(res, f"类：{full_name}")
 
 
-@mcp.tool(annotations={"title": "列出程序集", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("列出程序集", read_only=True))
 def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
     """列出游戏里的程序集（dll）及各自的类型数量。
 
@@ -667,7 +724,7 @@ def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
         return _err(f"查询失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "反编译 Mono 程序集", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("反编译 Mono 程序集", read_only=False, destroy=False, idempotent=True))
 def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
               split_files: bool = True) -> dict:
     """反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（外部工具 ilspycmd）。
@@ -747,7 +804,7 @@ def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "翻页/过滤读取查询结果", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("翻页/过滤读取查询结果", read_only=True))
 def read_query_result(handle: str, offset: int = 0, limit: int = 50,
                       pattern: str = "") -> dict:
     """按句柄翻页读取之前某次查询的完整结果；给了 `pattern` 就在结果内再过滤。
@@ -802,7 +859,7 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "注入游戏进程"})
+@mcp.tool(annotations=_ann("注入游戏进程", read_only=False, destroy=False, idempotent=True, open_world=True))
 def inject_process(pid: int = 0, auto_find: bool = True,
                    preferred_module: str = "") -> dict:
     """把运行时探针注入正在运行的游戏进程。
@@ -836,7 +893,7 @@ def inject_process(pid: int = 0, auto_find: bool = True,
     return _ok(pid=rt.get("pid") or pid, **body)
 
 
-@mcp.tool(annotations={"title": "启动并注入游戏"})
+@mcp.tool(annotations=_ann("启动并注入游戏", read_only=False, destroy=False, open_world=True))
 def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> dict:
     """启动游戏并**在游戏初始化之前**注入探针。
 
@@ -873,7 +930,7 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
     return _ok(target=target, argv=argv, pid=rt.get("pid"), **body)
 
 
-@mcp.tool(annotations={"title": "查看运行时概况", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查看运行时概况", read_only=True, open_world=True))
 def runtime_info() -> dict:
     """查看已注入游戏的运行时概况：IL2CPP 模块、映像数量、可用 API。
 
@@ -901,7 +958,7 @@ def runtime_info() -> dict:
     return _ok(**out)
 
 
-@mcp.tool(annotations={"title": "查询类的运行时信息", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查询类的运行时信息", read_only=True, open_world=True))
 def runtime_class_info(
     name: str,
     namespace: str = "",
@@ -951,7 +1008,7 @@ def runtime_class_info(
         return _err(f"查询失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "定位方法的 Hook 落点", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("定位方法的 Hook 落点", read_only=True, open_world=True))
 def find_hook_target(name: str, method: str, namespace: str = "",
                      image: str = "") -> dict:
     """定位某个方法可 Hook 的地址（含 RVA 与 token）。
@@ -992,7 +1049,7 @@ def find_hook_target(name: str, method: str, namespace: str = "",
         return _err(f"定位失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "Hook 方法"})
+@mcp.tool(annotations=_ann("Hook 方法", read_only=False, destroy=False, open_world=True))
 def hook_method(
     name: str,
     method: str,
@@ -1055,7 +1112,7 @@ def hook_method(
         return _err(f"Hook 失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "在指定地址安装 Hook"})
+@mcp.tool(annotations=_ann("在指定地址安装 Hook", read_only=False, destroy=False, open_world=True))
 def hook_address(
     address: str,
     args_type: str = "",
@@ -1101,7 +1158,7 @@ def hook_address(
         return _err(f"Hook 失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "卸载 Hook"})
+@mcp.tool(annotations=_ann("卸载 Hook", read_only=False, destroy=True, idempotent=True, open_world=True))
 def unhook(hook_id: str = "") -> dict:
     """卸载 Hook。hook_id 留空则卸载全部。
 
@@ -1122,7 +1179,7 @@ def unhook(hook_id: str = "") -> dict:
         return _err(f"卸载失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "查看 Hook 状态", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("查看 Hook 状态", read_only=True, open_world=True))
 def hook_status() -> dict:
     """列出当前所有 Hook 及其触发次数。
 
@@ -1138,7 +1195,7 @@ def hook_status() -> dict:
         return _err(f"查询失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "读取 Hook 事件", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("读取 Hook 事件", read_only=False, destroy=True, open_world=True))
 def drain_events(limit: int = 200, kind: str = "") -> dict:
     """取走探针缓冲的 Hook 事件（调用记录）。
 
@@ -1163,7 +1220,7 @@ def drain_events(limit: int = 200, kind: str = "") -> dict:
         return _err(f"读取失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "读游戏内存", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("读游戏内存", read_only=True, open_world=True))
 def read_memory(address: str, size: int = 16) -> dict:
     """读取游戏进程内存（十六进制返回）。
 
@@ -1185,7 +1242,7 @@ def read_memory(address: str, size: int = 16) -> dict:
         return _err(f"读取失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "写游戏内存"})
+@mcp.tool(annotations=_ann("写游戏内存", read_only=False, destroy=True, idempotent=True, open_world=True))
 def write_memory(address: str, hex_data: str) -> dict:
     """写游戏进程内存。
 
@@ -1209,7 +1266,7 @@ def write_memory(address: str, hex_data: str) -> dict:
         return _err(f"写入失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "读实例字段的值", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("读实例字段的值", read_only=True, open_world=True))
 def read_field_value(
     instance: str,
     name: str,
@@ -1296,7 +1353,7 @@ def read_field_value(
         return _err(f"读取字段失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "内存特征码扫描", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("内存特征码扫描", read_only=True, open_world=True))
 def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
     """在游戏模块里做 AOB（特征码）扫描。
 
@@ -1323,7 +1380,7 @@ def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
         return _err(f"扫描失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "在游戏内执行 JS"})
+@mcp.tool(annotations=_ann("在游戏内执行 JS", read_only=False, destroy=True, open_world=True))
 def eval_script(code: str) -> dict:
     """在游戏进程内执行 Frida JS 代码 —— 应急逃生舱。
 
@@ -1352,7 +1409,7 @@ def eval_script(code: str) -> dict:
         return _err(f"执行失败：{exc}")
 
 
-@mcp.tool(annotations={"title": "开关 GC", "readOnlyHint": False})
+@mcp.tool(annotations=_ann("开关 GC", read_only=False, destroy=False, idempotent=True, open_world=True))
 def gc_control(disable: bool = True) -> dict:
     """暂停/恢复游戏的 GC（垃圾回收）。
 
@@ -1405,7 +1462,7 @@ def _ue_exe(exe: str) -> tuple[str, dict | None]:
     return target, None
 
 
-@mcp.tool(annotations={"title": "识别 Unreal 游戏", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("识别 Unreal 游戏", read_only=True))
 def detect_ue(exe: str = "") -> dict:
     """判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据。
 
@@ -1429,7 +1486,7 @@ def detect_ue(exe: str = "") -> dict:
     return _ok(**res)
 
 
-@mcp.tool(annotations={"title": "提取 Unreal 游戏概况", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("提取 Unreal 游戏概况", read_only=False, destroy=False, idempotent=True))
 def ue_profile(exe: str = "", output_path: str = "") -> dict:
     """汇总一个 Unreal 游戏的可提取信息（资源容器、清单、脚本对象）。
 
@@ -1455,7 +1512,7 @@ def ue_profile(exe: str = "", output_path: str = "") -> dict:
     return _ok(**res)
 
 
-@mcp.tool(annotations={"title": "列出 Unreal 资源容器条目", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("列出 Unreal 资源容器条目", read_only=True))
 def ue_list_entries(container: str, kind: str = "auto",
                     pattern: str = "", limit: int = 200,
                     offset: int = 0) -> dict:
@@ -1546,7 +1603,7 @@ def ue_list_entries(container: str, kind: str = "auto",
     return out
 
 
-@mcp.tool(annotations={"title": "列出 Unreal 脚本对象", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("列出 Unreal 脚本对象", read_only=True))
 def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
     """从 UE 游戏 exe 里提取 /Script/ 模块名与对象路径。
 
@@ -1591,7 +1648,7 @@ def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
     return _ok(**out)
 
 
-@mcp.tool(annotations={"title": "读取 Unreal 打包清单", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("读取 Unreal 打包清单", read_only=True))
 def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
                 offset: int = 0, limit: int = 200) -> dict:
     """读取 UE 的打包清单 Manifest_UFSFiles_*.txt。
@@ -1661,7 +1718,7 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
 # ================================================================
 
 
-@mcp.tool(annotations={"title": "环境与能力诊断", "readOnlyHint": True})
+@mcp.tool(annotations=_ann("环境与能力诊断", read_only=True))
 def get_diagnostics(scan_processes: bool = False) -> dict:
     """检查运行环境：Python、Frida、各引擎解析器是否可用。
 

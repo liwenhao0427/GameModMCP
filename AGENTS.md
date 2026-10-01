@@ -99,7 +99,7 @@ src/gamemod_mcp/
 
 ---
 
-## 4. 工具增删改：必须同步的四处
+## 4. 工具增删改：必须同步的**五**处
 
 改动任何 MCP 工具（新增 / 删除 / 改名 / 改签名）时，以下位置**必须同一次改完**：
 
@@ -109,6 +109,12 @@ src/gamemod_mcp/
 | 2 | `README.md` | 「工具一览」表格 |
 | 3 | `skills/gamemod-mod/SKILL.md` | 工作流、配方、引擎差异里出现的该工具 |
 | 4 | `devtools/verify_mcp_*.py` | 覆盖该工具的验收断言 |
+| 5 | `devtools/verify_tool_annotations.py` | 在语义表里**表态它危不危险**（只读？破坏性？要活着的游戏进程？） |
+
+第 5 条是 P2-5 加的：MCP 的 `destructiveHint` 默认是 **True**、
+`openWorldHint` 默认也是 **True**，所以不表态就等于告诉客户端
+「它会破坏东西、且与外部世界交互」。新增工具不在这张表里，
+`verify_tool_annotations.py` 会直接报红。
 
 **工具清单以代码为准，文档不许硬编码数量。**
 用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **6 处**：
@@ -121,6 +127,9 @@ src/gamemod_mcp/
 | `FastMCP(instructions=...)` | 只许提到存在的工具 |
 | `SKILL.md`（含**代码块里的调用形式**） | 只许提到存在的工具 |
 | README「验证脚本」表 | 与 `devtools/verify_*.py` **双向完全一致** |
+
+**工具的语义标注**另由 `python devtools/verify_tool_annotations.py` 校验
+（4 个语义位必须显式有值、分组双向一致、只读 ⇒ 不破坏不副作用）。
 
 最后一行不属于「工具」，但属于同一类问题：**手工维护的清单必然漂移**，
 所以一并卡住（README 曾写「10 个可复现的验证脚本」而实际已有 20 多个）。
