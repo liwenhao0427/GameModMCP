@@ -139,6 +139,36 @@ else:
 bad = S.inspect_binary(r"C:\这个文件根本不存在_xyz.exe")
 check("不存在的文件被拒绝", bad.get("ok") is False, bad.get("error", ""))
 
+# P1-5 回归：inspect_binary 只许把 PE 解析**一次**。
+# 以前是 `pe_parse(p)` + `pe_summarize(p)`，而 summarize 内部又 parse 一遍，
+# 于是同一个文件被完整解析两次，且第一次的结果从未被使用。
+# 这里不量时间（会闪），而是数**调用次数** —— 次数是确定的。
+if have(GAME_EXE):
+    from gamemod_mcp.engine import pe as _pe
+    _orig_pe_parse = _pe.parse
+    _pe_calls = {"n": 0}
+
+    def _counting_pe_parse(*a, **kw):
+        _pe_calls["n"] += 1
+        return _orig_pe_parse(*a, **kw)
+
+    # pe.summarize 内部调的是 pe 模块全局的 parse，所以补这里能同时
+    # 覆盖「state 自己调的 parse」与「summarize 内部调的 parse」。
+    _pe.parse = _counting_pe_parse
+    try:
+        ib3 = S.inspect_binary(GAME_EXE)
+    finally:
+        _pe.parse = _orig_pe_parse
+    print(f"     inspect_binary 一次调用触发的 pe.parse 次数 = {_pe_calls['n']}")
+    check("inspect_binary 只解析 PE 一次（P1-5：不再重复解析）",
+          ib3.get("ok") is True and _pe_calls["n"] == 1,
+          f"pe.parse 被调 {_pe_calls['n']} 次，期望 1 次")
+    # 去掉重复解析后返回内容必须一字不差
+    check("去掉重复解析后返回值不变",
+          {k: v for k, v in ib3.items() if k != "pe"}
+          == {k: v for k, v in ib.items() if k != "pe"},
+          "顶层字段应当完全一致")
+
 
 section("3. find_derived_classes(assembly=) / class_detail(method_name=) —— 需要索引")
 #

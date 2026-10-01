@@ -218,6 +218,36 @@ for sp in SAMPLES:
     check(f"{sp['name']}：同时给出 offset/limit",
           le.get("offset") == 0 and le.get("limit") == 10,
           f"offset={le.get('offset')} limit={le.get('limit')}")
+
+    # P1-5 回归：ue_list_entries 只许把容器解析**一次**。
+    # server.py 为了区分「解析失败」与「容器真的是空」，必须先调
+    # read_*_index；而 list_*_entries 内部默认又会解析一遍 ——
+    # 实测这占该工具耗时 48%~52%。修复方式是把 report 传进去复用。
+    # 这里数调用次数（确定量），不量时间（会闪）。
+    from gamemod_mcp.engine import ue as _ue_mod
+    _read_name = "read_iostore_index" if sp["entry_kind"] == "utoc" else "read_pak_index"
+    _orig_read = getattr(_ue_mod, _read_name)
+    _read_calls = {"n": 0}
+
+    def _counting_read(*a, **kw):
+        _read_calls["n"] += 1
+        return _orig_read(*a, **kw)
+
+    setattr(_ue_mod, _read_name, _counting_read)
+    try:
+        le2 = S.ue_list_entries(container=target, limit=10)
+    finally:
+        setattr(_ue_mod, _read_name, _orig_read)
+    print(f"     ue_list_entries 一次调用触发的 {_read_name} 次数 = "
+          f"{_read_calls['n']}")
+    check(f"{sp['name']}：ue_list_entries 只解析容器一次（P1-5：不再重复解析）",
+          le2.get("ok") is True and _read_calls["n"] == 1,
+          f"{_read_name} 被调 {_read_calls['n']} 次，期望 1 次")
+    check(f"{sp['name']}：去掉重复解析后返回内容不变",
+          {k: v for k, v in le2.items() if k != "entries"}
+          == {k: v for k, v in le.items() if k != "entries"},
+          "除 entries 外的字段应当完全一致")
+
     for e in (le.get("entries") or [])[:3]:
         p = e.get("path") if isinstance(e, dict) else e
         print(f"       · {str(p)[:100]}")

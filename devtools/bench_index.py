@@ -182,10 +182,13 @@ def bench_query(label: str, mpath: Path) -> None:
 
 
 def bench_dup_parse() -> None:
-    """P1-5：重复解析 —— 同一次调用里把同一份数据解析两遍。"""
+    """P1-5：重复解析 —— 同一次调用里把同一份数据解析两遍。
+
+    每个场景都量**修复前的写法**与**修复后的写法**，直接给出省下多少。
+    """
     print()
     print("=" * 76)
-    print("[P1-5] 重复解析成本")
+    print("[P1-5] 重复解析成本（修复前 vs 修复后）")
     print("=" * 76)
 
     print("-" * 76)
@@ -210,8 +213,10 @@ def bench_dup_parse() -> None:
         print(f"  pe.parse       单次 {p_ms:7.2f} ms")
         print(f"  pe.summarize   单次 {s_ms:7.2f} ms"
               f"   ← 内部又 parse 了一遍")
-        print(f"  → state.inspect_binary 若两者都调，就付了约 "
-              f"{p_ms + s_ms:.2f} ms，其中 {p_ms:.2f} ms 是重复的")
+        print(f"  修复前 state.inspect_binary = pe_parse + pe_summarize"
+              f" = {p_ms + s_ms:7.2f} ms（其中 {p_ms:.2f} ms 白付）")
+        print(f"  修复后 state.inspect_binary = pe_summarize"
+              f"        = {s_ms:7.2f} ms  → 省 {p_ms:.2f} ms")
 
     print("-" * 76)
     print("② ue_list_entries：容器索引被解析几遍")
@@ -227,26 +232,38 @@ def bench_dup_parse() -> None:
         print(f"  {label}:  pak={len(paks)}  utoc={len(utocs)}")
         for p in (utocs[:1] + paks[:1]):
             is_utoc = p.suffix.lower() == ".utoc"
+            read = ue.read_iostore_index if is_utoc else ue.read_pak_index
+            listing = ue.list_iostore_entries if is_utoc else ue.list_pak_entries
+
+            # 修复前：read 一次判 ok，list 内部再 read 一次
             t0 = time.perf_counter()
-            if is_utoc:
-                r1 = ue.read_iostore_index(str(p))
-            else:
-                r1 = ue.read_pak_index(str(p))
+            r1 = read(str(p))
             t1 = time.perf_counter()
-            if is_utoc:
-                entries = ue.list_iostore_entries(str(p))
-            else:
-                entries = ue.list_pak_entries(str(p))
+            entries_before = listing(str(p))
             t2 = time.perf_counter()
-            first = ms(t0, t1) / 1000
-            both = ms(t0, t2) / 1000
+
+            # 修复后：read 一次，list 复用它的结果
+            t3 = time.perf_counter()
+            r2 = read(str(p))
+            t4 = time.perf_counter()
+            entries_after = listing(str(p), report=r2)
+            t5 = time.perf_counter()
+
+            before = ms(t0, t2) / 1000
+            after = ms(t3, t5) / 1000
+            # 修复只应省时间，绝不该改变结果
+            same = len(entries_before) == len(entries_after)
             print(f"    {p.name}  ({p.stat().st_size / 1024 / 1024:.1f} MB,"
-                  f" 条目 {len(entries):,})")
-            print(f"      read_*_index    {first:6.3f}s  ok={r1.get('ok')}")
-            print(f"      list_*_entries  {ms(t1, t2) / 1000:6.3f}s")
-            print(f"      → server.py 里两次都调 = {both:.3f}s，"
-                  f"其中 {first:.3f}s（{first / max(both, 1e-9) * 100:.0f}%）"
-                  f"是重复解析")
+                  f" 条目 {len(entries_after):,})")
+            print(f"      read_*_index    {ms(t0, t1) / 1000:6.3f}s  "
+                  f"ok={r1.get('ok')}")
+            print(f"      修复前（两次解析）  {before:6.3f}s")
+            print(f"      修复后（复用 report）{after:6.3f}s"
+                  f"  → 省 {before - after:.3f}s"
+                  f"（{(1 - after / max(before, 1e-9)) * 100:.0f}%）")
+            print(f"      条目数一致：{same}"
+                  f"（{len(entries_before):,} vs {len(entries_after):,}）"
+                  + ("" if same else "  ← 不一致，修复有问题！"))
 
 
 def main() -> int:

@@ -305,6 +305,22 @@ def main() -> int:
         print(f"   list_pak_entries()  = {len(listed):,} 条（含目录），其中文件 {files_listed:,} 条；"
               f"与 read_pak_index 条目总数一致：{same}")
 
+        # 复用 report 必须与自行解析**完全等价**。
+        # server.py 的 ue_list_entries 为了区分「解析失败」与「容器空」
+        # 必须先 read_pak_index，再把结果传给 list_pak_entries；
+        # 这条断言就是「复用没有改变结果」的证据。
+        reused = ue.list_pak_entries(sample["pak"], report=data)
+        identical = reused == listed
+        print(f"   list_pak_entries(report=...) 与自行解析结果完全一致：{identical}"
+              f"（{len(reused):,} 条）")
+        if identical:
+            mark_ok(
+                f"{name}：list_pak_entries(report=) 复用已解析结果与自行解析**逐条等价**"
+                f"（{len(reused):,} 条）—— 这是 server.py 去掉重复解析的依据"
+            )
+        else:
+            mark_no(f"{name}：list_pak_entries(report=) 与自行解析结果不一致")
+
     # =====================================================================
     # 4. utoc（IoStore）目录索引
     # =====================================================================
@@ -354,6 +370,19 @@ def main() -> int:
         listed = ue.list_iostore_entries(sample["utoc"])
         files_listed = sum(1 for e in listed if not e["is_dir"])
         print(f"   list_iostore_entries() = {len(listed):,} 条（含目录），其中文件 {files_listed:,} 条")
+
+        # 同 pak：复用 report 必须与自行解析逐条等价
+        reused = ue.list_iostore_entries(sample["utoc"], report=data)
+        identical = reused == listed
+        print(f"   list_iostore_entries(report=...) 与自行解析结果完全一致：{identical}"
+              f"（{len(reused):,} 条）")
+        if identical:
+            mark_ok(
+                f"{name}：list_iostore_entries(report=) 复用已解析结果与自行解析**逐条等价**"
+                f"（{len(reused):,} 条）"
+            )
+        else:
+            mark_no(f"{name}：list_iostore_entries(report=) 与自行解析结果不一致")
 
     # global.utoc：实测没有目录索引，必须诚实报告而不是伪造
     sub("global.utoc —— 实测无目录索引")

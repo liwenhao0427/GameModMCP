@@ -32,7 +32,7 @@ from ..logutil import progress, warn
 from . import discovery
 from .il2cpp_meta import MetadataError
 from .index import Index
-from .pe import parse as pe_parse, summarize as pe_summarize
+from .pe import summarize as pe_summarize
 
 # ---------------------------------------------------------------- 状态对象
 
@@ -673,8 +673,14 @@ def inspect_binary(path: str) -> dict:
     if not p.is_file():
         return {"ok": False, "error": f"文件不存在：{path}"}
     try:
-        info = pe_parse(p)
-        out = pe_summarize(p) if callable(pe_summarize) else {}
+        # 只解析一次。早先这里是 `info = pe_parse(p)` + `pe_summarize(p)`，
+        # 而 summarize 内部又会 parse 一遍（pe.py:484）—— 于是同一个文件
+        # 被完整解析两次，且 `info` **从未被使用**（实测白付 0.55 ms，
+        # 约占该工具耗时的一半）。
+        #
+        # 去掉 `pe_parse` 不改变语义：文件非法时两者抛的都是同一个
+        # PEError（summarize 走的就是 parse），下面照旧捕获。
+        out = pe_summarize(p)
         return {"ok": True, "path": str(p), "pe": out}
     except Exception as exc:
         return {"ok": False, "error": f"PE 解析失败：{exc}", "path": str(p)}

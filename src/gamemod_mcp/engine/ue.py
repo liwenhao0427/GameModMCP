@@ -483,15 +483,21 @@ def _records_to_entries(records: list[tuple[str, int]], mount: str) -> list[dict
     return entries
 
 
-def list_pak_entries(pak_path: str | Path) -> list[dict]:
+def list_pak_entries(pak_path: str | Path, report: dict | None = None) -> list[dict]:
     """列出 .pak 内的全部条目（目录 + 文件）。
 
     实测：CatapultHero 4556 个文件 / 359 个目录，Dinoblade 4565 / 438，
     与 Manifest_UFSFiles_Win64.txt 交叉校验命中率 100%。
     解析失败时返回空列表（调用方应用 read_pak_index 获取失败原因）。
+
+    :param report: 已经调用过 :func:`read_pak_index` 的返回值。
+        传入时直接复用它，**不再解析一遍容器** —— 否则调用方为了区分
+        「解析失败」与「容器真的是空」而先调 read_pak_index，
+        就会把同一个容器完整解析两次（实测占大容器总耗时的一半）。
+        传 None（默认）时行为与从前一致。
     """
     try:
-        data = read_pak_index(pak_path)
+        data = report if report is not None else read_pak_index(pak_path)
     except (OSError, struct.error) as exc:  # pragma: no cover - 防御性
         warn(f"读取 pak 失败：{pak_path}：{exc}")
         return []
@@ -709,14 +715,19 @@ def _rebuild_iostore_paths(
     return entries
 
 
-def list_iostore_entries(utoc_path: str | Path) -> list[dict]:
+def list_iostore_entries(utoc_path: str | Path,
+                         report: dict | None = None) -> list[dict]:
     """列出 .utoc（IoStore）容器目录索引中的全部条目。
 
     实测：CatapultHero 7178 条、Dinoblade 18956 条，与 Manifest 交叉校验
     （大小写不敏感）命中率 100%。失败返回空列表。
+
+    :param report: 已经调用过 :func:`read_iostore_index` 的返回值；
+        语义与 :func:`list_pak_entries` 的 ``report`` 完全相同
+        （传入即复用，避免同一容器被解析两遍）。
     """
     try:
-        data = read_iostore_index(utoc_path)
+        data = report if report is not None else read_iostore_index(utoc_path)
     except (OSError, struct.error) as exc:  # pragma: no cover - 防御性
         warn(f"读取 utoc 失败：{utoc_path}：{exc}")
         return []
