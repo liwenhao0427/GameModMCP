@@ -21,11 +21,31 @@ Agent 的上下文有限，一次返回 13 万个方法会把上下文炸掉。
     给 `pattern` 即在同一结果内部再过滤（原先独立的
     `search_query_result` 就是它在 `pattern=""` 时的特例，已按契约第 3 条合并）。
 这样既保证单次返回精简，又保证信息不丢失。
+
+句柄的命名与**生命周期**（P2-4）
+--------------------------------------------------
+句柄形如 `il2cpp-g3-classes-1`，三段各有用途：
+
+    il2cpp   引擎名 —— 给人看：拿着句柄能看出它属于哪个会话；
+    g3       **代次号**，进程内每新建一个句柄表就 +1；
+    classes-1 原来的「结果种类 + 序号」。
+
+`g3` 这一段不是装饰，是**修 bug 用的**。`ResultStore` 是 `Index` 的实例属性，
+切游戏就换一个实例、序号从 0 重来，于是旧会话的 `classes-1` 会在新会话里
+**静默命中另一份结果集**。实测（修之前）：
+
+    IL2CPP 游戏 search_classes('Player') -> 句柄 'classes-1'，首条 PlayerPrefsController
+    切到 Mono 游戏 search_classes('a')   -> 句柄 'classes-1'，首条 __StaticArrayInitTypeSize=26136
+    再读 IL2CPP 那个句柄                 -> ok=True，读出来的是 **Mono 的那一条**
+
+`ok=True` 但数据是另一个游戏的 —— 正是本项目最不能接受的一类缺陷。
+带上代次号后，旧句柄在新会话里查不到，会如实报「不存在或已过期」。
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,17 +177,34 @@ class QueryResult:
 
 
 class ResultStore:
-    """查询结果句柄表（进程内，有上限，超出后淘汰最旧的）。"""
+    """查询结果句柄表（进程内，有上限，超出后淘汰最旧的）。
 
-    def __init__(self, max_entries: int = 32):
+    每个实例领一个**进程内唯一的代次号**并写进句柄，见模块上方
+    「句柄的命名与生命周期」。这一条是正确性要求，不是可读性偏好：
+    没有它，切游戏后旧句柄会静默读到另一个游戏的数据。
+    """
+
+    #: 代次号：进程内每新建一个句柄表就 +1，保证句柄字符串跨索引不重名。
+    _EPOCH = itertools.count(1)
+
+    def __init__(self, owner: str = "", max_entries: int = 32):
         self._max = max_entries
         self._items: dict[str, QueryResult] = {}
         self._counter = 0
+        self._epoch = next(self._EPOCH)
+        # owner 只影响可读性；**唯一性由代次号保证**（同一个引擎的两个游戏
+        # owner 相同，只靠引擎名区分不开）。
+        self._prefix = f"{owner or 'idx'}-g{self._epoch}-"
+
+    @property
+    def prefix(self) -> str:
+        """句柄前缀（`{引擎}-g{代次}-`），仅供说明与验证脚本使用。"""
+        return self._prefix
 
     def put(self, kind: str, source: _RowSource) -> QueryResult:
         """登记一份结果来源，返回句柄（**不物化**，见模块上方说明）。"""
         self._counter += 1
-        handle = f"{kind}-{self._counter}"
+        handle = f"{self._prefix}{kind}-{self._counter}"
         qr = QueryResult(handle=handle, kind=kind, source=source)
         self._items[handle] = qr
 
@@ -237,7 +274,7 @@ class Index:
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
-        self.results = ResultStore()
+        self.results = ResultStore(owner=self.engine)
         # 「父类名 -> 直接子类」映射的惰性缓存（见 _direct_children）。
         # 构建一次约 6 ms（IL2CPP 20,072 类型），元数据本身是只读的，
         # 所以不需要失效逻辑。

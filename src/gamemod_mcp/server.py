@@ -909,7 +909,10 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
         return _err(
             f"句柄不存在或已过期：{handle}",
             available_handles=(res or {}).get("available_handles", []),
-            hint="句柄在会话内有效；切换游戏或重建索引后会失效",
+            hint=("句柄只在**它所属的那一个会话**内有效：句柄前缀带引擎与代次"
+                  f"（当前会话前缀 {idx.results.prefix!r}）。切换游戏或重建索引后"
+                  "旧句柄一律失效 —— 这是刻意的：否则旧句柄会静默读到"
+                  "另一个结果集（实测过，见 index.py 模块上方说明）"),
         )
     out = _ok(**res)
     if pattern and not (res.get("items") or []):

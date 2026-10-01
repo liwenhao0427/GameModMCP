@@ -380,13 +380,18 @@ hook_method(name="BodyPart", method="Visualize", param_count=1)
 ```python
 r = search_classes(pattern="Player", limit=50)
 r["total"]        # 总共 697 个（**匹配总数**，不受 limit 影响）
-r["handle"]       # "classes-1"
+r["handle"]       # "il2cpp-g3-classes-1"（引擎-g代次-种类-序号）
 read_query_result(r["handle"], offset=500, limit=50)      # 翻页
 read_query_result(r["handle"], pattern="Controller")      # 在结果内再过滤
 ```
 
 > 翻页与「结果内再过滤」是**同一个工具**的两种用法：`read_query_result`
 > 的 `pattern` 留空就是纯翻页（两者原先各是一个工具，按契约第 3 条已合并）。
+
+> **句柄只属于它被创建时的那一个会话**（前缀里的 `g3` 就是会话代次）。
+> 切游戏或重建索引后旧句柄一律失效 —— 这是刻意的：句柄表是每个索引
+> 实例各自的、序号会从 0 重来，若不带代次，旧句柄会**静默读到另一个游戏
+> 的结果集**（实测过）。失效时返回里会给出 `available_handles`，从里面取。
 
 **`total` 与 `returned` 不是一回事，`has_more` 才是截断标志**：
 

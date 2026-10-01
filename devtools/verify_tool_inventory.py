@@ -74,6 +74,8 @@ NON_TOOL_IDENTIFIERS = {
     "exclude_compiler_generated", "subtype_of", "only_enums",
     "output_dir", "split_files", "assembly", "type_name", "source",
     "has_more", "cache_hit", "readOnlyHint", "destructiveHint",
+    # P2-4a 起句柄失败时会返回它（可用句柄清单），是返回字段不是工具
+    "available_handles",
     "image_count", "rva_hex", "hex_data", "module", "offset",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
