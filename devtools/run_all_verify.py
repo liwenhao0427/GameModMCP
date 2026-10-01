@@ -22,6 +22,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 # 中文 Windows 的控制台默认 GBK，本脚本会打印 ✅ / ❌ / 💥 之类的字符。
@@ -43,7 +44,64 @@ SELF_ATTACH = {"verify_agent_js"}
 # 会落在很大的负数或 1，这里统一按「崩溃」处理。
 CRASH_CODES = {-1073741819, 3221225477, -1073740791, 3221225725}
 
+#: 本脚本自己造出来的退出码：脚本超时被终止（见 `run()` 的注释）。
+#: 与「崩溃」分开记 —— 一个是被系统/断言打断，一个是根本没结束。
+TIMEOUT_CODE = -9
+
 COV_LOG = os.path.join(ROOT, ".cache-test", "tool_calls.jsonl")
+LOCK = os.path.join(ROOT, ".cache-test", "run_all_verify.lock")
+
+
+def pid_alive(pid: int) -> bool:
+    """进程是否还活着（Windows 上**不能**用 `os.kill(pid, 0)`）。
+
+    Python 文档写得很清楚：Windows 上 `os.kill` 的第二个参数只要不是
+    那两个控制台事件，就会被当成 TerminateProcess —— 拿它做「探活」
+    会把目标进程**杀掉**。
+    """
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return str(pid) in (out.stdout or "")
+
+
+def acquire_lock() -> bool:
+    """同一时间只允许一套完整验收在跑。
+
+    实测教训：两套同时跑会互相踩。① 覆盖率日志是共享的，先跑的那套会把它
+    清空，于是「证据」串味；② Unity 样本游戏带**单实例锁**，第二个实例
+    直接退出 —— 另一边看到的现象是「游戏启动后 60 秒一直没就绪、
+    会话已失效」，一个纯粹的假失败。
+    """
+    try:
+        with open(LOCK, encoding="utf-8") as fh:
+            old = int((fh.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        old = 0
+    if old and old != os.getpid() and pid_alive(old):
+        print(f"❌ 已有一套验收在跑（pid={old}）："
+              f"{os.path.relpath(LOCK, ROOT)} 是它的锁。")
+        print("   等它跑完再跑 —— 两套同时跑会互相踩：覆盖率日志串味，"
+              "样本游戏又带单实例锁，会造出「游戏没就绪」这类假失败。")
+        return False
+    try:
+        os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+        with open(LOCK, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError as exc:
+        print(f"⚠️  写不了锁文件（{exc}），本次不加锁继续跑")
+    return True
+
+
+def release_lock() -> None:
+    try:
+        with open(LOCK, encoding="utf-8") as fh:
+            if (fh.read() or "").strip() == str(os.getpid()):
+                os.remove(LOCK)
+    except OSError:
+        pass
 
 
 def child_env() -> dict:
@@ -60,13 +118,35 @@ def child_env() -> dict:
     return env
 
 
-def run(script: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        [sys.executable, os.path.join(HERE, script)],
-        capture_output=True, text=True, encoding="utf-8",
-        errors="replace", cwd=ROOT, env=child_env(),
-    )
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+def run(script: str, timeout: float = 1200.0) -> tuple[int, str]:
+    """跑一个验收脚本：输出走**临时文件**，并带超时。
+
+    为什么不能用 `capture_output=True`（实测踩到）：管道要等到 **EOF** 才算读完，
+    而验收脚本会 spawn 出游戏进程；只要有进程继承了那两根管道还继续活着，
+    `subprocess.run` 就**永远**等不到 EOF。
+    现象很好认：`run_all_verify.py` 只用了 0.1 秒 CPU、一个子进程都没有、
+    整轮卡在 `verify_mcp_tools` 上不动，而那个游戏进程在另一头烧 CPU。
+    实测确认：`Stop-Process` 掉那个游戏，父进程**立刻**继续往下跑。
+
+    改成写临时文件后，`subprocess.run` 只等**子进程自己退出**，
+    谁还攥着文件句柄都不影响它 —— 这类挂死从根上消失。
+    超时仍然保留：脚本自己死循环时，要报红（`TIMEOUT_CODE`），不能把整套挂住。
+    """
+    with tempfile.TemporaryFile(mode="w+b") as fh:
+        try:
+            proc = subprocess.run(
+                [sys.executable, os.path.join(HERE, script)],
+                stdout=fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, cwd=ROOT, env=child_env(),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            fh.seek(0)
+            tail = fh.read().decode("utf-8", "replace").strip()[-2000:]
+            return (TIMEOUT_CODE,
+                    f"[超时 {timeout:.0f}s 被终止] 输出尾部：\n{tail}")
+        fh.seek(0)
+        return proc.returncode, fh.read().decode("utf-8", "replace")
 
 
 def main() -> int:
@@ -102,6 +182,14 @@ def main() -> int:
             return 2
         scripts = [s for s in scripts if s in wanted]
 
+    # 加锁只在「跑整套」时做：`--only` 会被 verify_encoding_console.py
+    # 嵌套调用，外层已经拿着锁，内层再抢一次会自己把自己挡住。
+    locked = False
+    if not args.only:
+        if not acquire_lock():
+            return 2
+        locked = True
+
     print("=" * 74)
     print(f"验收脚本总览：{len(scripts)} 个")
     print("=" * 74)
@@ -123,20 +211,22 @@ def main() -> int:
 
     failed: list[str] = []
     crashed: list[str] = []
+    timedout: list[str] = []
     retried: list[str] = []
 
     for name in scripts:
         stem = name[:-3]
         code, out = run(name)
 
-        # 崩溃：重试。断言失败（正常非零退出）不重试 —— 那是确定的结论。
+        # 崩溃 / 超时：重试。断言失败（正常非零退出）不重试 —— 那是确定的结论。
         # 自注入 Frida 的脚本（SELF_ATTACH）本身就是崩溃高发户，
         # 给它们**多一次**预算，但仍要留痕（重试过就记进 retried）。
         budget = args.retries + (1 if stem in SELF_ATTACH else 0)
         attempts = 0
-        while code in CRASH_CODES and attempts < budget:
+        while (code in CRASH_CODES or code == TIMEOUT_CODE) and attempts < budget:
             attempts += 1
-            print(f"[崩溃] {stem} exit={code}"
+            what = "超时" if code == TIMEOUT_CODE else "崩溃"
+            print(f"[{what}] {stem} exit={code}"
                   f"（{out.strip().splitlines()[-1][:60] if out.strip() else '无输出'}）"
                   f" —— 第 {attempts} 次重试…")
             time.sleep(1.0)
@@ -148,6 +238,11 @@ def main() -> int:
                 retried.append(stem)
                 mark = "✅(重试)"
             print(f"[{mark}] {stem}")
+        elif code == TIMEOUT_CODE:
+            timedout.append(stem)
+            print(f"[⏱] {stem} —— **超时被终止**（脚本没结束，不是断言失败）")
+            for line in out.strip().splitlines()[-6:]:
+                print(f"       {line}")
         elif code in CRASH_CODES:
             crashed.append(stem)
             print(f"[💥] {stem} exit={code} —— 进程崩溃（非断言失败）")
@@ -161,8 +256,10 @@ def main() -> int:
 
     print()
     print("=" * 74)
-    print(f"通过 {len(scripts) - len(failed) - len(crashed)} / {len(scripts)}"
-          f"    断言失败 {len(failed)}    进程崩溃 {len(crashed)}")
+    print(f"通过 {len(scripts) - len(failed) - len(crashed) - len(timedout)}"
+          f" / {len(scripts)}"
+          f"    断言失败 {len(failed)}    进程崩溃 {len(crashed)}"
+          f"    超时 {len(timedout)}")
     if retried:
         print(f"重试后通过（环境抖动）：{', '.join(retried)}")
         print("  ⚠️  出现重试说明本机存在不稳定因素，结论比一次跑通要弱。")
@@ -172,9 +269,13 @@ def main() -> int:
         print(f"崩溃：{', '.join(crashed)}")
         print("  崩溃多为 Frida 自注入本进程导致，非产品缺陷；")
         print("  但**不算通过**，需在有显示环境/管理员权限下复核。")
+    if timedout:
+        print(f"超时：{', '.join(timedout)}")
+        print("  超时说明脚本**自己没结束**（死循环，或卡在某个调用上）；"
+              "输出走的是临时文件，所以这不可能是「等管道 EOF」造成的。")
     print("=" * 74)
 
-    rc = 1 if (failed or crashed) else 0
+    rc = 1 if (failed or crashed or timedout) else 0
 
     if not args.no_cov:
         # --only 时**必须**跳过门禁：只跑一两个脚本，不可能覆盖全部工具，
@@ -201,6 +302,8 @@ def main() -> int:
             print("  注：覆盖率日志由本脚本统一设置（PYTHONPATH=devtools/_cov），")
             print("     已在开跑前清空，因此是本次运行的证据。")
 
+    if locked:
+        release_lock()
     return rc
 
 
