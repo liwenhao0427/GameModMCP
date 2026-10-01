@@ -99,7 +99,7 @@ find_game_processes()              # 游戏已经在跑时，用它拿 pid
 > `open_game` 会报「没有元数据文件」。UE 直接走 `detect_ue` / `ue_list_entries`。
 
 ```
-open_game(game_dir="D:\\Projects\\Garden of Witches")
+open_game(game_dir="D:\\Games\\MyGame")
 ```
 
 这一步会解析元数据并建 SQLite 缓存。**首次约 2 秒，之后 0.01 秒**（缓存键是元数据文件的 sha256）。

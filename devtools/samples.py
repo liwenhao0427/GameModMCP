@@ -68,12 +68,19 @@ def ensure_cache_dirs() -> None:
 # ---------------------------------------------------------------- 样本根目录
 
 #: 样本游戏可能所在的根。用环境变量 GAMEMOD_SAMPLES 可整体重定向。
+#:
+#: 默认值全部**由位置推导**，不含任何盘符字面量：
+#:   ① 仓库所在目录（即 `ROOT.parent`，样本与仓库并列存放）
+#:   ② `~/Projects`
+#: 取不到的根不会有任何副作用（`_find_dir` 只做 `root / 名字` 的存在性判断，
+#: 不做递归扫描），所以多列几个候选是安全的。
 SAMPLE_ROOTS: list[Path] = [
     Path(os.environ["GAMEMOD_SAMPLES"]) if os.environ.get("GAMEMOD_SAMPLES") else None,
-    Path(r"D:\Projects"),
+    ROOT.parent,
     Path.home() / "Projects",
 ]
-SAMPLE_ROOTS = [p for p in SAMPLE_ROOTS if p is not None]
+# 去重但保序：仓库父目录与 ~/Projects 可能恰好是同一个
+SAMPLE_ROOTS = list(dict.fromkeys(p for p in SAMPLE_ROOTS if p is not None))
 
 
 def _find_dir(names: list[str], marker: str = "") -> Path | None:

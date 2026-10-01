@@ -87,8 +87,8 @@ ARGV_CASES: list[tuple[str, list[str]]] = [
     # （最容易被 shlex 吃掉的情形）
     (r"C:\Games\Garden\GameAssembly.dll",
      [r"C:\Games\Garden\GameAssembly.dll"]),
-    (r'"C:\Games\Garden of Witches\GameAssembly.dll"',
-     [r"C:\Games\Garden of Witches\GameAssembly.dll"]),
+    (r'"C:\Games\My Game\GameAssembly.dll"',
+     [r"C:\Games\My Game\GameAssembly.dll"]),
     # 未闭合引号：一直引到串尾（不报错）
     ('"unterminated', ["unterminated"]),
     ('--a "b', ["--a", "b"]),

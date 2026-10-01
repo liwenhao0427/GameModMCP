@@ -16,9 +16,9 @@
 
 已验证（真实样本交叉比对，脚本 devtools/verify_mono.py）
 --------------------------------------------------
-    D:\\Projects\\Archon Soul\\Archon Soul_Data\\Managed\\Assembly-CSharp.dll
+    <游戏目录>\\Archon Soul_Data\\Managed\\Assembly-CSharp.dll
         （1,141,760 字节，PE32 x86，元数据 v4.0.30319，#~ 2.0，heapSizes=0x01）
-    D:\\Projects\\Kinny and the Cosmic Cauldron\\...\\Assembly-CSharp.dll
+    <游戏目录>\\Kinny and the Cosmic Cauldron_Data\\Managed\\Assembly-CSharp.dll
     真值来源：微软官方 System.Reflection.Metadata（devtools/mono_groundtruth/），
     完全不复用本模块的代码，逐表比对行数与成员归属。
 

@@ -116,8 +116,8 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 | `find_il2cpp_dump()` | `aiMod/dump/*/il2cpp_dump.cs` | IL2CPP 字段类型真值 |
 | `find_mono_groundtruth()` | `devtools/groundtruth/mono/` | Mono 真值生成器 |
 
-样本根默认是 `D:\Projects` 与 `~/Projects`，可用环境变量
-`GAMEMOD_SAMPLES` 整体重定向。
+样本根的默认值**由位置推导**（不含盘符字面量）：仓库所在目录（`ROOT.parent`，
+即样本与仓库并列存放）与 `~/Projects`；可用环境变量 `GAMEMOD_SAMPLES` 整体重定向。
 
 样本不在时脚本记为**「无法验证」并跳过**，不会假装通过。
 

@@ -147,7 +147,9 @@ namespace MonoGroundTruth
             var provider = new NameProvider(R);
 
             var root = new Dictionary<string, object>();
-            root["path"] = path;
+            // 只记文件名：真值 JSON 是要入库的产物，写绝对路径等于把「生成它的那台机器」
+            // 一起提交进去（换台机器这条路径就是死链，且暴露本机目录结构）。
+            root["path"] = Path.GetFileName(path);
             root["metadata_version"] = R.MetadataVersion;
 
             // ---- 各表行数（这是最硬的真值）----

@@ -4,8 +4,8 @@
 一律返回空值 + 明确的未验证原因，绝不猜测字段偏移。
 
 ================================ 实测样本 ================================
-样本 A：D:\\Projects\\CatapultHero（UE，pak v12，utoc v8）
-样本 B：D:\\Projects\\Dinoblade（UE，pak v11，utoc v8）
+样本 A：CatapultHero（UE，pak v12，utoc v8）
+样本 B：Dinoblade（UE，pak v11，utoc v8）
 
 ================================ 实测结论 ================================
 已验证可用：
@@ -742,7 +742,7 @@ def parse_usmap(path: str | Path) -> dict:
     """解析 .usmap（UE 映射文件）。
 
     **本函数不实现解析逻辑**，原因（实测）：
-      对 D:\\Projects 全盘递归搜索 ``*.usmap`` / ``*.uproject`` / ``*.upluginmanifest``，
+      对样本所在的目录树递归搜索 ``*.usmap`` / ``*.uproject`` / ``*.upluginmanifest``，
       结果为空：两个真实样本中都不存在 .usmap 文件。
       没有真实样本就无法确认其 magic、版本枚举与压缩格式，
       按项目铁律「永远不要编造、不照搬网上偏移表」，此处拒绝解读。
