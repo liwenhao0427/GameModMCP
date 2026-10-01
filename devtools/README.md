@@ -23,6 +23,7 @@ python devtools\samples.py                 # 只看本机样本可用性（不�
 python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否一致（无需游戏）
 python devtools\verify_tool_annotations.py # 38 个工具的语义标注（危险工具须声明，无需游戏）
 python devtools\verify_server_helpers.py   # server.py 的纯函数：命令行拆分 / 字段读取宽度（无需游戏）
+python devtools\verify_response_size.py    # 响应体积基线：最大的只读查询在线上有多大（无需注入）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）

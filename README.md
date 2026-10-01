@@ -244,8 +244,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 25 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 24 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 26 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 25 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -269,6 +269,7 @@ GameModMCP/
 | `verify_mcp_decompile.py` | `decompile` 工具（`ilspycmd` 薄封装） |
 | `verify_mcp_extra.py` | 补全主流程没覆盖到的工具 |
 | `verify_server_helpers.py` | `server.py` 的纯函数：命令行拆分（`launch_game`）与字段读取宽度（`read_field_value`） |
+| `verify_response_size.py` | **响应体积**：与 FastMCP 完全相同的序列化下，最大的只读查询有多大（P2-4 的基线） |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
