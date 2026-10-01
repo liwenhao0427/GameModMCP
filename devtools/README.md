@@ -26,6 +26,7 @@ python devtools\verify_handle_scope.py     # 结果句柄作用域：跨游戏�
 python devtools\verify_server_helpers.py   # server.py 的纯函数：命令行拆分 / 字段读取宽度（无需游戏）
 python devtools\verify_response_size.py    # 响应体积：P2-4 前后对比 + 上限不变量 + 旧记录订正（无需注入）
 python devtools\verify_cap.py              # 体积上限的机制：截断/句柄/字段诚实性/不丢数据（无需注入）
+python devtools\verify_mcp_resources.py    # MCP 资源层：gamemod://guide 与 SKILL.md 同源 + 找不到时如实说（无需注入）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）

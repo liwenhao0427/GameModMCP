@@ -198,6 +198,42 @@ Agent 会自动：
 
 ---
 
+## 资源（MCP resources）
+
+只有一个：**`gamemod://guide`** —— 这份 MCP 自己的完整使用指南
+（与 `skills/gamemod-mod/SKILL.md` 同源，逐字节相同）。
+
+```text
+gamemod://guide   text/markdown   约 24 KB
+```
+
+支持 resources 的客户端可以直接读它，不必先在系统提示里塞进这份长文档。
+它也是全项目**唯一没有工具出口**的内容：其余（会话状态、引擎能力矩阵、
+缓存与依赖清单）都已经由 `get_session` / `open_game` / `get_diagnostics`
+返回，再开一个资源出口就是同一份数据的第二个来源（契约第 3 条）。
+
+### 为什么没有 prompts
+
+MCP 还有 `prompts` 这一面，本服务器**不做**，这是量过的结论而不是遗漏：
+
+| 协议面 | 客户端（DSH）实测 | 结论 |
+|---|---|---|
+| `resources/list` `resources/templates/list` `resources/read` | 客户端实现了，且把资源包成给模型用的工具（模型够得着） | ✅ 做 |
+| `prompts/list` `prompts/get` | 客户端**一个 prompt 方法都没有**，也没有对应的包 | ❌ 不做 |
+
+证据：在 `E:\DSH\resources\app.asar` 里按路径检索 JS，
+`dsh-mcp-client` 的请求分发 `switch` 里只有 `resources/*` 三个分支，
+`prompts/*` **零命中**。加了 prompt 也传不到模型面前，
+只会是一份没人读的声明 —— 与当初否决 `outputSchema` 是同一套判断方式
+（见 `docs/项目梳理与优化建议.md` §4.14 附近）。
+
+> 反过来说：**换个客户端就要重新量一次**。如果某个客户端确实消费 prompts，
+> 「把 SKILL.md 挂成带 `engine` 参数的 prompt」是现成的做法。
+> `devtools/verify_mcp_resources.py` 已经把「资源清单恰好只有 guide」
+> 做成断言，将来补资源时会强制过一次讨论。
+
+---
+
 ## 目录结构
 
 ```
@@ -268,8 +304,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 28 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 27 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 29 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 28 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -296,6 +332,7 @@ GameModMCP/
 | `verify_server_helpers.py` | `server.py` 的纯函数：命令行拆分（`launch_game`）与字段读取宽度（`read_field_value`） |
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
+| `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |

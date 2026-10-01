@@ -51,6 +51,19 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
     已有的 `handle` 会被复用（不另造句柄）；`has_more` / `returned`
     一律按**实际**返回改写：明明还有却说没有，比超限更糟。
 
+资源（MCP resources，P2-2）
+------------------------------------------------------------
+    只有一个：`gamemod://guide`，内容是本 MCP 自己的使用指南
+    （与 `skills/gamemod-mod/SKILL.md` 同源）—— 这是全项目唯一
+    **没有任何工具出口**的内容，所以放进资源不算重复。
+    `get_session` / `open_game` 已经返回引擎能力矩阵，故**不做**
+    `gamemod://capabilities`（那会是同一份数据的第二个出口）。
+    **不做 prompts**：实测客户端（DSH）的 MCP 客户端实现了
+    `resources/list|read`，却完全没有 prompts 相关方法，也没有
+    `dsh-mcp-prompts` 这类包 —— 加了也传不到模型面前。
+    资源不走 `@_cap_response`（它是工具层的外壳）：内容是受控的静态文件，
+    体积远小于上限，验收脚本里卡了这条。
+
 静态与运行时的能力边界（**不许说反**）
 ------------------------------------------------------------
     静态元数据里有: 类 / 字段 / 方法的**存在与签名**、方法 token
@@ -106,7 +119,10 @@ mcp = FastMCP(
         "响应体积上限：任何一次返回不超过 256 KB。被截断时返回里会有\n"
         "`capped: true` 与 `note`，照 note 给的\n"
         "read_query_result(handle=..., offset=...) 就能取回剩下的（一条不丢）；\n"
-        "此时 `has_more` / `returned` 已按**实际**返回改写，不是原来的请求值。"
+        "此时 `has_more` / `returned` 已按**实际**返回改写，不是原来的请求值。\n"
+        "\n"
+        "需要完整的使用指南（配方、引擎差异、常见坑）时，读资源\n"
+        "gamemod://guide —— 它与 skills/gamemod-mod/SKILL.md 同源。"
     ),
 )
 
@@ -1967,6 +1983,69 @@ def get_diagnostics(scan_processes: bool = False) -> dict:
         return _ok(**info)
     except Exception as exc:
         return _err(f"诊断失败：{exc}")
+
+
+# ================================================================
+# 8. 资源（MCP resources）
+# ================================================================
+#
+# 只做一个资源，理由写在模块 docstring 的「资源」一节：
+# 工具已经能给出的一切都不该再开第二个出口（§3.1 第 3 条）。
+
+_GUIDE_REL = Path("skills") / "gamemod-mod" / "SKILL.md"
+
+
+def _guide_candidates() -> list[Path]:
+    """`gamemod://guide` 的正文按此优先级去找。
+
+    覆盖两种部署形态：
+      · 在仓库里跑 —— `server.py` 往上两级就是仓库根；
+      · 在别处跑但装过 skill —— skill 会被复制到 `~/.dsh/skills/`。
+    """
+    here = Path(__file__).resolve()
+    out = [p / _GUIDE_REL for p in here.parents[1:3]]      # src/ 与 仓库根
+    out.append(Path.home() / ".dsh" / _GUIDE_REL)
+    return out
+
+
+def guide_text() -> str:
+    """`gamemod://guide` 的正文（纯函数，便于单测）。
+
+    找不到文件时**不返回空串、也不假装成功**，而是如实列出找过的位置
+    并给出退路（§3.1 第 4 条：找不到就明说）。
+    """
+    tried: list[str] = []
+    for path in _guide_candidates():
+        tried.append(str(path))
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+        except OSError as exc:                              # 权限/占用等
+            tried.append(f"（读取失败：{exc}）")
+    listed = "\n".join(f"- {t}" for t in tried)
+    return (
+        "# GameMod MCP 使用指南（当前环境里找不到）\n"
+        "\n"
+        "这份资源的内容来自 `skills/gamemod-mod/SKILL.md`，"
+        "但下面这些位置都没有它：\n"
+        f"{listed}\n"
+        "\n"
+        "不影响使用：`instructions` 里已有七步工作流，各工具的说明也在"
+        "各自 docstring 里。先 get_diagnostics 确认这台机器能做什么，"
+        "再 open_game 选定游戏即可。\n"
+    )
+
+
+@mcp.resource(
+    "gamemod://guide",
+    name="gamemod_guide",
+    title="GameMod MCP 使用指南",
+    description="本 MCP 的完整工作流说明（与 skills/gamemod-mod/SKILL.md 同源）。",
+    mime_type="text/markdown",
+)
+def guide_resource() -> str:
+    """完整使用指南：七步工作流、配方、引擎差异、常见坑。"""
+    return guide_text()
 
 
 # ================================================================

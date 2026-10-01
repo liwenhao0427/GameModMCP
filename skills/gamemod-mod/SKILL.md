@@ -5,6 +5,9 @@ description: 用 GameMod MCP 工具集做游戏 Mod：定位类/字段/方法、
 
 # 游戏 Mod 开发（GameMod MCP）
 
+> 这份文档同时也是 MCP 资源 **`gamemod://guide`**（同一份内容，逐字节相同）。
+> 没装 skill 的客户端可以直接读该资源拿到完整指南 —— 见 README「资源」一节。
+
 ## 先判断引擎——它决定你能做什么
 
 **动手前第一步永远是 `inspect_game(game_dir=...)`**，
