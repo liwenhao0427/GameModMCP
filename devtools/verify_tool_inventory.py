@@ -365,6 +365,49 @@ def main() -> int:
         check("README 声明了验证脚本总数", False,
               "没找到「N 个可复现的验证脚本」字样")
 
+    # --------------------------------------------------- 8. 已删工具的文档残留
+    show("8. 已删除 / 已合并的工具：出现在文档里必须**标注**")
+    # 前 7 节里与「工具名出现在哪」有关的，只有四处：
+    # README 工具表 / server docstring / instructions / SKILL.md。
+    # **其它文档不在任何检查范围内** —— `docs/项目梳理与优化建议.md`
+    # 就长期写着「全部工具清单（41 个）」（实际 38），§三 的工作流还让
+    # Agent 去调已删除的 `detect_games()`。
+    # 一个已删除的工具名出现在**指导性**段落里，Agent 会照着去调，
+    # 而它比「README 表格写错」更难发现：没有检查覆盖 docs/。
+    # 所以这里补一条通用规则：提到它们可以（历史记录有价值），
+    # 但同一行必须能看出「它已经没了」。
+    doc_files = [p for p in ROOT.rglob("*.md")
+                 if "agent_logs" not in p.parts and ".git" not in p.parts
+                 and "node_modules" not in p.parts]
+    # 「已经没了」的标记词。故意放宽 —— 这一节的目的是**消除歧义**，
+    # 不是逼人用某个固定句式。
+    GONE = re.compile(r"已删|删掉|删除|移除|已移除|已合并|合并|~~|旧|曾经|更名|"
+                      r"不再|当时|历史|不存在|从未")
+    mentions = 0
+    offenders: list[str] = []
+    for p in sorted(doc_files):
+        for lineno, line in enumerate(
+                p.read_text(encoding="utf-8").splitlines(), 1):
+            for name in REMOVED_TOOLS:
+                if name not in line:
+                    continue
+                mentions += 1
+                if not GONE.search(line):
+                    offenders.append(
+                        f"{p.relative_to(ROOT)}:{lineno} `{name}` —— "
+                        f"{line.strip()[:56]}")
+    print(f"  扫描 {len(doc_files)} 个 .md，命中已删工具名 {mentions} 处")
+    check("扫到了文档文件（否则下面的断言是空转的）", len(doc_files) >= 8,
+          f"{len(doc_files)} 个")
+    # 非空转保证：这些名字**确实**还在文档里被提到（历史记录），
+    # 所以「没有未标注的提及」不是因为扫了个空集合。
+    check("这些已删工具名在文档里确实被提到（证明扫描不是空转）",
+          mentions >= 5, f"{mentions} 处")
+    check("提到已删工具的地方都做了标注（没有让 Agent 以为它还在）",
+          not offenders,
+          f"{len(offenders)} 处未标注：" + "；".join(offenders[:4])
+          if offenders else "（全部有标注）")
+
     # ------------------------------------------------------------ 汇总
     if "--list" in argv:
         show("当前工具清单")
@@ -379,7 +422,7 @@ def main() -> int:
         for f in FAIL:
             print(f"  - {f}")
         print()
-        print("→ 工具清单已漂移：请按 AGENTS.md §4「必须同步的四处」改完再提交。")
+        print("→ 工具清单已漂移：请按 AGENTS.md §4「必须同步的五处」改完再提交。")
     print("=" * 76)
     return 1 if FAIL else 0
 

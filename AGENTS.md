@@ -124,7 +124,7 @@ src/gamemod_mcp/
 `verify_tool_annotations.py` 会直接报红。
 
 **工具清单以代码为准，文档不许硬编码数量。**
-用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **6 处**：
+用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **8 处**：
 
 | 校验对象 | 强度 |
 |---|---|
@@ -133,13 +133,23 @@ src/gamemod_mcp/
 | `server.py` docstring 的「工具分层」列表 | 双向完全一致 |
 | `FastMCP(instructions=...)` | 只许提到存在的工具 |
 | `SKILL.md`（含**代码块里的调用形式**） | 只许提到存在的工具 |
+| 已删除 / 已合并的工具名 | 在**上面四处**都已清理（逐个点名，见 `REMOVED_TOOLS`） |
 | README「验证脚本」表 | 与 `devtools/verify_*.py` **双向完全一致** |
+| **所有 `*.md`**（排除 `agent_logs/`）提到已删工具时 | 同一行必须能看出「它已经没了」；否则 Agent 会照着去调 |
+
+最后一行是 P1-3b 那轮补的：前七处只管「README 表 / docstring / instructions /
+SKILL.md」，而 `docs/项目梳理与优化建议.md` 长期写着「全部工具清单（41 个）」、
+§三 的工作流还让 Agent 去调**已删除**的 `detect_games()` —— 没有任何检查覆盖 `docs/`。
+所以规则放宽到「提到可以，但必须同行标注」，并且扫描脚本自己要有
+**非空转保证**（确认这些名字确实还在文档里被提到、确认扫到了文件），
+否则「没有未标注的提及」可能只是因为扫了个空集合。
 
 **工具的语义标注**另由 `python devtools/verify_tool_annotations.py` 校验
 （4 个语义位必须显式有值、分组双向一致、只读 ⇒ 不破坏不副作用）。
 
-最后一行不属于「工具」，但属于同一类问题：**手工维护的清单必然漂移**，
-所以一并卡住（README 曾写「10 个可复现的验证脚本」而实际已有 20 多个）。
+**「README 验证脚本表」那一行不属于「工具」，但属于同一类问题**：
+**手工维护的清单必然漂移**，所以一并卡住
+（README 曾写「10 个可复现的验证脚本」而实际已有 20 多个）。
 
 不一致时返回非零退出码，是判断「文档是否实时更新」的唯一依据。
 
