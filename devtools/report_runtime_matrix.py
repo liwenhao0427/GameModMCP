@@ -14,10 +14,10 @@
     ② 静态查询全家桶（search_* / class_detail / class_hierarchy /
        find_derived_classes / analyze_dependency / list_images /
        read_query_result / decompile / get_diagnostics）
-    ③ launch_game          启动并注入探针（Mono 会在这里如实失败）
+    ③ launch_game          启动并注入探针（IL2CPP 与 Mono 都会真的就绪）
     ④ runtime_info         静态/运行时映像数对账
-    ⑤ runtime_class_info   真实字段偏移 + 方法 RVA
-    ⑥ find_hook_target     拿真实 RVA + token 对账
+    ⑤ runtime_class_info   真实字段偏移 + 方法地址
+    ⑥ find_hook_target     拿真实地址 + token 对账
     ⑦ hook_method          装 Hook（含参数捕获）
     ⑧ 强制调用 → 事件      证明 Hook 真的生效、参数/返回值真的读对
     ⑨ hook_status / unhook / hook_address / drain_events
@@ -31,7 +31,7 @@
 tools/call）。直接 import 会绕过 JSON-RPC 序列化与工具注册，测不到那一段。
 
 **「不适用」与「失败」必须分开**：UE 游戏没有类型系统（`open_game` 不适用）、
-Mono 游戏没有运行时探针（`agent.js` 只认 IL2CPP），把它们算成「失败」是错的。
+`decompile` 在 IL2CPP 上没有托管元数据，把它们算成「失败」是错的。
 所以引擎范围外的工具记为 `skip` 并写出原因，**不冒充通过、也不冒充失败**。
 
 为什么是 report 而不是 verify
@@ -106,8 +106,11 @@ ALL_TOOLS: list[str] = [
 #: 所以记为「不适用」而不是「失败」—— 但要写清原因，不假装通过。
 UE_ONLY = ["ue_profile", "ue_list_entries", "ue_script_objects", "ue_manifest"]
 
-#: 依赖运行时探针（`agent.js`）的工具。`agent.js` 只认 IL2CPP，
-#: 所以 Mono 游戏在这批工具上**没有可用路径**（这是能力边界，不是 bug）。
+#: 依赖运行时探针（`agent.js`）的工具。
+#:
+#: 历史：`agent.js` 曾经只认 IL2CPP，于是 Mono 游戏在这批工具上「没有可用路径」，
+#: 本报告把它们记为「不适用」。**探针补上 Mono 后端之后这条边界不存在了** ——
+#: Mono 游戏现在真的会走完这批工具，结果如何由实测决定，不再预先跳过。
 RUNTIME_TOOLS = [
     "inject_process", "launch_game", "runtime_info", "runtime_class_info",
     "find_hook_target", "hook_method", "hook_address", "unhook", "hook_status",
@@ -254,6 +257,39 @@ class Probe:
         """记一条不属于某个工具的观测（例如「静态 token 对账一致」）。"""
         self.rec.setdefault("notes", {})[key] = value
 
+    @staticmethod
+    def _detail_of(res: dict) -> dict:
+        d = res.get("detail")
+        return d if isinstance(d, dict) else {}
+
+    @classmethod
+    def _is_ambiguous(cls, res: dict) -> bool:
+        """工具是否**按设计拒绝**了歧义。
+
+        为什么两处都看：`runtime_class_info` 的歧义标记在 `detail.ambiguous`
+        （探针侧 `fail(msg, extra)` 把附加字段放进了 `detail`），
+        但历史上顶层也放过同名标记。只看一层就会把「按设计拒绝」
+        误判成「未找到」—— 实测 Sephiria 就这么被记成了「未找到」，
+        而真实原因是 `Transform` 短名命中 2 个同名类（工具行为正确）。
+        """
+        return bool(res.get("ambiguous") or cls._detail_of(res).get("ambiguous"))
+
+    @classmethod
+    def _candidate_count(cls, res: dict) -> int:
+        n = res.get("candidate_count")
+        if isinstance(n, int):
+            return n
+        cands = cls._detail_of(res).get("candidates")
+        return len(cands) if isinstance(cands, list) else 0
+
+    @classmethod
+    def _candidate_names(cls, res: dict) -> list[str]:
+        out: list[str] = []
+        for c in (cls._detail_of(res).get("candidates") or []):
+            if isinstance(c, dict):
+                out.append(str(c.get("full_name") or c.get("klass") or "?"))
+        return out[:6]
+
     def _drain_until(self, hook_id: str, phase: str, wait: float,
                      timeout: float = 30.0) -> list[dict]:
         """反复 drain 直到出现某个 hook 的某阶段事件，或超时。"""
@@ -392,6 +428,7 @@ class Probe:
         self.rec["pid"] = self.pid
         init = lg.get("init") or {}
         self.rec["init"] = {
+            "engine": init.get("engine"),
             "module": init.get("module"),
             "base": init.get("base"),
             # api_available 是**计数**（int），不是列表 —— 早期版本这里写成
@@ -402,9 +439,10 @@ class Probe:
             "waited": init.get("waited"),
         }
         if not init.get("module"):
-            # Mono 走到这里：进程起来了、探针也注入了，但**没有 IL2CPP 运行时**
-            # （`agent.js` 只认 IL2CPP），所以后面那批工具没有可用路径。
-            return ("注入成功但 IL2CPP 运行时不存在（Mono/非 IL2CPP 引擎没有"
+            # 走到这里说明进程起来了、探针也注入了，但**两个后端都没认出来**：
+            # 既没有 IL2CPP 模块也没有 Mono 模块（原生/UE 游戏就属于这种），
+            # 所以后面那批运行时工具确实没有可用路径。
+            return ("注入成功但没找到托管运行时模块（非 IL2CPP/Mono 游戏没有"
                     f"探针路径）：{str(init.get('error'))[:160]}")
         ri = self.call("runtime_info", {})
         self.rec["images"] = {
@@ -422,7 +460,8 @@ class Probe:
     def stage_hook_core(self) -> None:
         """Time.get_frameCount：静态 token ↔ 运行时 token 对账 + 强制调用。"""
         cd = self.call("class_detail", {"full_name": "UnityEngine.Time",
-                                        "method_name": "get_frameCount"})
+                                        "method_name": "get_frameCount"},
+                       record=False)
         static_tok = ""
         for m in (cd.get("methods") or []):
             if m.get("name") == "get_frameCount":
@@ -452,10 +491,11 @@ class Probe:
         short_probe = self.call("runtime_class_info", {"name": "Transform"})
         if short_probe.get("ok"):
             self.note("runtime_class_info_short_name", "ok")
-        elif short_probe.get("ambiguous"):
+        elif self._is_ambiguous(short_probe):
             self.note("runtime_class_info_short_name",
-                      f"歧义({short_probe.get('candidate_count')}) —— 按设计拒绝，"
-                      f"改传完整名")
+                      f"歧义({self._candidate_count(short_probe)}) —— 按设计拒绝，"
+                      f"改传完整名；候选="
+                      f"{','.join(self._candidate_names(short_probe))}")
         else:
             self.note("runtime_class_info_short_name",
                       f"未找到：{str(short_probe.get('error'))[:60]}")
@@ -516,12 +556,19 @@ class Probe:
     def stage_float(self) -> None:
         """浮点参数 + 浮点返回值：一次覆盖两条 XMM 路径。"""
         for cls, meth, ptypes, argv, want in FLOAT_TARGETS:
+            # `record=False`：这一步是**探路**（想从静态元数据里拿 float 方法的
+            # token）。Mono 的静态索引默认只收游戏自己的程序集，查
+            # `UnityEngine.*` 必然「未找到类」—— 那是索引范围的事实，不是
+            # `class_detail` 坏了（`stage_static` 已用游戏自己的类证明它能用）。
+            # 照原样记录会让每个 Mono 游戏多一条假 ❌。
             cd = self.call("class_detail", {"full_name": f"UnityEngine.{cls}",
-                                            "method_name": meth})
+                                            "method_name": meth}, record=False)
             ovl = [m for m in (cd.get("methods") or [])
                    if m.get("name") == meth
                    and int(m.get("parameter_count") or 0) == len(ptypes)]
             if not ovl:
+                self.note("float_skip", f"静态元数据里没有 UnityEngine.{cls}.{meth}"
+                                        f"（{str(cd.get('error'))[:50]}）")
                 continue
             tok = str(ovl[0].get("token") or "")
             spec = ",".join(ptypes)
@@ -599,12 +646,41 @@ class Probe:
         self.call("gc_control", {"disable": True})
         self.call("gc_control", {"disable": False})
 
+    def _instance_method_exists(self, cls: str, meth: str) -> bool:
+        """`UnityEngine.<cls>.<meth>` 存不存在。
+
+        为什么要问两遍：Mono 的静态索引只覆盖游戏自己的程序集，
+        `class_detail("UnityEngine.Object")` 必然「未找到类」（实测 4/4）。
+        以前这里只看静态结果，于是 Mono 上整条「实例方法 → this → 读字段」
+        链路**根本没跑**，`read_field_value` 在报告里既不是通过也不是失败，
+        而报告把「没跑到」算成了失败（见 §0）。运行时探针两边都能查，
+        所以静态查不到时改问运行时 —— 这不是降级，是 Mono 上的正常路径。
+        """
+        cd = self.call("class_detail", {"full_name": f"UnityEngine.{cls}",
+                                        "method_name": meth}, record=False)
+        if any(m.get("name") == meth for m in (cd.get("methods") or [])):
+            return True
+        ri = self.call("runtime_class_info", {"name": cls,
+                                              "namespace": "UnityEngine",
+                                              "method_filter": meth})
+        return any(m.get("name") == meth for m in (ri.get("methods") or []))
+
+    def _instance_field_names(self, cls: str) -> list[str]:
+        """实例字段名列表（静态查不到就改问运行时，理由同上）。"""
+        cd = self.call("class_detail", {"full_name": f"UnityEngine.{cls}"},
+                       record=False)
+        names = [f.get("name") for f in (cd.get("fields") or []) if f.get("name")]
+        if names:
+            return names
+        ri = self.call("runtime_class_info", {"name": cls,
+                                              "namespace": "UnityEngine"})
+        return [f.get("name") for f in (ri.get("fields") or [])
+                if f.get("name") and not f.get("is_static")]
+
     def stage_this(self) -> None:
         """实例方法 → `this` 指针 → read_field_value（Mod 最常用的一条链）。"""
         for cls, meth in INSTANCE_TARGETS:
-            cd = self.call("class_detail", {"full_name": f"UnityEngine.{cls}",
-                                            "method_name": meth})
-            if not (cd.get("methods") or []):
+            if not self._instance_method_exists(cls, meth):
                 continue
             hm = self.call("hook_method", {
                 "name": cls, "method": meth, "namespace": "UnityEngine",
@@ -621,13 +697,12 @@ class Probe:
             if not this_ptr:
                 continue
             # 拿这个指针读一个实例字段：指针若不是真对象，这里必然失败
-            obj_cd = self.call("class_detail", {"full_name": f"UnityEngine.{cls}"})
-            for f in (obj_cd.get("fields") or [])[:3]:
+            for fname in self._instance_field_names(cls)[:3]:
                 rv = self.call("read_field_value", {
                     "instance": this_ptr, "name": cls,
-                    "field": f.get("name"), "namespace": "UnityEngine"})
+                    "field": fname, "namespace": "UnityEngine"})
                 if rv.get("ok"):
-                    self.note("field_read", f"{f.get('name')}="
+                    self.note("field_read", f"{fname}="
                               f"{rv.get('raw_hex')}（宽度 {rv.get('read_width')}）")
                     break
             return
@@ -875,6 +950,11 @@ def _mark(cell: dict | None) -> str:
 REFUSAL_RULES = [
     ("decompile", "不是 .NET 程序集",
      "IL2CPP 没有托管元数据（`decompile` 只支持 Mono/.NET）"),
+    # Mono 的运行时**没有** mono_gc_disable / mono_gc_enable 导出（实测四个样本
+    # 的 mono-2.0-bdwgc.dll 导出表里都没有），所以 `gc_control` 只能明确拒绝。
+    # 这是探针如实报告能力缺失，不是工具坏了 —— 记成「不适用」并保留原文。
+    ("gc_control", "没有 mono_gc_disable",
+     "本版 Mono 运行时缺 mono_gc_disable / mono_gc_enable 导出（能力缺失，如实拒绝）"),
 ]
 
 
@@ -905,8 +985,8 @@ def _short_reason(why: str, limit: int = 48) -> str:
 
     表格里塞进一条 140 字符、还带着绝对路径的理由，读者只会跳过去。
     """
-    if why.startswith("注入成功但 IL2CPP 运行时不存在"):
-        return "Mono/非 IL2CPP 引擎没有探针路径（详见 §5）"
+    if why.startswith("注入成功但没找到托管运行时模块"):
+        return "非 IL2CPP/Mono 游戏没有探针路径（详见 §5）"
     if why.startswith("不适用（UE 无类型系统"):
         return "UE 无类型系统，走容器/清单（详见 §5）"
     if why.startswith("IL2CPP 没有托管元数据"):
@@ -930,7 +1010,8 @@ def write_markdown(out: dict, path: Path) -> None:
     lines.append("> 本文件由脚本生成，数字全部是跑出来的。图例："
                  "`✅` 工具返回 `ok:true`；`❌` 返回 `ok:false` 或调用异常；"
                  "`▫️` **不适用**（该引擎没有这条路径，例如 UE 没有类型系统、"
-                 "Mono 没有运行时探针）——「不适用」既不算通过也不算失败；"
+                 "`decompile` 在 IL2CPP 上无托管元数据）"
+                 "——「不适用」既不算通过也不算失败；"
                  "`⬜` 没跑到。")
     lines.append("")
 
@@ -950,13 +1031,20 @@ def write_markdown(out: dict, path: Path) -> None:
                          f"多 {out.get('tools_extra')}）"))
     lines.append("")
 
-    def _count(eng: str, tool: str) -> tuple[int, int, int]:
+    def _count(eng: str, tool: str) -> tuple[int, int, int, int]:
+        """(通过, 不适用, 没跑到, 失败)。
+
+        「没跑到」必须与「失败」分开：以前这里用 `总数 - 通过 - 不适用`
+        当失败数，于是**任何没被触发的工具都被算成失败**。实测 Mono 上
+        `read_field_value` 因为静态索引查不到 `UnityEngine.Object` 而整条链路
+        没跑（单元格根本不存在），报告却在结论里写「❌4 ← 有游戏失败」，
+        而同一份报告的「问题汇总」章节写着「没有任何工具返回失败」——
+        两节自相矛盾，且矛盾的那一侧把锅扣给了工具。
+        """
         group = by_eng.get(eng) or []
-        ok = sum(1 for r in group
-                 if _mark((r.get("cells") or {}).get(tool)) == "✅")
-        skip = sum(1 for r in group
-                   if _mark((r.get("cells") or {}).get(tool)) == "▫️")
-        return ok, skip, len(group) - ok - skip
+        marks = [_mark((r.get("cells") or {}).get(tool)) for r in group]
+        return (marks.count("✅"), marks.count("▫️"),
+                marks.count("⬜"), marks.count("❌"))
 
     for eng, label in (("il2cpp", "IL2CPP（Unity AOT）"),
                        ("mono", "Mono（Unity 托管）"),
@@ -970,14 +1058,17 @@ def write_markdown(out: dict, path: Path) -> None:
         for tool in ("open_game", "search_classes", "class_detail",
                      "decompile", "launch_game", "runtime_info",
                      "hook_method", "read_field_value", "ue_profile"):
-            ok, skip, bad = _count(eng, tool)
-            if ok == 0 and skip == 0 and bad == 0:
+            ok, skip, notrun, bad = _count(eng, tool)
+            if ok == 0 and skip == 0 and bad == 0 and notrun == 0:
                 continue
             if skip == len(group):
                 lines.append(f"  - `{tool}`：**不适用**（{skip}/{len(group)}）")
             elif bad:
-                lines.append(f"  - `{tool}`：✅{ok} / ▫️{skip} / ❌{bad}"
-                             + ("　← **有游戏失败**" if bad else ""))
+                lines.append(f"  - `{tool}`：✅{ok} / ▫️{skip} / ⬜{notrun} / ❌{bad}"
+                             "　← **有游戏失败**")
+            elif notrun:
+                lines.append(f"  - `{tool}`：✅{ok} / ▫️{skip} / ⬜{notrun}"
+                             "　（没跑到，不算失败）")
             else:
                 lines.append(f"  - `{tool}`：✅{ok}/{len(group)} 全部可用")
     lines.append("")
@@ -1181,9 +1272,12 @@ def write_markdown(out: dict, path: Path) -> None:
                  "（产品路径用 `pipe`、`inherit` 会泄漏标记、4 MB 洪水不卡死） |")
     lines.append("| Mono 游戏 `launch_game` 每次都要**白等满 60 秒**"
                  "（实测 4 个样本各 62 秒）才如实返回「没有 IL2CPP 运行时」 | "
-                 "等就绪的预算写死 60 秒，而 Mono/UE 游戏永远不会有 "
-                 "`GameAssembly.dll` | 预算按引擎给：IL2CPP 60 秒，其余 2 秒"
-                 "（`state.ready_timeout_for`） | `verify_runtime_target.py` §8"
+                 "等就绪的预算写死 60 秒，而当时 Mono **没有探针路径**"
+                 "（`agent.js` 只认 IL2CPP），等下去永远不会就绪 | "
+                 "预算按引擎给（`state.ready_timeout_for`）：有托管运行时探针的引擎"
+                 "（IL2CPP / Mono）60 秒，其余（UE/原生）2 秒。"
+                 "探针补上 Mono 后端之后，Mono 的 60 秒是**真的会就绪**，不再空转 | "
+                 "`verify_runtime_target.py` §8"
                  "（纯函数 + 端到端确认传下去的 timeout 真的是 2.0/60.0） |")
     lines.append("")
     lines.append("> 反面教材（这一轮踩到的）：第一版修复曾让探针在"
