@@ -719,7 +719,7 @@ class Index:
 
         # P1-3：句柄登记「原始行 + 解析函数」，不提前把 2 万行全解析成 dict。
         # 这里原来对全部 rows 调一次 _row_to_type（只为了塞进句柄），
-        # 同时又对 page 调一次 —— 前者在 width 查询里占 41%。
+        # 同时又对 page 调一次 —— 前者在宽查询里占 45%。
         source = _RowSource(rows, self._row_to_type)
         qr = self.results.put("classes", source)
         items = source.slice(offset, limit)

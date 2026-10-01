@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import io
 import sqlite3
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -191,13 +192,44 @@ def bench_query(label: str, mpath: Path) -> None:
     print("-" * 76)
     print(f"[P1-4] 继承过滤成本  ——  {label}")
     print("-" * 76)
-    plain, a = best(lambda: idx.search_classes("", limit=20))
-    sub, b = best(lambda: idx.search_classes(
-        "", limit=20, subtype_of="UnityEngine.MonoBehaviour"))
-    print(f"  pattern=''                 {plain:9.1f} ms  命中 {a['total']:,}")
-    print(f"  pattern='' + subtype_of    {sub:9.1f} ms  命中 {b['total']:,}")
-    print(f"  → 继承过滤净增 {sub - plain:+.1f} ms"
-          f"（文档 §4.8 称「秒级」，此处以实测为准）")
+    # 这里**故意不用 `best()`**：`best()` 取 N 次最小值，适合量「单条路径的
+    # 最优成本」，但不适合量「两条路径之间的微小差值」——取最小值等于专挑
+    # 噪声里最有利的那一次，符号都能翻。实测踩过：同一个查询两次跑分别得到
+    # −4.9 ms 与 +14.7 ms，于是文档先写成「秒级」、又错改成「甚至为负」。
+    # 所以改成跑多轮、打印**分布**（最小/中位/最大），让开销的大小与抖动
+    # 一起暴露出来。
+    ROUNDS = 12
+    ps: list[float] = []
+    ss: list[float] = []
+    a = b = None
+    for _ in range(ROUNDS):
+        t0 = time.perf_counter()
+        a = idx.search_classes("", limit=20)
+        ps.append((time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
+        b = idx.search_classes("", limit=20,
+                               subtype_of="UnityEngine.MonoBehaviour")
+        ss.append((time.perf_counter() - t0) * 1000)
+    ds = [s - p for p, s in zip(ps, ss)]
+    lab1 = "pattern=''"
+    lab2 = "pattern='' + subtype_of"
+    lab3 = f"→ 净增（{ROUNDS} 轮）"
+    print(f"  {'':26}{'最小':>9}{'中位':>9}{'最大':>9}")
+    print(f"  {lab1:26}{min(ps):9.1f}{statistics.median(ps):9.1f}"
+          f"{max(ps):9.1f}   命中 {a['total']:,}")
+    print(f"  {lab2:26}{min(ss):9.1f}"
+          f"{statistics.median(ss):9.1f}{max(ss):9.1f}   命中 {b['total']:,}")
+    print(f"  {lab3:26}{min(ds):+9.1f}"
+          f"{statistics.median(ds):+9.1f}{max(ds):+9.1f}")
+    if min(ds) < 0 < max(ds):
+        sign = "有正有负 → 与噪声同量级，别报一个精确数字"
+    elif min(ds) > 0:
+        sign = "全为正 → 是真开销"
+    else:
+        sign = "全为负 → 过滤免费"
+    print(f"  → 符号：{sign}")
+    print(f"  → 抖动 {max(ds) - min(ds):.1f} ms（文档 §4.8 曾称「秒级」；"
+          f"但也不该只看一个数）")
 
     print("-" * 76)
     print(f"[参考] 各查询耗时（{REPEATS} 次取最小）  ——  {label}")
