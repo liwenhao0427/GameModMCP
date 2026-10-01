@@ -212,9 +212,9 @@ def main() -> int:
     reset()
 
     # ---------------------------------------------------------------- 8
-    show("8. spawn 后的就绪等待预算按引擎给（Mono 不许白等 60 秒）")
+    show("8. spawn 后的就绪等待预算按引擎给（有托管运行时探针的引擎才等）")
 
-    # 纯函数层：IL2CPP 才给 60 秒，其余 2 秒
+    # 纯函数层：IL2CPP 与 Mono 都给 60 秒（探针都有对应后端），其余 2 秒
     print(f"  ready_timeout_for('il2cpp')={S.ready_timeout_for('il2cpp')} "
           f"('IL2CPP')={S.ready_timeout_for('IL2CPP')} "
           f"('mono')={S.ready_timeout_for('mono')} "
@@ -225,13 +225,27 @@ def main() -> int:
     check("大小写不敏感（'IL2CPP' 也认）",
           S.ready_timeout_for("IL2CPP") == 60.0,
           str(S.ready_timeout_for("IL2CPP")))
-    check("mono → 2 秒（实测此前每个 Mono 样本白等 62 秒）",
-          S.ready_timeout_for("mono") == 2.0, str(S.ready_timeout_for("mono")))
-    check("ue → 2 秒", S.ready_timeout_for("ue") == 2.0,
+    # 订正：Mono 曾经是 2 秒，理由是「Mono 没有探针路径，等也白等」。
+    # 探针补上 Mono 后端之后这个理由不再成立 —— 等下去**真的会**就绪。
+    check("mono → 60 秒（探针有 Mono 后端，等下去真的会就绪）",
+          S.ready_timeout_for("mono") == 60.0, str(S.ready_timeout_for("mono")))
+    check("ue → 2 秒（UE 永远没有托管运行时模块，等满 60 秒纯空转）",
+          S.ready_timeout_for("ue") == 2.0,
           str(S.ready_timeout_for("ue")))
-    check("引擎未知 → 2 秒（不拿 60 秒赌它是 IL2CPP）",
+    check("引擎未知 → 2 秒（不拿 60 秒赌它是托管游戏）",
           S.ready_timeout_for("") == 2.0 and S.ready_timeout_for(None) == 2.0,
           f"{S.ready_timeout_for('')}/{S.ready_timeout_for(None)}")
+    # 提示语必须按引擎说，不能在 Mono 游戏上说「IL2CPP 未就绪」
+    print(f"  runtime_label: il2cpp={S.runtime_label('il2cpp')!r} "
+          f"mono={S.runtime_label('mono')!r} ue={S.runtime_label('ue')!r} "
+          f"None={S.runtime_label(None)!r}")
+    check("提示语按引擎给（Mono 不说 IL2CPP）",
+          S.runtime_label("mono") == "Mono" and S.runtime_label("il2cpp") == "IL2CPP",
+          f"{S.runtime_label('mono')}/{S.runtime_label('il2cpp')}")
+    check("非托管引擎的提示语不冒充某个具体引擎",
+          "IL2CPP" not in S.runtime_label("ue")
+          and "Mono" not in S.runtime_label("ue"),
+          S.runtime_label("ue"))
 
     # 端到端层：确认 ensure_runtime 真的把预算传下去了（不是写死 60 秒）
     seen: list[float] = []
@@ -244,7 +258,9 @@ def main() -> int:
 
     rt_mod.spawn_and_attach = lambda exe, **kw: TimeoutSpy(8888, spawned=True)
     try:
-        for eng, want in (("mono", 2.0), ("il2cpp", 60.0), ("ue", 2.0)):
+        # Mono 也走 60 秒：它的探针有运行时后端，等下去**真的会**就绪
+        # （曾经给 2 秒，理由是「Mono 没有运行时探针，等也白等」——该理由已不成立）。
+        for eng, want in (("mono", 60.0), ("il2cpp", 60.0), ("ue", 2.0)):
             reset()
             st.engine = eng
             res = S.ensure_runtime(spawn=True, launcher_exe="D:/fake/game.exe")

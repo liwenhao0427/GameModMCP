@@ -267,12 +267,18 @@ for label, path, eng in (("IL2CPP", IL2CPP_META, "il2cpp"),
     print(f"  [{label}] {cap['label']}")
     print(f"     字段类型精度: {cap['field_type_precision']}")
     print(f"     元数据含字段偏移: {cap['field_offset_in_metadata']}")
+    print(f"     元数据含方法地址: {cap['method_address_in_metadata']}")
     print(f"     元数据含 static:  {cap['field_is_static_available']}")
     check(f"{label} 能力声明含 engine/label", 
           bool(cap.get("engine") and cap.get("label")))
     check(f"{label} 明确指出字段偏移不在元数据里",
           cap.get("field_offset_in_metadata") is False,
           "两个引擎的字段偏移都必须靠运行时探针")
+    # 方法地址同理：静态元数据里只有 token。Mono 特别容易说反 ——
+    # 程序集里确实有 RVA 字段，但它指向 IL 字节码而非机器码。
+    check(f"{label} 明确指出方法地址不在元数据里",
+          cap.get("method_address_in_metadata") is False,
+          "只有 token，没有 RVA/绝对地址；Hook 落点必须靠运行时探针")
     idx.close()
 
 # IL2CPP 必须诚实说明「static 查不到」，否则 Agent 会把 None 当成 False

@@ -4,9 +4,17 @@
 本脚本用 Mono 的 Archon Soul，证明跨引擎这件事在**工具层**也成立，
 而不只是在 engine 层成立。
 
-注意：Mono 是 JIT 引擎，运行时 Hook 需要 mono_* API（本工具集
-静态部分完整支持；运行时部分以 get_diagnostics 报告为准）。
-因此本脚本重点验证**静态链路**：inspect_game → open_game → 查询。
+分工（P1 起 Mono 已有运行时探针，所以这里也覆盖运行时能力）：
+
+| 脚本 | 覆盖 |
+|---|---|
+| 本脚本 | 工具层在 Mono 上的**静态**链路 + 运行时能力位/接口 |
+| `verify_mono_runtime.py` | 探针的 Mono 后端：导出真值、真实偏移/地址、Hook 端到端 |
+
+注意：Mono 是 JIT 引擎 —— 方法地址必须靠 `mono_compile_method` 触发 JIT 后
+才能拿到，且 **JIT 代码不在 mono 模块内，因此没有有意义的 RVA**；
+`gc_control` 在本版 Mono 上如实报不支持（没有 `mono_gc_disable` 导出）。
+这些都是能力位/探针返回里如实声明的，不是「没实现」。
 """
 
 from __future__ import annotations
@@ -121,6 +129,27 @@ cap = idx.get("capabilities") or {}
 check("索引带能力声明", bool(cap), f"{cap.get('label')}")
 check("能力声明的引擎为 mono", cap.get("engine") == "mono",
       f"实际={cap.get('engine')}")
+
+# 能力位必须承认「偏移/地址都不在元数据里」——这是 AGENTS.md §1 的核心断言。
+# Mono 尤其容易说反：程序集里**有**方法的 RVA 字段，但它指向 IL 字节码、
+# 不是机器码，所以对 Hook 毫无用处。
+print(f"     method_address_in_metadata={cap.get('method_address_in_metadata')} "
+      f"field_offset_in_metadata={cap.get('field_offset_in_metadata')}")
+check("mono 能力位：方法地址不在元数据里",
+      cap.get("method_address_in_metadata") is False,
+      f"实际={cap.get('method_address_in_metadata')}")
+check("mono 能力位：字段偏移不在元数据里",
+      cap.get("field_offset_in_metadata") is False,
+      f"实际={cap.get('field_offset_in_metadata')}")
+_notes = " ".join(cap.get("notes") or [])
+check("能力说明点出了「元数据 RVA 指向 IL 字节码」",
+      "IL" in _notes and "字节码" in _notes, _notes[:110])
+check("能力说明点出了「JIT 代码不在 mono 模块内，拿不到有意义的 RVA」",
+      "JIT" in _notes and "RVA" in _notes, _notes[:160])
+
+# 注入前不许谎称有运行时
+check("未注入时 runtime_ready 为假", op.get("runtime_ready") in (False, None),
+      f"实际={op.get('runtime_ready')}")
 
 # 缓存复用
 t1 = time.time()

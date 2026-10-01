@@ -121,6 +121,36 @@ def find_mono_multi() -> Path | None:
                      marker=r"Kinny and the Cosmic Cauldron_Data/Managed/Assembly-CSharp.dll")
 
 
+#: 全部 Mono 样本：(目录名候选, 相对 marker)。
+#:
+#: 为什么集中列在这里：`agent.js` 的 Mono 后端里有多处「四个样本一致核实」的断言
+#: （哪些导出有、哪些没有），这些断言必须能被一条命令复验 —— 只测一个样本
+#: 支撑不起「四个样本一致」这句话。
+#:
+#: 后两个样本嵌在子目录里（`GambonanzaModDev/Gambonanza`、
+#: `Sephiria.v0.12.0/Sephiria.v0.12.0`），所以候选名里带分隔符 ——
+#: `_find_dir` 只做 `root / 名字` 的存在性判断，带分隔符是合法的。
+MONO_SAMPLE_NAMES: list[tuple[list[str], str]] = [
+    (["Archon Soul"], r"Archon Soul_Data/Managed/Assembly-CSharp.dll"),
+    (["Kinny and the Cosmic Cauldron"],
+     r"Kinny and the Cosmic Cauldron_Data/Managed/Assembly-CSharp.dll"),
+    (["GambonanzaModDev/Gambonanza", "Gambonanza"],
+     r"Gambonanza_Data/Managed/Assembly-CSharp.dll"),
+    (["Sephiria.v0.12.0/Sephiria.v0.12.0", "Sephiria.v0.12.0", "Sephiria"],
+     r"Sephiria_Data/Managed/Assembly-CSharp.dll"),
+]
+
+
+def mono_games() -> list[Path]:
+    """全部可用的 Mono 样本目录（取不到的自动跳过，不做递归扫描）。"""
+    out: list[Path] = []
+    for names, marker in MONO_SAMPLE_NAMES:
+        d = _find_dir(names, marker=marker)
+        if d is not None:
+            out.append(d)
+    return out
+
+
 def find_ue_pak_v12() -> Path | None:
     """UE 样本：CatapultHero（pak v12 / utoc v8）。"""
     return _find_dir(["CatapultHero"], marker="Manifest_UFSFiles_Win64.txt")

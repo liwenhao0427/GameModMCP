@@ -231,6 +231,11 @@ def capabilities_of(engine: str) -> dict:
             "field_type_precision": "启发式（约 90% 可解，其余需运行时确认）",
             "field_is_static_available": False,
             "method_address_in_metadata": False,
+            # IL2CPP 的映像在进程启动时就全都在了，没有「等程序集加载」这件事。
+            "lazy_assemblies": False,
+            # IL2CPP 的 global-metadata.dat 里含引擎自己的类型，
+            # 所以 `UnityEngine.*` 静态也能查到。
+            "static_index_covers_frameworks": True,
             "notes": [
                 "字段偏移与方法地址都必须通过运行时探针获取",
                 "字段记录无 flags 槽，无法从元数据判断 static",
@@ -243,11 +248,35 @@ def capabilities_of(engine: str) -> dict:
         "field_offset_in_metadata": False,
         "field_type_precision": "精确（标准 ECMA-335 签名，含数组/泛型）",
         "field_is_static_available": True,
-        "method_address_in_metadata": True,
+        # 订正：Mono 程序集的 MethodDef 表里**确实**有 RVA，但它指向 IL 字节码，
+        # 不是可 Hook 的机器码（Mono 是 JIT，代码地址要运行时
+        # `mono_compile_method` 才拿得到，且**不在 mono 模块内**）。
+        # 这个能力位的语义是「能不能只靠元数据得到 Hook 落点」—— 答案是**不能**，
+        # 所以必须是 False（曾经写成 True，与 §1 的核心断言直接矛盾）。
+        "method_address_in_metadata": False,
+        # 实测（Archon Soul）：注入后 0.5 秒时只有 13 个程序集，游戏起来后是 164 个。
+        # 在这中间去 Hook/调用托管方法**会把游戏打崩**（矩阵实测：Archon Soul
+        # 在 13 个程序集时被 Hook 并强制调用 get_frameCount，进程随后消失）。
+        # 所以注入之后必须等程序集加载稳定再返回，见 engine/state.py 的
+        # `_settle_assemblies`。
+        "lazy_assemblies": True,
+        # 静态索引只收游戏自己的程序集（Assembly-CSharp.dll），
+        # `UnityEngine.*` 静态查不到（实测 4/4 样本）；这个位用来决定
+        # 「未找到类」时要不要把这句话告诉调用方。详见下面 notes。
+        "static_index_covers_frameworks": False,
         "notes": [
             "字段类型从 #Blob 签名精确解出",
-            "方法有 RVA（Mono 是 JIT，RVA 指向 IL，不是机器码）",
+            "方法地址必须通过运行时探针获取（mono_compile_method 触发 JIT 后的机器码地址）",
+            "元数据里的 RVA 指向 IL 字节码，不是机器码，不能用来 Hook",
+            "JIT 代码不在 mono 模块内，所以运行时也拿不到有意义的 RVA（只有绝对地址）",
             "可直接用 ILSpy/dnSpy 反编译拿到接近源码的 C#",
+            # 实测（4 个 Mono 样本）：静态索引默认只收游戏自己的程序集
+            # （Assembly-CSharp.dll，1,387 类型），`UnityEngine.*` 静态查不到 ——
+            # 这不是工具坏了，是没索引那份 dll。要查就得用运行时探针。
+            "静态索引默认只覆盖游戏自己的程序集（Assembly-CSharp.dll）；"
+            "UnityEngine.* 等框架类型静态查不到，要用运行时探针（runtime_class_info）",
+            "程序集是懒加载的：刚注入时只有十几个，游戏起来后可达 160+；"
+            "注入后会自动等它加载稳定再返回",
         ],
     }
 

@@ -2,24 +2,31 @@
 /**
  * GameMod MCP —— 游戏内运行时探针（注入脚本）
  * ============================================================================
- * 职责：在目标进程内部解析 il2cpp 导出符号，把「静态元数据」与「运行时实况」
+ * 职责：在目标进程内部解析**引擎的**导出符号，把「静态元数据」与「运行时实况」
  *       对上：
  *         · 字段的真实运行时偏移（静态元数据里没有，泛型实例化后才确定）
- *         · 方法的真实代码地址 → 换算成 RVA → 这就是 Hook 落点
+ *         · 方法的真实代码地址 → 这就是 Hook 落点
  *         · 类/方法/字段的运行时枚举与类型名
  *         · 内存读写、AOB 扫描、任意 JS 求值（兜底手段）
  *
+ * 支持两个后端，共用同一套 rpc.exports（宿主不需要知道底下是哪个）：
+ *   · IL2CPP —— GameAssembly.dll / libil2cpp.so，走官方 il2cpp-api.h
+ *   · Mono   —— mono-2.0-bdwgc.dll 等，走 Mono 的 embedding API
+ * 两个后端的差异**只体现在本文件的两段后端实现里**，RPC 层只调 BE.*。
+ *
  * 设计原则（与 AiMod 的「元数据优先」一致）：
- *   1. 优先走官方 il2cpp_api.h 导出的稳定接口，不硬编码 Il2CppClass 内部布局。
- *      内部布局随 Unity 版本变化，硬编码是崩溃与错值的根源。
- *      仅在导出缺失时才回退到读结构体，并**明确标注回退已启用**。
+ *   1. 优先走引擎官方导出的稳定接口，不硬编码内部结构体布局。
+ *      内部布局随版本变化，硬编码是崩溃与错值的根源。
  *   2. 任何一步失败都返回结构化错误，绝不返回看似成功的假数据。
  *   3. 所有对外返回的值必须是可 JSON 序列化的。
  *
  * 未经验证的部分（诚实声明）：
- *   · 本脚本的导出符号名取自 Unity 官方 il2cpp-api.h；不同 Unity 版本可能
+ *   · IL2CPP 的导出符号名取自 Unity 官方 il2cpp-api.h；不同 Unity 版本可能
  *     缺少部分导出（例如 il2cpp_field_get_offset 在个别版本被内联）。
  *     脚本会如实报告哪些 API 可用，不使用不可用 API。
+ *   · Mono 后端所需的导出**逐个在四个 Mono 样本上核实过**（见 SKILL.md 的
+ *     引擎差异表）；本版 Mono 确实没有的导出（mono_method_get_param_count /
+ *     mono_gc_disable / mono_gc_enable）一律用替代路径或如实报不支持。
  *   · 回退路径（读 Il2CppClass / FieldInfo 结构体偏移）取自社区通用布局，
  *     **未经本项目地面真值验证**，仅在导出缺失时启用并会在结果里标注。
  * ============================================================================
@@ -122,9 +129,99 @@
     //   MethodInfo { Il2CppMethodPointer methodPointer; ... }
     var METHODINFO_POINTER_OFFSET = 0x00;
 
+    // 各平台 Mono 运行时模块名（Unity 的 MonoBleedingEdge/EmbedRuntime 下）
+    var MONO_MODULE_CANDIDATES = [
+        'mono-2.0-bdwgc.dll',
+        'mono-2.0-sgen.dll',
+        'mono.dll',
+        'libmonosgen-2.0.so',
+        'libmonobdwgc-2.0.so',
+        'libmono-2.0.so',
+        'libmonosgen-2.0.dylib'
+    ];
+
+    /**
+     * Mono embedding API 导出符号。
+     *
+     * 这份清单是**按能力逐个在四个 Mono 样本上核实过的**（不是照抄文档）：
+     * 缺失的那几个都有替代路径或明确不支持，见各处注释与 SKILL.md 的引擎差异表。
+     * 特别地：`mono_method_get_param_count` 在本版 Mono **不存在**，
+     * 参数个数一律走 mono_method_signature + mono_signature_get_param_count。
+     */
+    var MONO_API_NAMES = [
+        // 域 / 线程
+        'mono_get_root_domain',
+        'mono_domain_get',
+        'mono_thread_attach',
+        'mono_jit_thread_attach',
+        'mono_thread_detach',
+        // 程序集 / 映像
+        'mono_assembly_foreach',
+        'mono_domain_assembly_foreach',
+        'mono_assembly_get_image',
+        'mono_assembly_get_name',
+        'mono_image_loaded',
+        'mono_image_get_name',
+        'mono_image_get_filename',
+        'mono_image_get_table_rows',
+        'mono_image_is_dynamic',
+        // 按 TypeDef 行号取类（短名解析的兜底路径；Mono 没有 mono_image_get_class）
+        'mono_image_get_table_info',
+        'mono_table_info_get_rows',
+        // 类
+        'mono_class_from_name',
+        'mono_class_get',
+        'mono_class_get_name',
+        'mono_class_get_namespace',
+        'mono_class_get_parent',
+        'mono_class_get_nesting_type',
+        'mono_class_get_nested_types',
+        'mono_class_get_image',
+        'mono_class_get_flags',
+        'mono_class_get_type_token',
+        'mono_class_instance_size',
+        'mono_class_num_fields',
+        'mono_class_num_methods',
+        'mono_class_is_enum',
+        'mono_class_is_valuetype',
+        'mono_class_get_interfaces',
+        // 字段
+        'mono_class_get_fields',
+        'mono_class_get_field_from_name',
+        'mono_field_get_name',
+        'mono_field_get_offset',
+        'mono_field_get_type',
+        'mono_field_get_flags',
+        'mono_field_static_get_value',
+        'mono_field_get_value',
+        // 方法
+        'mono_class_get_methods',
+        'mono_class_get_method_from_name',
+        'mono_method_get_name',
+        'mono_method_get_token',
+        'mono_method_get_flags',
+        'mono_method_signature',
+        'mono_signature_get_param_count',
+        'mono_signature_get_return_type',
+        'mono_signature_is_instance',
+        'mono_method_get_class',
+        'mono_compile_method',
+        'mono_free_method',
+        // 类型 / 字符串
+        'mono_type_get_name',
+        'mono_string_to_utf8',
+        'mono_string_new',
+        'mono_free'
+    ];
+
+    // 回退：System.String 长度字段名（不同 Mono/CoreCLR 命名不同）
+    // 实测本版 Unity Mono 用 _stringLength；CoreCLR 用 m_stringLength。
+    // 所以**查出来**，不硬编码 —— 硬编码 m_stringLength 在这里直接给 NULL。
+    var MONO_STRING_LENGTH_FIELDS = ['_stringLength', 'm_stringLength', 'length'];
+
     // ---------------------------------------------------------------- 运行时状态
 
-    var mod = null;          // IL2CPP 运行时模块
+    var mod = null;          // 当前引擎的运行时模块
     var api = {};            // 已解析的导出（缺失为 null）
     var apiMissing = [];     // 缺失的导出名
     var funcs = {};          // NativeFunction 包装
@@ -135,6 +232,21 @@
     var hookCounts = {};     // hookId -> 已触发次数
     var gcDisabled = false;
     var attached = false;
+
+    // 后端（引擎实现）：RPC 层只调 BE.*，两个引擎的差异都收敛在下面两段实现里
+    var BE = null;
+
+    // Mono 后端状态
+    var monoMod = null;          // Mono 运行时模块
+    var monoFuncs = {};          // Mono NativeFunction 包装
+    var monoDomain = null;       // MonoDomain*
+    var monoImagesCache = null;  // [{name, class_count, image}]，**仅一次 RPC 内有效**
+    // 短名兜底索引：{key, rows:[{klass, image, name, namespace}]}，**仅一次 RPC 内有效**。
+    // 只在精确写法查不到时才建（一次约几万次 Mono 调用），所以不放进热路径。
+    var monoTypeIndexCache = null;
+    var monoKeep = [];           // 必须长期存活的 Frida 回调（被 GC 回收后再调用会崩）
+    var monoStringLayout = null; // {field, offset} —— 初始化时查出来，不硬编码
+    var monoTypeNameAllocates = null; // mono_type_get_name 是否堆分配（实测确认后决定是否 free）
 
     // ---------------------------------------------------------------- 基础工具
 
@@ -202,6 +314,20 @@
         } catch (e) {
             return null;
         }
+    }
+
+    /**
+     * 按**当前后端**解码托管字符串（Hook 事件里的 string 参数与 this_str 用它）。
+     *
+     * 两个引擎的字符串布局不同：IL2CPP 固定 0x10/0x14；
+     * Mono 的长度字段偏移要运行时查（本版 mscorlib 是 _stringLength @16）。
+     * 后端还没选定时退回 IL2CPP 布局（保持原有行为，不改变已通过验收的路径）。
+     */
+    function managedStringOf(p) {
+        if (BE) {
+            try { return BE.stringOf(p); } catch (e) { return null; }
+        }
+        return il2cppString(p);
     }
 
     /** 调 il2cpp_type_get_name，并释放返回的堆字符串（避免泄漏）。 */
@@ -282,21 +408,34 @@
         return parts.length ? parts.join('.') : null;
     }
 
-    /** 把绝对地址换算成「模块内 RVA + 十六进制」——Hook 落点就用这个。 */
+    /**
+     * 把绝对地址换算成「模块内 RVA + 十六进制」——Hook 落点就用这个。
+     *
+     * **只有地址真的落在当前模块内才给 RVA**。这一点在 Mono 上尤其重要：
+     * Mono 是 JIT，`mono_compile_method` 给出的机器码**不在 mono 模块内**
+     * （实测 in_module=false），此时 `addr - mod.base` 算出来的是个毫无意义的
+     * 大数（例如 0xb6b68000）。把它当 RVA 输出，Agent 就会拿它去和静态元数据
+     * 的 IL-RVA 对照 —— 那是假数据，比「没有 RVA」糟得多。
+     */
     function describeAddress(addr) {
         var q = ptr(addr);
         if (q.isNull()) { return null; }
         var out = { address: q.toString() };
         if (mod) {
-            var rva = q.sub(mod.base);
-            out.rva = rva.toString();
-            out.rva_hex = hex32(rva);
             out.module = mod.name;
+            out.in_module = isInModule(q);
+            if (out.in_module) {
+                var rva = q.sub(mod.base);
+                out.rva = rva.toString();
+                out.rva_hex = hex32(rva);
+            }
+        } else {
+            out.in_module = false;
         }
         return out;
     }
 
-    /** 判断地址是否落在 IL2CPP 运行时模块内（区分托管方法与 icall/转发桩）。 */
+    /** 判断地址是否落在当前运行时模块内（区分托管方法与 icall/转发桩/JIT 代码）。 */
     function isInModule(addr) {
         if (!mod) { return false; }
         var q = ptr(addr);
@@ -924,7 +1063,7 @@
                 case 'double':  throw new Error('浮点参数/返回值必须走 xmmValue');
                 case 'ptr':     return raw.toString();
                 case 'cstring': return cstr(raw);
-                case 'string':  return il2cppString(raw);
+                case 'string':  return managedStringOf(raw);
                 default:        return raw.toString();
             }
         } catch (e) {
@@ -963,7 +1102,7 @@
                     };
                     if (spec.this_type === 'string') {
                         var selfPtr = safeArg(args, 0);
-                        if (selfPtr !== null) { rec.this_str = il2cppString(selfPtr); }
+                        if (selfPtr !== null) { rec.this_str = managedStringOf(selfPtr); }
                     }
                     // 整型参数按 RCX/RDX/R8/R9 顺序取（`this` 占第一个），
                     // 浮点参数按 XMM0..3 顺序取 —— 两套计数器互不影响，
@@ -1054,6 +1193,1022 @@
 
     // ---------------------------------------------------------------- 导出接口
 
+    // ================================================================ 共用：带继承链的字段枚举
+
+    /**
+     * 沿父类链收集字段（IL2CPP 与 Mono 共用）。
+     *
+     * 为什么必须有这一层：**两个引擎的字段枚举 API 都只给本类自己声明的字段**。
+     * Mono 侧实测（Archon Soul / UnityEngine.Transform）：
+     *   Transform 自己 0 个字段、Component 0 个、Object 5 个（m_CachedPtr 在 Object 上）
+     * —— 于是 `runtime_class_info("Transform")` 返回 0 个字段。这不是工具坏了，
+     * 是 Unity 的字段本来就都在基类上。IL2CPP 侧同样只给本类字段，
+     * 这也是「字段偏移查不到」类反馈的同一个根因。
+     *
+     * 规则：
+     *   · 从最派生类往上走，最多 32 层（防元数据异常造成死循环）；
+     *   · 同名同静态性的字段**以最派生的那个为准**（C# 的隐藏语义）；
+     *   · 非本类声明的字段加 `inherited_from: <声明类全名>`，让调用方能分辨来源。
+     */
+    function fieldsWithInheritance(klass, wantStatic) {
+        var out = [];
+        var seen = {};
+        var cur = klass;
+        var depth = 0;
+        while (cur && !cur.isNull() && depth < 32) {
+            var own = [];
+            try { own = BE.fieldsOfOwn(cur, wantStatic) || []; } catch (e) { own = []; }
+            var owner = null;
+            try { owner = BE.fullNameOf(cur); } catch (e) { owner = null; }
+            for (var i = 0; i < own.length; i++) {
+                var rec = own[i];
+                var key = String(rec.name) + '|' + (rec.is_static === true ? 's' : 'i');
+                if (seen[key]) { continue; }
+                seen[key] = true;
+                if (depth > 0 && owner) { rec.inherited_from = owner; }
+                out.push(rec);
+            }
+            var par = null;
+            try { par = BE.parentOf(cur); } catch (e) { par = null; }
+            if (!par || par.isNull()) { break; }
+            cur = par;
+            depth++;
+        }
+        return out;
+    }
+
+    // ================================================================ Mono 后端
+    //
+    // 与 IL2CPP 后端的差别（每一条都是实测出来的，不是推测）：
+    //   · 就绪判断：mono_get_root_domain() 返回 NULL 就是没起来（比 IL2CPP 的野指针干净）
+    //   · 附线程：mono_thread_attach(domain) —— 四个样本上都可用；
+    //     代码里仍保留 mono_jit_thread_attach 作为备选
+    //   · Hook 落点：mono_compile_method() 触发 JIT 并给出**真实机器码地址**；
+    //     该地址**不在 mono 模块内**（实测 in_module=false），所以没有 RVA ——
+    //     结果里不输出 rva（输出一个相对模块的假 RVA 就是假数据）
+    //   · 抽象方法：mono_compile_method 返回 NULL（实测 System.IO.Stream.Read），
+    //     不崩 —— 如实记为「无代码地址」
+    //   · 参数个数：本版 Mono **没有** mono_method_get_param_count 导出，
+    //     统一走 mono_method_signature + mono_signature_get_param_count
+    //   · 嵌套类型：mono_class_from_name 认的是
+    //     (最外层命名空间, "Outer/Inner") 斜杠形式；点号形式一律查不到（实测四种写法）
+    //   · 字符串：System.String 的长度字段在本版 mscorlib 里叫 _stringLength
+    //     （不是 CoreCLR 的 m_stringLength，实测按名查 m_stringLength 给 NULL），
+    //     偏移在初始化时**查出来**，不硬编码
+    //   · GC 控制：本版 Mono 没有 mono_gc_disable / mono_gc_enable 导出（四个样本一致），
+    //     如实报「不支持」，不假装成功
+
+    // Mono 导出符号的签名表（只登记 MONO_API_NAMES 里用得到的）
+    //
+    // ⚠️ 数值返回统一按 'pointer' 读，调用方用 .toInt32()/.toUInt32() 取值。
+    //
+    // 为什么不用 Frida 的 'int'/'uint32'/'bool'：那三种返回类型给的是 **JS number**，
+    // 而 'pointer' 给的是 NativePointer —— 两种写法本身都对，但**混用就会炸**。
+    // 实测踩到的：表里写 'int'、调用方按 IL2CPP 的约定写 `.toInt32()`，
+    // 于是 `mono_field_get_offset(f).toInt32()` 抛
+    // `TypeError: not a function`（number 没有 toInt32），**初始化直接失败**；
+    // 更糟的是有 4 处调用点在 try/catch 里，会静默变成 null ——
+    // 表现成「字段偏移查不到」，而不是报错。
+    // 本文件 IL2CPP 侧历来就是 'pointer' + toInt32 的写法，Mono 侧跟它保持一致，
+    // 这样 12 个数值调用点无需各写一套。'pointer' 读的是整个 RAX，
+    // toInt32() 取低 32 位 —— 对 int/uint32/bool 返回都是正确的。
+    var MONO_SIGS = {
+        mono_get_root_domain: ['pointer', []],
+        mono_domain_get: ['pointer', []],
+        mono_thread_attach: ['pointer', ['pointer']],
+        mono_jit_thread_attach: ['pointer', ['pointer']],
+        mono_thread_detach: ['void', ['pointer']],
+        mono_assembly_foreach: ['void', ['pointer', 'pointer']],
+        mono_domain_assembly_foreach: ['void', ['pointer', 'pointer', 'pointer']],
+        mono_assembly_get_image: ['pointer', ['pointer']],
+        mono_assembly_get_name: ['pointer', ['pointer']],
+        mono_image_loaded: ['pointer', ['pointer']],
+        mono_image_get_name: ['pointer', ['pointer']],
+        mono_image_get_filename: ['pointer', ['pointer']],
+        mono_image_get_table_rows: ['pointer', ['pointer', 'int']],
+        mono_image_is_dynamic: ['pointer', ['pointer']],
+        // 注意第二个参数是 TypeDef token（guint32），按 uint32 传，
+        // 这样调用方可以直接给 JS 数字；'pointer' 参数则必须给 NativePointer。
+        mono_class_get: ['pointer', ['pointer', 'uint32']],
+        mono_image_get_table_info: ['pointer', ['pointer', 'int']],
+        mono_table_info_get_rows: ['pointer', ['pointer']],
+        mono_class_from_name: ['pointer', ['pointer', 'pointer', 'pointer']],
+        mono_class_get_name: ['pointer', ['pointer']],
+        mono_class_get_namespace: ['pointer', ['pointer']],
+        mono_class_get_parent: ['pointer', ['pointer']],
+        mono_class_get_nesting_type: ['pointer', ['pointer']],
+        mono_class_get_nested_types: ['pointer', ['pointer', 'pointer']],
+        mono_class_get_image: ['pointer', ['pointer']],
+        mono_class_get_flags: ['pointer', ['pointer']],
+        mono_class_get_type_token: ['pointer', ['pointer']],
+        mono_class_instance_size: ['pointer', ['pointer']],
+        mono_class_num_fields: ['pointer', ['pointer']],
+        mono_class_num_methods: ['pointer', ['pointer']],
+        mono_class_is_enum: ['pointer', ['pointer']],
+        mono_class_is_valuetype: ['pointer', ['pointer']],
+        mono_class_get_interfaces: ['pointer', ['pointer', 'pointer']],
+        mono_class_get_fields: ['pointer', ['pointer', 'pointer']],
+        mono_class_get_field_from_name: ['pointer', ['pointer', 'pointer']],
+        mono_field_get_name: ['pointer', ['pointer']],
+        mono_field_get_offset: ['pointer', ['pointer']],
+        mono_field_get_type: ['pointer', ['pointer']],
+        mono_field_get_flags: ['pointer', ['pointer']],
+        mono_field_static_get_value: ['void', ['pointer', 'pointer']],
+        mono_field_get_value: ['void', ['pointer', 'pointer', 'pointer']],
+        mono_class_get_methods: ['pointer', ['pointer', 'pointer']],
+        mono_class_get_method_from_name: ['pointer', ['pointer', 'pointer', 'int']],
+        mono_method_get_name: ['pointer', ['pointer']],
+        mono_method_get_token: ['pointer', ['pointer']],
+        mono_method_get_flags: ['pointer', ['pointer', 'pointer']],
+        mono_method_signature: ['pointer', ['pointer']],
+        mono_signature_get_param_count: ['pointer', ['pointer']],
+        mono_signature_get_return_type: ['pointer', ['pointer']],
+        mono_signature_is_instance: ['pointer', ['pointer']],
+        mono_method_get_class: ['pointer', ['pointer']],
+        mono_compile_method: ['pointer', ['pointer']],
+        mono_free_method: ['void', ['pointer']],
+        mono_type_get_name: ['pointer', ['pointer']],
+        mono_string_to_utf8: ['pointer', ['pointer']],
+        mono_string_new: ['pointer', ['pointer', 'pointer']],
+        mono_free: ['void', ['pointer']]
+    };
+
+    function monoResolveModule(preferredModule) {
+        var names = [];
+        if (preferredModule) { names.push(preferredModule); }
+        for (var i = 0; i < MONO_MODULE_CANDIDATES.length; i++) {
+            names.push(MONO_MODULE_CANDIDATES[i]);
+        }
+        for (var j = 0; j < names.length; j++) {
+            var m = Process.findModuleByName(names[j]);
+            if (m) { return m; }
+        }
+        return null;
+    }
+
+    /** 绑定 Mono 导出；返回缺失清单（不抛异常，缺谁报谁）。 */
+    function monoBind() {
+        var missing = [];
+        monoFuncs = {};
+        for (var i = 0; i < MONO_API_NAMES.length; i++) {
+            var name = MONO_API_NAMES[i];
+            var p = null;
+            try { p = monoMod.findExportByName(name); } catch (e) { p = null; }
+            if (!p) { missing.push(name); continue; }
+            var sig = MONO_SIGS[name];
+            if (!sig) {
+                // 有导出但没登记签名：不硬猜参数类型（猜错就是崩溃），如实记为不可用
+                missing.push(name + '(未登记签名)');
+                continue;
+            }
+            try {
+                monoFuncs[name] = new NativeFunction(p, sig[0], sig[1]);
+            } catch (e) {
+                missing.push(name + '(绑定失败：' + e.message + ')');
+            }
+        }
+        return missing;
+    }
+
+    /**
+     * 查出 System.String 的长度字段偏移（**不硬编码**）。
+     *
+     * 实测本版 Unity Mono 的字段名是 `_stringLength`（CoreCLR 是 `m_stringLength`，
+     * 按那个名字查直接返回 NULL）。不同 Mono 分支命名不同，所以：
+     * 先按候选名字查，都查不到就遍历字段找「名字含 stringLength 的 int 实例字段」。
+     */
+    function monoDiscoverStringLayout() {
+        if (!monoFuncs.mono_class_from_name || !monoFuncs.mono_image_loaded) { return null; }
+        var img = monoFuncs.mono_image_loaded(Memory.allocUtf8String('mscorlib'));
+        if (!img || img.isNull()) { return null; }
+        var klass = monoFuncs.mono_class_from_name(
+            img, Memory.allocUtf8String('System'), Memory.allocUtf8String('String'));
+        if (!klass || klass.isNull()) { return null; }
+
+        if (monoFuncs.mono_class_get_field_from_name && monoFuncs.mono_field_get_offset) {
+            for (var i = 0; i < MONO_STRING_LENGTH_FIELDS.length; i++) {
+                var f = null;
+                try {
+                    f = monoFuncs.mono_class_get_field_from_name(
+                        klass, Memory.allocUtf8String(MONO_STRING_LENGTH_FIELDS[i]));
+                } catch (e) { f = null; }
+                if (f && !f.isNull()) {
+                    return { field: MONO_STRING_LENGTH_FIELDS[i],
+                             offset: monoFuncs.mono_field_get_offset(f).toInt32(),
+                             via: 'mono_class_get_field_from_name' };
+                }
+            }
+        }
+        // 回退：遍历字段找名字里含 stringLength 的实例字段
+        // 注意守卫里**必须**包含 mono_field_get_offset：这一支会调它取偏移，
+        // 漏掉它就会出现「守卫通过、调用却 undefined」的 TypeError
+        // （实测踩过：主分支守卫里有、回退分支漏了）。
+        if (monoFuncs.mono_class_get_fields && monoFuncs.mono_field_get_name &&
+            monoFuncs.mono_field_get_offset) {
+            var iter = Memory.alloc(Process.pointerSize);
+            iter.writePointer(NULL);
+            var guard = 0;
+            for (;;) {
+                var fld = monoFuncs.mono_class_get_fields(klass, iter);
+                if (!fld || fld.isNull()) { break; }
+                if (++guard > 200) { break; }
+                var nm = cstr(monoFuncs.mono_field_get_name(fld)) || '';
+                if (nm.toLowerCase().indexOf('stringlength') >= 0) {
+                    return { field: nm,
+                             offset: monoFuncs.mono_field_get_offset(fld).toInt32(),
+                             via: '字段遍历（按名字匹配 stringLength）' };
+                }
+            }
+        }
+        return null;
+    }
+
+    function monoEnsureReady(preferredModule) {
+        monoMod = monoResolveModule(preferredModule);
+        if (!monoMod) {
+            return fail('未找到 Mono 运行时模块（尝试过：' +
+                        MONO_MODULE_CANDIDATES.join(' / ') + '）',
+                        { retryable: true, process: Process.id });
+        }
+        mod = monoMod;
+        var missing = monoBind();
+        apiMissing = missing;
+        fallbacks = [];
+
+        // 就绪判断：域指针为空 = Mono 还没初始化好。
+        // 这一步必须**先做**：没起来的域上调用任何 mono_* 都可能让游戏崩溃。
+        if (!monoFuncs.mono_get_root_domain) {
+            return fail('Mono 模块里没有 mono_get_root_domain 导出，无法确认运行时是否就绪',
+                        { module: monoMod.name });
+        }
+        var dom = null;
+        try { dom = monoFuncs.mono_get_root_domain(); } catch (e) { dom = null; }
+        if (!dom || dom.isNull()) {
+            return fail('Mono 运行时尚未初始化（mono_get_root_domain 返回 NULL），稍后重试即可',
+                        { module: monoMod.name, retryable: true });
+        }
+        monoDomain = dom;
+
+        // 附着当前线程。未附着的线程上调用 Mono 接口会让游戏崩溃，
+        // 所以附着失败一律拒绝继续（与 IL2CPP 侧同样的理由）。
+        try {
+            if (monoFuncs.mono_thread_attach) {
+                monoFuncs.mono_thread_attach(dom);
+            } else if (monoFuncs.mono_jit_thread_attach) {
+                fallbacks.push('mono_thread_attach 不可用，改用 mono_jit_thread_attach');
+                monoFuncs.mono_jit_thread_attach(dom);
+            } else {
+                return fail('Mono 模块里既没有 mono_thread_attach 也没有 ' +
+                            'mono_jit_thread_attach，无法把探针线程附着到 Mono 域',
+                            { module: monoMod.name });
+            }
+        } catch (e) {
+            return fail('无法把探针线程附着到 Mono 域：' + e.message +
+                        '。未附着的线程上调用 Mono 接口会让游戏崩溃，' +
+                        '因此这里拒绝继续（稍后重试通常就能成功）',
+                        { module: monoMod.name, domain: dom.toString(), retryable: true });
+        }
+
+        // 字符串布局：查出来（查不到就如实标注，字符串相关能力降级但不假成功）
+        //
+        // 这里**必须**包 try/catch：探测失败只是「字符串参数读不出来」这一项降级，
+        // 不该让整个 Mono 后端初始化失败。实测踩到的正是这个 ——
+        // 探测里一个 TypeError 让 init 直接红，于是 Mono 游戏**所有**运行时工具
+        // 全都不可用（本该只有字符串那一项降级）。
+        try {
+            monoStringLayout = monoDiscoverStringLayout();
+        } catch (e) {
+            monoStringLayout = null;
+            fallbacks.push('字符串布局探测抛异常：' + e.message);
+        }
+        if (!monoStringLayout) {
+            fallbacks.push('未能查出 System.String 的长度字段偏移，' +
+                           'hook 事件里的字符串参数与 this_str 会返回 null');
+        }
+
+        // mono_type_get_name 的返回值是否堆分配在不同 Mono 版本不一致，
+        // 直接 free 有崩游戏的风险 → 实测两次调用同一类型看指针是否相同，
+        // 相同说明是缓存/静态串（不能 free），不同说明是新分配（可 free）。
+        monoTypeNameAllocates = null;
+        if (monoFuncs.mono_type_get_name && monoFuncs.mono_class_from_name &&
+            monoFuncs.mono_image_loaded && monoFuncs.mono_string_to_utf8) {
+            try {
+                var timg = monoFuncs.mono_image_loaded(Memory.allocUtf8String('mscorlib'));
+                if (timg && !timg.isNull()) {
+                    var tcls = monoFuncs.mono_class_from_name(
+                        timg, Memory.allocUtf8String('System'),
+                        Memory.allocUtf8String('String'));
+                    if (tcls && !tcls.isNull() && monoFuncs.mono_class_get_fields) {
+                        var it = Memory.alloc(Process.pointerSize);
+                        it.writePointer(NULL);
+                        var f0 = monoFuncs.mono_class_get_fields(tcls, it);
+                        if (f0 && !f0.isNull() && monoFuncs.mono_field_get_type) {
+                            var ty = monoFuncs.mono_field_get_type(f0);
+                            var n1 = monoFuncs.mono_type_get_name(ty);
+                            var n2 = monoFuncs.mono_type_get_name(ty);
+                            monoTypeNameAllocates = (n1.toString() !== n2.toString());
+                        }
+                    }
+                }
+            } catch (e) { monoTypeNameAllocates = null; }
+        }
+        if (monoTypeNameAllocates === false) {
+            fallbacks.push('mono_type_get_name 返回的是缓存串（实测两次调用同址），' +
+                           '因此不释放，避免误 free 导致崩溃');
+        }
+
+        attached = true;
+        return {
+            ok: true,
+            engine: 'mono',
+            module: monoMod.name,
+            base: monoMod.base.toString(),
+            size: monoMod.size,
+            domain: dom.toString(),
+            api_available: Object.keys(monoFuncs).length,
+            api_missing: missing,
+            fallbacks: fallbacks,
+            string_layout: monoStringLayout
+                ? { field: monoStringLayout.field, offset: monoStringLayout.offset,
+                    via: monoStringLayout.via }
+                : null
+        };
+    }
+
+    /**
+     * 枚举已加载的程序集（带 MonoImage* 指针，供类解析直接使用）。
+     *
+     * `monoImagesCache` 只在**一次 RPC 内**有效：RPC 入口统一清空（见文件末尾
+     * 的 exports 包装）。Mono 的程序集是懒加载的，跨 RPC 缓存会让后加载的
+     * `UnityEngine.*` 永远查不到，而报出来的错是「类不存在」。
+     */
+    function monoImages() {
+        if (monoImagesCache) { return monoImagesCache; }
+        if (!monoFuncs.mono_assembly_foreach || !monoFuncs.mono_assembly_get_image) {
+            return [];
+        }
+        var out = [];
+        var seenImg = {};    // 按 MonoImage* 去重
+        // 回调必须保持引用：NativeCallback 被 GC 回收后再被 C 侧调用会直接崩
+        var cb = new NativeCallback(function (asm, userData) {
+            try {
+                if (out.length > 5000) { return; }
+                var img = monoFuncs.mono_assembly_get_image(asm);
+                if (!img || img.isNull()) { return; }
+                var pk = img.toString();
+                if (seenImg[pk]) { return; }
+                seenImg[pk] = true;
+                var file = null;
+                if (monoFuncs.mono_image_get_filename) {
+                    try { file = cstr(monoFuncs.mono_image_get_filename(img)); }
+                    catch (e) { file = null; }
+                }
+                // 内存加载的程序集（Unity/BepInEx 常见）拿到的不是路径，而是
+                // `data-00000219A9D5A040` 这种合成名（内嵌映像指针）—— 实测。
+                // 那种东西当「路径」显示会误导人，所以只在看着像路径时才带上。
+                if (file && (/^data-/i.test(file) || !/[\\/]/.test(file))) {
+                    file = null;
+                }
+                var rec = { image: img,
+                            name: cstr(monoFuncs.mono_image_get_name(img)) };
+                if (file) { rec.file = file; }
+                if (monoFuncs.mono_image_get_table_rows) {
+                    // TypeDef 表（表号 2）的行数就是类数。
+                    // 实测与静态索引的类型数、微软 System.Reflection.Metadata 的真值三方一致。
+                    rec.class_count = monoFuncs.mono_image_get_table_rows(img, 2).toInt32();
+                }
+                out.push(rec);
+            } catch (e) { /* 单个程序集读失败不影响整体 */ }
+        }, 'void', ['pointer', 'pointer']);
+        monoKeep.push(cb);
+        try {
+            monoFuncs.mono_assembly_foreach(cb, ptr(0));
+        } catch (e) {
+            monoKeep.pop();
+            return [];
+        }
+        monoImagesCache = out;
+        return out;
+    }
+
+    function monoFindImages(name) {
+        var imgs = monoImages();
+        if (!name) { return imgs; }
+        var needle = String(name).toLowerCase();
+        var bare = needle.replace(/\.dll$/, '').replace(/\.exe$/, '');
+        var hits = [];
+        var i;
+        for (i = 0; i < imgs.length; i++) {
+            var n = (imgs[i].name || '').toLowerCase();
+            if (n === needle || n === bare) { hits.push(imgs[i]); }
+        }
+        if (!hits.length) {
+            // 退一步做子串匹配（与 IL2CPP 侧的 findImage 行为一致）
+            for (i = 0; i < imgs.length; i++) {
+                var m = (imgs[i].name || '').toLowerCase();
+                if (m.indexOf(bare) >= 0) { hits.push(imgs[i]); }
+            }
+        }
+        return hits;
+    }
+
+    /**
+     * 把「静态索引给的命名」映射成 mono_class_from_name 认的 (namespace, name) 形式。
+     *
+     * 实测（Archon Soul / FlyingWormConsole3.LiteNetLib.NetPeer.IncomingFragments）：
+     *   ✅ ("FlyingWormConsole3.LiteNetLib", "NetPeer/IncomingFragments")
+     *   ❌ ("",            "NetPeer/IncomingFragments")
+     *   ❌ ("",            "FlyingWormConsole3.LiteNetLib.NetPeer.IncomingFragments")
+     *   ❌ ("FlyingWormConsole3.LiteNetLib", "NetPeer.IncomingFragments")
+     *   ❌ ("FlyingWormConsole3.LiteNetLib", "IncomingFragments")
+     * 即：**命名空间给到最外层类型所在的命名空间，嵌套链用 / 连接**。
+     * 调用方可能给 (ns, 短名)、(ns, Outer.Inner) 或 (空, 完整点号名)，
+     * 所以这里穷举拆分点，谁命中算谁（命中多个类才报歧义）。
+     */
+    function monoNameForms(namespace, name) {
+        var out = [];
+        var seen = {};
+        function push(ns, nm) {
+            if (!nm) { return; }
+            var key = ns + '|' + nm;
+            if (seen[key]) { return; }
+            seen[key] = true;
+            out.push([ns, nm]);
+        }
+        var nm = String(name || '');
+        if (!nm) { return out; }
+        push(namespace || '', nm);
+        push(namespace || '', nm.replace(/\./g, '/'));
+        var dotted = (namespace ? namespace + '.' + nm : nm);
+        var parts = dotted.split('.');
+        for (var i = 1; i < parts.length; i++) {
+            push(parts.slice(0, i).join('.'), parts.slice(i).join('/'));
+        }
+        return out;
+    }
+
+    /**
+     * 按 TypeDef 行号枚举一个映像里的全部类，供**短名兜底**使用。
+     *
+     * 为什么需要它：IL2CPP 侧有全量类索引（`il2cpp_image_get_class_count` /
+     * `il2cpp_image_get_class`），所以 `runtime_class_info(name="Time")` 这种
+     * **不给命名空间**的用法能命中 `UnityEngine.Time`。Mono 没有
+     * `mono_image_get_class` 这类接口，于是短名解析一直缺失 ——
+     * 实测 `monoNameForms("", "Time")` 只生成 `("", "Time")`，
+     * 而类在 `UnityEngine.Time`，结果报「运行时没找到类 Time」，
+     * 与工具文档承诺的「不给命名空间也能按短名解析」不符（两个引擎不一致）。
+     *
+     * Mono 的可行路径是**按 TypeDef 行号取类**：
+     *   mono_image_get_table_info(image, 2)，2 即 MONO_TABLE_TYPEDEF
+     *     → mono_table_info_get_rows(info) 得到行数
+     *   → 第 i 行的 token 是 `0x02000000 | i`，交给 `mono_class_get` 拿到 MonoClass。
+     * 用 `mono_class_get` 而不是 `mono_class_get_full`：后者要多传一个 MonoError*
+     * 结构体，传 NULL 是否安全没有保证；前者只需要 (image, token)。
+     * 这三个导出在**四个 Mono 样本里都核实存在**（见 verify_mono_runtime.py §2）。
+     *
+     * 代价：一次全量扫描是几万次 Mono 调用（实测样本 TypeDef 行数合计约 2 万），
+     * 所以只在精确写法查不到时调用，且按 RPC 失效（懒加载会带来新类）。
+     */
+    function monoBuildTypeIndex(imageName) {
+        var key = String(imageName || '');
+        if (monoTypeIndexCache && monoTypeIndexCache.key === key) {
+            return monoTypeIndexCache.rows;
+        }
+        var rows = [];
+        if (!monoFuncs.mono_image_get_table_info || !monoFuncs.mono_table_info_get_rows ||
+            !monoFuncs.mono_class_get || !monoFuncs.mono_class_get_name) {
+            return rows;
+        }
+        var imgs = monoFindImages(imageName);
+        for (var i = 0; i < imgs.length; i++) {
+            var total = 0;
+            try {
+                var ti = monoFuncs.mono_image_get_table_info(imgs[i].image, 2);
+                if (!ti || ti.isNull()) { continue; }
+                total = monoFuncs.mono_table_info_get_rows(ti).toInt32();
+            } catch (e) { continue; }
+            for (var r = 1; r <= total; r++) {
+                var k = null;
+                try { k = monoFuncs.mono_class_get(imgs[i].image, 0x02000000 | r); }
+                catch (e) { continue; }
+                if (!k || k.isNull()) { continue; }
+                var nm = null;
+                try { nm = cstr(monoFuncs.mono_class_get_name(k)); } catch (e) { nm = null; }
+                if (!nm) { continue; }
+                var ns = '';
+                if (monoFuncs.mono_class_get_namespace) {
+                    try {
+                        ns = cstr(monoFuncs.mono_class_get_namespace(k)) || '';
+                    } catch (e) { ns = ''; }
+                }
+                rows.push({ klass: k, image: imgs[i], name: nm, namespace: ns });
+            }
+        }
+        monoTypeIndexCache = { key: key, rows: rows };
+        return rows;
+    }
+
+    /**
+     * 候选去重键：**程序集名** + 命名空间 + 短名。
+     *
+     * 为什么不用「程序集文件路径」：实测（Archon Soul，BepInEx 内存加载）
+     * `mono_image_get_filename` 返回的是 `data-00000219A9D5A040` 这种
+     * **合成名**（内嵌映像指针），不是路径 —— 按路径去重根本不会命中。
+     *
+     * 为什么需要去重：实测游戏运行约 90 秒后，`UnityEngine.Time` 会被枚举出
+     * **两条完全一样**的顶层记录：
+     *     UnityEngine.CoreModule TypeDef 行 740 token=0x20002e4
+     *     ns='UnityEngine' 顶层=True  klass=0x25ff6b54948
+     *     UnityEngine.CoreModule TypeDef 行 740 token=0x20002e4
+     *     ns='UnityEngine' 顶层=True  klass=0x25f920a9ab0
+     * 行号、token、命名空间、程序集名全都相同，只有 klass 指针不同 ——
+     * 即**同一个程序集被加载出了两个映像**（同一个 dll 加载两次）。
+     * 不去重的话，一次本可解析的查询会变成「命中 2 个同名类」，
+     * 而且调用方**无法消解**：两条的 image / namespace / full_name 都一模一样。
+     *
+     * 代价说清楚：两个**不同**程序集若恰好同名且含同名同命名空间的类，
+     * 会被合并成一条。实测没遇到过；而上面那种重复是实测到的真实情况，
+     * 且它导致的错误无法由调用方消解，所以选择合并（保留先枚举到的那条）。
+     */
+    function monoHitKey(imgRec, form) {
+        var n = (imgRec && imgRec.name) || '';
+        return String(n).toLowerCase() + '\u0000' + (form[0] || '') +
+               '\u0000' + (form[1] || '');
+    }
+
+    /** 解析类；返回 [{klass, image}]（可能多个 → 由调用方报歧义）。 */
+    function monoResolveClass(imageName, namespace, name) {
+        var imgs = monoFindImages(imageName);
+        var forms = monoNameForms(namespace, name);
+        var hits = [];
+        var seenPtr = {};
+        var seenDup = {};
+        for (var i = 0; i < imgs.length; i++) {
+            for (var j = 0; j < forms.length; j++) {
+                var k = null;
+                try {
+                    k = monoFuncs.mono_class_from_name(
+                        imgs[i].image,
+                        Memory.allocUtf8String(forms[j][0]),
+                        Memory.allocUtf8String(forms[j][1]));
+                } catch (e) { k = null; }
+                if (!k || k.isNull()) { continue; }
+                var key = k.toString();
+                if (seenPtr[key]) { continue; }   // 同一类被多种写法命中：只算一次
+                seenPtr[key] = true;
+                // 同一个程序集文件若被枚举出两个 MonoImage*，这里会拿到两个
+                // 不同的 klass 指针 → 上面那层挡不住 → 再用文件路径挡一次。
+                var dk = monoHitKey(imgs[i], forms[j]);
+                if (seenDup[dk]) { continue; }
+                seenDup[dk] = true;
+                hits.push({ klass: k, image: imgs[i], form: forms[j] });
+            }
+        }
+        if (hits.length) { return hits; }
+
+        // 精确写法一个都没命中 → 按短名全量扫描兜底。
+        // 只匹配**短名**（名字最后一个点号之后那段），命名空间给了就按它过滤。
+        // 这样 `runtime_class_info(name="Time")` 也能命中 `UnityEngine.Time`，
+        // 与 IL2CPP 侧的行为一致；命中多个同名类仍然报歧义，不替调用方猜。
+        var wantName = String(name || '');
+        if (!wantName) { return hits; }
+        var shortName = wantName.split('.').pop();
+        var wantNs = String(namespace || '');
+        // 工具文档承诺的是「按短名在**顶层类型**里解析」，所以只给短名时
+        // 不接受嵌套类型。否则 `Time` 会同时命中嵌套的
+        // `UnityEngine.InputForUI.InputManagerProvider.Time` 而报歧义 ——
+        // 实测正是如此，把一次本可成功的查询变成了要人工消歧。
+        var topLevelOnly = wantName.indexOf('.') < 0;
+        var idx = monoBuildTypeIndex(imageName);
+        for (var m = 0; m < idx.length; m++) {
+            var e = idx[m];
+            if (e.name !== shortName) { continue; }
+            if (wantNs && e.namespace !== wantNs) { continue; }
+            if (topLevelOnly && monoFuncs.mono_class_get_nesting_type) {
+                var outer = null;
+                try { outer = monoFuncs.mono_class_get_nesting_type(e.klass); }
+                catch (err) { outer = null; }
+                if (outer && !outer.isNull()) { continue; }
+            }
+            var kk = e.klass.toString();
+            if (seenPtr[kk]) { continue; }
+            seenPtr[kk] = true;
+            var dk2 = monoHitKey(e.image, [e.namespace || '', e.name]);
+            if (seenDup[dk2]) { continue; }
+            seenDup[dk2] = true;
+            hits.push({ klass: e.klass, image: e.image,
+                        form: [e.namespace, e.name], via: '短名扫描' });
+        }
+        return hits;
+    }
+
+    function monoResolveClassOrFail(imageName, namespace, name) {
+        if (!monoFuncs.mono_class_from_name) {
+            return fail('mono_class_from_name 不可用，无法按名解析类');
+        }
+        var hits = monoResolveClass(imageName, namespace, name);
+        if (!hits.length) {
+            var imgs = monoFindImages(imageName);
+            return fail('运行时没找到类 ' +
+                        (namespace ? namespace + '.' : '') + name +
+                        (imageName ? '（限程序集 ' + imageName + '）' : ''), {
+                searched_images: imgs.length,
+                image_hint: imgs.length ? null
+                    : '指定/默认的程序集没有加载；用 list_images 看已加载的程序集',
+                note: '静态索引里有、运行时没有，通常意味着这个类在本局游戏里没被加载' +
+                      '（Unity 会裁剪未使用的程序集）；也可能是命名空间/嵌套名给法不对。' +
+                      '**还有一种很常见的情况：游戏刚启动，Mono 的程序集还在懒加载**' +
+                      '（实测刚注入时只能枚举到十来个 BepInEx 自己的程序集，' +
+                      'UnityEngine.* 要过几秒才出现）——这种情况稍后重试即可，' +
+                      '不必改写类名。已加载程序集数见 searched_images，' +
+                      '它应当随游戏运行**变多**；若始终不变，才是真的没有这个类'
+            });
+        }
+        if (hits.length > 1) {
+            return fail('类名有歧义：命中 ' + hits.length + ' 个同名类', {
+                ambiguous: true,
+                candidates: hits.map(function (h) {
+                    return { image: h.image.name,
+                             full_name: monoClassFullName(h.klass),
+                             klass: h.klass.toString(),
+                             via: h.via || '精确写法' };
+                })
+            });
+        }
+        return { ok: true, klass: hits[0].klass, image: hits[0].image };
+    }
+
+    /** 类的完整名（嵌套类型用点号连接，与静态索引的 nested_name 对齐）。 */
+    function monoClassFullName(klass) {
+        var parts = [];
+        var cur = klass;
+        var guard = 0;
+        while (cur && !cur.isNull() && guard++ < 32) {
+            var nm = null;
+            try { nm = cstr(monoFuncs.mono_class_get_name(cur)); } catch (e) { nm = null; }
+            if (nm) { parts.unshift(nm); }
+            var ns = null;
+            try { ns = cstr(monoFuncs.mono_class_get_namespace(cur)); } catch (e) { ns = null; }
+            if (ns && ns.length) { parts.unshift(ns); break; }
+            var outer = null;
+            try {
+                outer = monoFuncs.mono_class_get_nesting_type
+                    ? monoFuncs.mono_class_get_nesting_type(cur) : null;
+            } catch (e) { outer = null; }
+            if (!outer || outer.isNull()) { break; }
+            cur = outer;
+        }
+        return parts.length ? parts.join('.') : null;
+    }
+
+    function monoParentOf(klass) {
+        if (!monoFuncs.mono_class_get_parent) { return null; }
+        try { return monoFuncs.mono_class_get_parent(klass); } catch (e) { return null; }
+    }
+
+    function monoClassAttrs(klass) {
+        var out = { full_name: monoClassFullName(klass) };
+        var par = monoParentOf(klass);
+        out.parent = (par && !par.isNull()) ? monoClassFullName(par) : null;
+        if (monoFuncs.mono_class_get_flags) {
+            var fl = null;
+            try { fl = monoFuncs.mono_class_get_flags(klass).toUInt32(); } catch (e) { fl = null; }
+            if (fl !== null) {
+                out.flags = hex32(fl);
+                // ECMA-335 TypeAttributes：0x20 = Interface，0x80 = Abstract。
+                // 本版 Mono 没有 mono_class_is_interface / mono_class_is_abstract 导出
+                // （四个样本一致），所以从 flags 位判断。
+                out.is_interface = (fl & 0x20) !== 0;
+                out.is_abstract = (fl & 0x80) !== 0;
+            }
+        }
+        if (monoFuncs.mono_class_is_enum) {
+            try { out.is_enum = monoFuncs.mono_class_is_enum(klass).toInt32() !== 0; }
+            catch (e) { /* 拿不到就不给这个字段 */ }
+        }
+        if (monoFuncs.mono_class_is_valuetype) {
+            try { out.is_value_type = monoFuncs.mono_class_is_valuetype(klass).toInt32() !== 0; }
+            catch (e) { /* 同上 */ }
+        }
+        if (monoFuncs.mono_class_instance_size) {
+            try { out.instance_size = monoFuncs.mono_class_instance_size(klass).toInt32(); }
+            catch (e) { /* 同上 */ }
+        }
+        if (monoFuncs.mono_class_get_type_token) {
+            try { out.token = hex32(monoFuncs.mono_class_get_type_token(klass).toUInt32()); }
+            catch (e) { /* 同上 */ }
+        }
+        if (monoFuncs.mono_class_num_fields) {
+            try { out.own_field_count = monoFuncs.mono_class_num_fields(klass).toInt32(); }
+            catch (e) { /* 同上 */ }
+        }
+        if (monoFuncs.mono_class_num_methods) {
+            try { out.method_count = monoFuncs.mono_class_num_methods(klass).toInt32(); }
+            catch (e) { /* 同上 */ }
+        }
+        return out;
+    }
+
+    /** Mono 的类型名。注意与 IL2CPP 的差异：Mono 给的是短名（int / string）。 */
+    function monoTypeName(typePtr) {
+        if (!typePtr || typePtr.isNull() || !monoFuncs.mono_type_get_name) { return null; }
+        var p = null;
+        try { p = monoFuncs.mono_type_get_name(typePtr); } catch (e) { return null; }
+        var s = cstr(p);
+        // 只有实测确认是新分配（两次调用不同址）时才释放；否则可能是缓存串，free 会崩
+        if (monoTypeNameAllocates === true && monoFuncs.mono_free && p && !p.isNull()) {
+            try { monoFuncs.mono_free(p); } catch (e) { /* 释放失败不影响结果 */ }
+        }
+        return s;
+    }
+
+    /** 只枚举**本类自己声明**的字段（继承字段由 fieldsWithInheritance 负责）。 */
+    function monoFieldsOfOwn(klass, wantStatic) {
+        if (!monoFuncs.mono_class_get_fields) { return []; }
+        var iter = Memory.alloc(Process.pointerSize);
+        iter.writePointer(NULL);
+        var out = [];
+        var guard = 0;
+        for (;;) {
+            var f = null;
+            try { f = monoFuncs.mono_class_get_fields(klass, iter); }
+            catch (e) { break; }
+            if (!f || f.isNull()) { break; }
+            if (++guard > 100000) { break; }
+            var flags = null;
+            if (monoFuncs.mono_field_get_flags) {
+                try { flags = monoFuncs.mono_field_get_flags(f).toUInt32(); } catch (e) { flags = null; }
+            }
+            // ECMA-335 FieldAttributes：0x10 = Static
+            var isStatic = (flags !== null) ? ((flags & 0x10) !== 0) : null;
+            if (wantStatic === true && isStatic !== true) { continue; }
+            if (wantStatic === false && isStatic === true) { continue; }
+            var rec = {
+                name: monoFuncs.mono_field_get_name ? cstr(monoFuncs.mono_field_get_name(f)) : null,
+                type: (monoFuncs.mono_field_get_type && monoFuncs.mono_type_get_name)
+                    ? monoTypeName(monoFuncs.mono_field_get_type(f)) : null,
+                token: null,
+                flags: (flags !== null) ? hex32(flags) : null,
+                is_static: isStatic
+            };
+            if (monoFuncs.mono_field_get_offset) {
+                try {
+                    rec.offset = monoFuncs.mono_field_get_offset(f).toInt32();
+                    rec.offset_via = 'mono_field_get_offset';
+                } catch (e) {
+                    rec.offset = null;
+                    rec.offset_via = null;
+                }
+            } else {
+                rec.offset = null;
+                rec.offset_via = null;
+            }
+            out.push(rec);
+        }
+        return out;
+    }
+
+    function monoMethodsOf(klass) {
+        if (!monoFuncs.mono_class_get_methods) { return []; }
+        var iter = Memory.alloc(Process.pointerSize);
+        iter.writePointer(NULL);
+        var iflags = Memory.alloc(4);   // mono_method_get_flags 的第二个参数是出参
+        var out = [];
+        var guard = 0;
+        for (;;) {
+            var m = null;
+            try { m = monoFuncs.mono_class_get_methods(klass, iter); }
+            catch (e) { break; }
+            if (!m || m.isNull()) { break; }
+            if (++guard > 100000) { break; }
+            var rec = {
+                name: monoFuncs.mono_method_get_name ? cstr(monoFuncs.mono_method_get_name(m)) : null,
+                method_info: m.toString()
+            };
+            if (monoFuncs.mono_method_get_token) {
+                try { rec.token = hex32(monoFuncs.mono_method_get_token(m).toUInt32()); }
+                catch (e) { rec.token = null; }
+            } else {
+                rec.token = null;
+            }
+            // 参数个数与返回类型：本版 Mono 没有 mono_method_get_param_count，
+            // 一律走签名（mono_method_signature + mono_signature_*）
+            var sig = null;
+            try { sig = monoFuncs.mono_method_signature(m); } catch (e) { sig = null; }
+            if (sig && !sig.isNull()) {
+                if (monoFuncs.mono_signature_get_param_count) {
+                    try { rec.param_count = monoFuncs.mono_signature_get_param_count(sig).toInt32(); }
+                    catch (e) { rec.param_count = null; }
+                }
+                if (monoFuncs.mono_signature_get_return_type) {
+                    try {
+                        rec.return_type = monoTypeName(
+                            monoFuncs.mono_signature_get_return_type(sig));
+                    } catch (e) { rec.return_type = null; }
+                }
+                if (monoFuncs.mono_signature_is_instance) {
+                    try {
+                        rec.is_instance = monoFuncs.mono_signature_is_instance(sig).toInt32() !== 0;
+                    } catch (e) { /* 交给 flags 兜底 */ }
+                }
+            }
+            if (monoFuncs.mono_method_get_flags) {
+                try {
+                    var fl = monoFuncs.mono_method_get_flags(m, iflags).toUInt32();
+                    rec.flags = hex32(fl);
+                    rec.is_static = (fl & 0x0010) !== 0;   // MethodAttributes.Static
+                    if (rec.is_instance === undefined) { rec.is_instance = !rec.is_static; }
+                } catch (e) { /* 同上 */ }
+            }
+            // is_generic：本版 Mono 的导出表里没有直接判断泛型的函数
+            // （mono_method_get_generic_container 不在导出表），拿不到就给 null，不猜
+            rec.is_generic = null;
+            // Hook 落点：mono_compile_method 触发 JIT 并给出真实机器码地址
+            var mp = null;
+            try { mp = monoFuncs.mono_compile_method(m); } catch (e) { mp = null; }
+            if (mp && !mp.isNull()) {
+                var d = describeAddress(mp);
+                rec.pointer = d.address;
+                rec.in_module = d.in_module;
+                if (d.rva !== undefined) { rec.rva = d.rva; rec.rva_hex = d.rva_hex; }
+            } else {
+                rec.pointer = null;
+                rec.note = '无代码地址（抽象/接口方法或未被 JIT 的方法：' +
+                           'mono_compile_method 返回 NULL）';
+            }
+            out.push(rec);
+        }
+        return out;
+    }
+
+    /** 从托管字符串指针取 JS 字符串（长度偏移在初始化时查出来）。 */
+    function monoStringOf(p) {
+        if (p === null || p === undefined) { return null; }
+        if (!monoStringLayout) { return null; }
+        try {
+            var q = ptr(p);
+            if (q.isNull()) { return null; }
+            var len = q.add(monoStringLayout.offset).readS32();
+            if (len < 0 || len > 0x100000) { return null; }
+            // 字符数组紧跟在长度字段之后（本版 mscorlib：_stringLength @16 → chars @20）
+            return q.add(monoStringLayout.offset + 4).readUtf16String(len);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function monoGcControl(disable) {
+        // 本版 Mono **没有** mono_gc_disable / mono_gc_enable 导出（四个样本一致核实），
+        // 所以做不到「暂停 GC」。如实报不支持 —— 不假装成功。
+        return fail('本版 Mono 运行时没有 mono_gc_disable / mono_gc_enable 导出，' +
+                    '无法暂停/恢复 GC（mono_gc_collect 只能强制回收一次，' +
+                    '起不到「Hook 期间不回收」的作用）', {
+            engine: 'mono',
+            unsupported: true,
+            note: 'Hook 期间如需保护对象，请用 read_memory 立即取走需要的字节，' +
+                  '或缩短观察窗口'
+        });
+    }
+
+    // ================================================================ 后端装配
+
+    /** IL2CPP 的父类指针（fieldsWithInheritance 用）。 */
+    function parentOf(klass) {
+        if (!funcs.il2cpp_class_get_parent) { return null; }
+        try { return funcs.il2cpp_class_get_parent(klass); } catch (e) { return null; }
+    }
+
+    /** IL2CPP 的类属性（原 classInfo 里的内联逻辑，抽出来与 Mono 对齐）。 */
+    function classAttrsOf(klass) {
+        var out = { full_name: fullNameOf(klass) };
+        var par = parentOf(klass);
+        out.parent = (par && !par.isNull()) ? fullNameOf(par) : null;
+        if (funcs.il2cpp_class_get_flags) {
+            out.flags = hex32(funcs.il2cpp_class_get_flags(klass).toUInt32());
+        }
+        if (funcs.il2cpp_class_is_enum) {
+            out.is_enum = funcs.il2cpp_class_is_enum(klass).toInt32() !== 0;
+        }
+        if (funcs.il2cpp_class_is_valuetype) {
+            out.is_value_type = funcs.il2cpp_class_is_valuetype(klass).toInt32() !== 0;
+        }
+        if (funcs.il2cpp_class_is_interface) {
+            out.is_interface = funcs.il2cpp_class_is_interface(klass).toInt32() !== 0;
+        }
+        if (funcs.il2cpp_class_is_abstract) {
+            out.is_abstract = funcs.il2cpp_class_is_abstract(klass).toInt32() !== 0;
+        }
+        if (funcs.il2cpp_class_instance_size) {
+            out.instance_size = funcs.il2cpp_class_instance_size(klass).toInt32();
+        }
+        return out;
+    }
+
+    var BE_IL2CPP = {
+        kind: 'il2cpp',
+        label: 'IL2CPP',
+        moduleCandidates: MODULE_CANDIDATES,
+        ensureReady: function (pm) { return ensureReady(pm); },
+        allImages: function () { return allImages(); },
+        resolveClassOrFail: function (img, ns, name) {
+            return resolveClassOrFail(img, ns, name);
+        },
+        classAttrs: classAttrsOf,
+        fieldsOfOwn: function (k, wantStatic) { return fieldsOf(k, wantStatic); },
+        methodsOf: methodsOf,
+        fullNameOf: fullNameOf,
+        parentOf: parentOf,
+        stringOf: il2cppString,
+        gcControl: function (disable) {
+            if (disable) {
+                if (!funcs.il2cpp_gc_disable) {
+                    return fail('il2cpp_gc_disable 不可用，无法暂停 GC');
+                }
+                funcs.il2cpp_gc_disable();
+                gcDisabled = true;
+            } else {
+                if (!funcs.il2cpp_gc_enable) {
+                    return fail('il2cpp_gc_enable 不可用，无法恢复 GC');
+                }
+                funcs.il2cpp_gc_enable();
+                gcDisabled = false;
+            }
+            return { ok: true, gc_disabled: gcDisabled, engine: 'il2cpp' };
+        },
+        apiCount: function () { return Object.keys(funcs).length; },
+        gcSupported: true,
+        // 「这个候选能不能 Hook」是**引擎相关**的判断，必须由后端给出：
+        // IL2CPP 的机器码一定在 GameAssembly 里，所以不在模块内就是可疑候选
+        // （空指针、转发桩）。见 BE_MONO 里的同名方法 —— Mono 恰好相反。
+        isHookable: function (c) {
+            return !!(c && c.pointer && c.in_module !== false);
+        },
+        methodTargetNote: '用 candidates[].pointer 直接 Hook；或静态 RVA + module_base 定位'
+    };
+
+    var BE_MONO = {
+        kind: 'mono',
+        label: 'Mono',
+        moduleCandidates: MONO_MODULE_CANDIDATES,
+        ensureReady: monoEnsureReady,
+        allImages: monoImages,
+        resolveClassOrFail: monoResolveClassOrFail,
+        classAttrs: monoClassAttrs,
+        fieldsOfOwn: monoFieldsOfOwn,
+        methodsOf: monoMethodsOf,
+        fullNameOf: monoClassFullName,
+        parentOf: monoParentOf,
+        stringOf: monoStringOf,
+        gcControl: monoGcControl,
+        apiCount: function () { return Object.keys(monoFuncs).length; },
+        gcSupported: false,
+        // Mono 的 JIT 代码**一定**在 mono 模块外，所以「不在模块内」完全正常，
+        // 不能用它筛掉候选 —— 只要 mono_compile_method 给出了非空地址就能 Hook。
+        // 实测踩到的：session.py 曾用 `in_module is not False` 过滤候选，
+        // 于是 Mono 上**所有**方法都被判成「没有可 Hook 的原生地址」，
+        // 而 find_hook_target 明明刚把地址给了出来（同一个候选）。
+        isHookable: function (c) {
+            return !!(c && c.pointer && c.pointer !== '0x0');
+        },
+        methodTargetNote: '用 candidates[].pointer 直接 Hook。' +
+                          '注意：Mono 是 JIT，代码地址**不在 mono 模块内**，' +
+                          '所以没有 RVA（静态元数据里的 RVA 指向 IL，不是机器码）'
+    };
+
+    /**
+     * 选定后端：先试 IL2CPP 模块，再试 Mono 模块。
+     *
+     * 为什么不是「按静态索引的引擎决定」：运行时看到的才算数 ——
+     * 静态索引可能来自另一份安装（同目录换版本），而注入的进程里到底加载了
+     * 哪个运行时，只有这里能回答。选定后**黏住**，不每次重选。
+     */
+    function selectBackend(preferredModule) {
+        if (BE) { return BE; }
+        var m = resolveModule(preferredModule);
+        if (m) {
+            mod = m;
+            BE = BE_IL2CPP;
+            return BE;
+        }
+        var mm = monoResolveModule(preferredModule);
+        if (mm) {
+            mod = mm;
+            BE = BE_MONO;
+            return BE;
+        }
+        return null;
+    }
+
+    function backendNotFound() {
+        return fail('未找到 IL2CPP 或 Mono 运行时模块', {
+            il2cpp_tried: MODULE_CANDIDATES,
+            mono_tried: MONO_MODULE_CANDIDATES,
+            process: Process.id,
+            retryable: true,
+            note: '刚 spawn 的进程里运行时模块可能还没加载完，稍后重试即可'
+        });
+    }
+
     rpc.exports = {
 
         /** 健康检查：不依赖 IL2CPP，验证脚本已加载。 */
@@ -1069,23 +2224,35 @@
             };
         },
 
-        /** 初始化并报告模块 / 导出可用性。 */
+        /**
+         * 初始化并报告模块 / 导出可用性。
+         *
+         * 先试 IL2CPP 再试 Mono —— 两个后端共用同一套 RPC，
+         * 宿主不需要预先知道进程里是哪个引擎（返回值里的 engine 字段会说明）。
+         */
         init: function (preferredModule) {
-            return ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var res = be.ensureReady(preferredModule);
+            if (res && res.ok) { res.engine = be.kind; }
+            return res;
         },
 
         /** 运行时总览：模块、域、映像数量。 */
         runtimeInfo: function (preferredModule) {
-            var ready = ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             var imgs = [];
             try {
-                imgs = allImages();
+                imgs = be.allImages();
             } catch (e) {
                 return fail('枚举映像失败：' + e.message);
             }
             return {
                 ok: true,
+                engine: be.kind,
                 module: mod.name,
                 base: mod.base.toString(),
                 size: mod.size,
@@ -1093,58 +2260,52 @@
                 images: imgs.map(function (x) {
                     return { name: x.name, class_count: x.class_count };
                 }),
-                api_available: Object.keys(funcs).length,
+                api_available: be.apiCount(),
                 api_missing: apiMissing,
                 fallbacks: fallbacks,
-                gc_disabled: gcDisabled
+                gc_disabled: gcDisabled,
+                gc_supported: be.gcSupported
             };
         },
 
         /** 列出全部映像（程序集）。 */
         listImages: function (preferredModule) {
-            var ready = ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
-            return { ok: true, images: allImages() };
+            return { ok: true, engine: be.kind, images: be.allImages() };
         },
 
         /** 查类：返回运行时字段偏移与方法地址。 */
         classInfo: function (opts, preferredModule) {
-            var ready = ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
             if (!found.ok) { return found; }
             var k = found.klass;
             var out = {
                 ok: true,
+                engine: be.kind,
                 image: found.image.name,
-                full_name: fullNameOf(k),
                 klass: k.toString()
             };
-            if (funcs.il2cpp_class_get_parent) {
-                var par = funcs.il2cpp_class_get_parent(k);
-                out.parent = (par && !par.isNull()) ? fullNameOf(par) : null;
+            var attrs = {};
+            try { attrs = be.classAttrs(k) || {}; } catch (e) { attrs = {}; }
+            for (var key in attrs) {
+                if (Object.prototype.hasOwnProperty.call(attrs, key)) { out[key] = attrs[key]; }
             }
-            if (funcs.il2cpp_class_get_flags) {
-                out.flags = hex32(funcs.il2cpp_class_get_flags(k).toUInt32());
-            }
-            if (funcs.il2cpp_class_is_enum) {
-                out.is_enum = funcs.il2cpp_class_is_enum(k).toInt32() !== 0;
-            }
-            if (funcs.il2cpp_class_is_valuetype) {
-                out.is_value_type = funcs.il2cpp_class_is_valuetype(k).toInt32() !== 0;
-            }
-            if (funcs.il2cpp_class_instance_size) {
-                out.instance_size = funcs.il2cpp_class_instance_size(k).toInt32();
-            }
-            // 字段：默认给出实例字段的真实偏移
+            // 字段：默认给出实例字段的真实偏移（含继承链上的，标 inherited_from）
             if (opts.fields !== false) {
-                out.fields = fieldsOf(k, null);
+                out.fields = fieldsWithInheritance(k, null);
                 out.field_count = out.fields.length;
             }
-            // 方法：默认给出 RVA，这是 Hook 的落点
+            // 方法：默认给出代码地址，这是 Hook 的落点
             if (opts.methods !== false) {
-                var ms = methodsOf(k);
+                var ms = be.methodsOf(k);
                 // 支持按名字过滤，便于直接定位 Hook 目标
                 if (opts.method_filter) {
                     var f = String(opts.method_filter);
@@ -1161,12 +2322,14 @@
 
         /** 只取某方法的 Hook 落点信息。 */
         methodTarget: function (opts, preferredModule) {
-            var ready = ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
             if (!found.ok) { return found; }
-            var ms = methodsOf(found.klass);
+            var ms = be.methodsOf(found.klass);
             var hits = ms.filter(function (x) {
                 return x.name === opts.method;
             });
@@ -1175,31 +2338,41 @@
                     available: ms.map(function (x) { return x.name; }).slice(0, 80)
                 });
             }
+            // 「能不能 Hook」由后端标注（IL2CPP 看是否在模块内，Mono 只要地址非空），
+            // 上层据此筛选，不再自己猜引擎语义。
+            hits.forEach(function (c) {
+                try { c.hookable = be.isHookable(c); }
+                catch (e) { c.hookable = false; }
+            });
             return {
                 ok: true,
-                class: fullNameOf(found.klass),
+                engine: be.kind,
+                class: be.fullNameOf(found.klass),
                 image: found.image.name,
                 module: mod.name,
                 module_base: mod.base.toString(),
                 candidates: hits,
-                note: '用 candidates[].pointer 直接 Hook；' +
-                      '或静态 RVA + module_base 定位'
+                usable_count: hits.filter(function (c) { return c.hookable; }).length,
+                note: be.methodTargetNote
             };
         },
 
         /** 枚举类的字段（可只要静态字段）。 */
         classFields: function (opts, preferredModule) {
-            var ready = ensureReady(preferredModule);
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }
             opts = opts || {};
-            var found = resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
             if (!found.ok) { return found; }
             var want = (opts.static_only === true) ? true
                      : (opts.instance_only === true) ? false : null;
-            var fs = fieldsOf(found.klass, want);
+            var fs = fieldsWithInheritance(found.klass, want);
             return {
                 ok: true,
-                class: fullNameOf(found.klass),
+                engine: be.kind,
+                class: be.fullNameOf(found.klass),
                 fields: fs,
                 count: fs.length,
                 fallbacks: fallbacks
@@ -1211,13 +2384,13 @@
          *
          * 注意：本接口**不要求 IL2CPP 初始化成功**。给定绝对地址即可挂钩，
          * 与引擎无关 —— 原生游戏的函数、系统 API、甚至 Unity 之外的进程
-         * 都能 Hook。若 IL2CPP 模块恰好可用，会顺带解析模块基址，
-         * 以便把目标地址换算成 RVA（方便与静态元数据对照）。
+         * 都能 Hook。若运行时模块（IL2CPP 或 Mono）恰好可用，会顺带解析模块基址，
+         * 以便把**落在模块内**的地址换算成 RVA（方便与静态元数据对照）。
          */
         hook: function (spec, preferredModule) {
             if (!mod) {
                 // 尽力而为：解析不到就只按绝对地址挂钩，不阻断
-                try { mod = resolveModule(preferredModule); } catch (e) { mod = null; }
+                try { selectBackend(preferredModule); } catch (e) { mod = null; }
             }
             return hookAt(spec || {});
         },
@@ -1451,18 +2624,22 @@
          */
         evalJs: function (code) {
             try {
+                // 注入的可用对象：mod / api / funcs / hooks（IL2CPP 侧），
+                // 外加 monoFuncs 与 BE（Mono 侧与后端选择结果）——
+                // 后者是排查 Mono 问题的必需品：没有它就只能靠复刻绑定逻辑猜
+                // （实测踩过：想知道哪个 mono_* 没绑上，却看不到 monoFuncs）。
                 // eslint-disable-next-line no-new-func
-                var fn = new Function('mod', 'api', 'funcs', 'hooks', 'return (' +
-                                      String(code) + ');');
-                var v = fn(mod, api, funcs, hooks);
+                var fn = new Function('mod', 'api', 'funcs', 'hooks', 'monoFuncs', 'BE',
+                                      'return (' + String(code) + ');');
+                var v = fn(mod, api, funcs, hooks, monoFuncs, BE);
                 return { ok: true, value: v === undefined ? null : v };
             } catch (e) {
                 // 表达式求值失败时，按语句块再试一次
                 try {
                     // eslint-disable-next-line no-new-func
-                    var fn2 = new Function('mod', 'api', 'funcs', 'hooks',
+                    var fn2 = new Function('mod', 'api', 'funcs', 'hooks', 'monoFuncs', 'BE',
                                            String(code));
-                    var v2 = fn2(mod, api, funcs, hooks);
+                    var v2 = fn2(mod, api, funcs, hooks, monoFuncs, BE);
                     return { ok: true, value: v2 === undefined ? null : v2 };
                 } catch (e2) {
                     return fail('求值失败：' + e2.message, { first_error: e.message });
@@ -1470,18 +2647,18 @@
             }
         },
 
-        /** GC 控制：Hook 期间建议关 GC，避免对象在回调中被回收。 */
+        /**
+         * GC 控制：Hook 期间建议关 GC，避免对象在回调中被回收。
+         *
+         * 注意引擎差异：IL2CPP 有 il2cpp_gc_disable/enable，Mono **没有**对应导出
+         * （四个样本一致核实），Mono 上这里会如实返回 ok:false。
+         */
         gcControl: function (disable) {
-            if (!funcs.il2cpp_gc_disable || !funcs.il2cpp_gc_enable) {
-                return fail('缺少 il2cpp_gc_disable / il2cpp_gc_enable 导出');
-            }
-            try {
-                if (disable) { funcs.il2cpp_gc_disable(); gcDisabled = true; }
-                else { funcs.il2cpp_gc_enable(); gcDisabled = false; }
-                return { ok: true, gc_disabled: gcDisabled };
-            } catch (e) {
-                return fail('GC 控制失败：' + e.message);
-            }
+            var be = selectBackend();
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady();
+            if (!ready.ok) { return ready; }
+            return be.gcControl(disable);
         },
 
         /**
@@ -1533,6 +2710,34 @@
             };
         }
     };
+
+    /**
+     * 每个 RPC 入口先清掉「单次调用内缓存」。
+     *
+     * 为什么必须有这一层：Mono 的程序集是**懒加载**的，会随着游戏运行**持续变多**。
+     * 实测（Archon Soul）：`init` 成功后 0.5 秒枚举到 **13** 个程序集，
+     * 且全是 BepInEx 自己那批（MonoMod / 0Harmony / Mono.Cecil / System）；
+     * Unity 的 `UnityEngine.CoreModule` 等**还没加载**。若把这份清单永久缓存，
+     * 之后 `UnityEngine.Time` 永远查不到 —— 而工具会报「类不存在」，
+     * 让 Agent 以为游戏里没有这个类（实际是探针没再看一眼）。
+     * 实测那版正是如此：`runtime_class_info("UnityEngine.Time")` 与
+     * `find_hook_target(Time.get_frameCount)` 双双失败，detail 里写着
+     * `searched_images: 13`。
+     *
+     * 也不能每次查类都重新枚举：类解析会按「映像 × 名字写法」组合着调
+     * `mono_class_from_name`（158 个映像 × 6 种写法），每次都重扫一遍程序集
+     * 会慢到不可用。所以粒度取**一次 RPC**：同一 RPC 内复用，跨 RPC 刷新。
+     */
+    for (var _k in rpc.exports) {
+        if (typeof rpc.exports[_k] !== 'function') { continue; }
+        rpc.exports[_k] = (function (orig) {
+            return function () {
+                monoImagesCache = null;
+                monoTypeIndexCache = null;
+                return orig.apply(null, arguments);
+            };
+        })(rpc.exports[_k]);
+    }
 
     // 脚本加载即发送一条就绪消息，便于宿主确认注入成功
     try {

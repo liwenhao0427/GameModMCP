@@ -94,6 +94,10 @@ NON_TOOL_IDENTIFIERS = {
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
+    # Mono 运行时探针用到的 Mono C API 导出名（不是 MCP 工具，是探针内部调的 C 函数）
+    "mono_compile_method", "mono_gc_disable", "mono_gc_enable",
+    # 类名没解析出来时返回的「已搜过几个程序集」，是返回字段不是工具
+    "searched_images",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
 }

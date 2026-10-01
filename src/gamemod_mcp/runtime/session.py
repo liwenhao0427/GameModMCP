@@ -92,17 +92,23 @@ def probe_available() -> dict:
 # ---------------------------------------------------------------- 探针脚本
 
 _AGENT_PATH = Path(__file__).with_name("agent.js")
-_agent_source: str | None = None
 
 
 def agent_source() -> str:
-    """读取探针脚本源码（带缓存）。"""
-    global _agent_source
-    if _agent_source is None:
-        if not _AGENT_PATH.is_file():
-            raise SessionError(f"探针脚本缺失：{_AGENT_PATH}")
-        _agent_source = _AGENT_PATH.read_text(encoding="utf-8")
-    return _agent_source
+    """读取探针脚本源码。
+
+    **故意不做缓存**（每次注入都重新读盘）。这里曾经缓存到模块级全局，
+    后果是：长时间运行的 MCP 服务器改了 `agent.js` 之后**永远**注入旧探针，
+    而磁盘上是新代码 —— 调试的人对着新代码找问题，跑的是旧行为。
+    实测就踩到过：端到端测试里 `agent.js` 的 Mono 后端明明有 53 个导出绑定，
+    live 服务器注入的却是只认 IL2CPP 的旧脚本，报的还是旧提示语
+    （「未找到 IL2CPP 运行时模块」），让人以为是新代码坏了。
+    注入是低频操作（一次会话一次），读一个 100 KB 文本的代价可以忽略，
+    换来的是「磁盘上的探针 == 注入的探针」这条不变量。
+    """
+    if not _AGENT_PATH.is_file():
+        raise SessionError(f"探针脚本缺失：{_AGENT_PATH}")
+    return _AGENT_PATH.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------- 重载选择
@@ -481,8 +487,13 @@ class RuntimeSession:
         if not tgt.get("ok"):
             return tgt
         cands = tgt.get("candidates") or []
-        # 优先选有真实代码地址且在模块内的
-        usable = [c for c in cands if c.get("pointer") and c.get("in_module") is not False]
+        # 「能不能 Hook」由探针的后端判定并标在候选上（`hookable`）：
+        # IL2CPP 的机器码一定在模块内，不在模块内就是可疑候选；
+        # Mono 的 JIT 代码**一定**在模块外，只要地址非空就能 Hook。
+        # 以前这里写死 `in_module is not False`，于是 Mono 上**所有**方法
+        # 都被判成「没有可 Hook 的原生地址」——而 find_hook_target 刚把
+        # 同一个候选的地址给出来（实测 Time.get_frameCount 就是如此）。
+        usable = [c for c in cands if c.get("hookable") is True]
         if not usable:
             return {
                 "ok": False,

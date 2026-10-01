@@ -1037,6 +1037,25 @@ class Index:
     # （见下面 _paged 的说明）——「句柄不全」必须如实标注，不能悄悄截断。
     _HANDLE_CAP = 20000
 
+    def _framework_hint(self) -> str:
+        """静态索引查不到框架类型时，把「为什么」直接告诉调用方。
+
+        为什么需要：Mono 的静态索引默认只收游戏自己的程序集
+        （Assembly-CSharp.dll），`UnityEngine.Component` 这类框架类型
+        **必然**查不到 —— 实测 4 个 Mono 样本上
+        `class_detail("UnityEngine.Component")` 全部返回「未找到类」。
+        只说「用 search_classes 搜短名」会把人引向一条走不通的路
+        （搜短名也搜不到，因为它压根没被索引），
+        而正确答案（改用运行时探针）就在手边。
+        这句话由 `adapt.py` 的能力位驱动，不在这里硬编码引擎名。
+        """
+        cap = adapt.capabilities_of(self.engine) if self.engine else {}
+        if cap.get("static_index_covers_frameworks") is False:
+            return ("；注意本引擎的静态索引**只覆盖游戏自己的程序集**，"
+                    "UnityEngine.* 等框架类型不在其中 —— "
+                    "这类类型请用 runtime_class_info 在运行时查（需先注入）")
+        return ""
+
     def _match_type_ids(
         self, name: str, assembly: str = "", label: str = "owner",
         _probe: bool = True,
@@ -1097,7 +1116,8 @@ class Index:
                                      f"{assembly!r} 里不存在，请检查拼写或去掉 assembly）",
                             "total": 0, "items": []}
             return [], {"error": f"未找到类：{name}"
-                                 f"（用 search_classes 搜短名以确认完整类名）",
+                                 f"（用 search_classes 搜短名以确认完整类名）"
+                                 f"{self._framework_hint()}",
                         "total": 0, "items": []}
 
         if len(cand) > 1:

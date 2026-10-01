@@ -16,16 +16,37 @@ description: 用 GameMod MCP 工具集做游戏 Mod：定位类/字段/方法、
 | 引擎 | 能查类型系统？ | 能查字段偏移？ | 主打能力 |
 |---|---|---|---|
 | **IL2CPP** | ✅ 类/字段/方法/token | ✅ 运行时取 | 精确定位 Hook 落点 |
-| **Mono** | ✅ 同上，且类型更精确 | ⚠️ **只有静态偏移**（见下） | 同上 + 可直接反编译出 C# |
+| **Mono** | ✅ 同上，且类型更精确 | ✅ 运行时取 | 同上 + 可直接反编译出 C# |
 | **Unreal** | ❌ | ❌ | **资源容器**（pak/utoc 里有什么） |
 
-> ⚠️ **Mono 的运行时能力目前是缺的**，不要照 IL2CPP 的配方走：
-> 注入探针（`agent.js`）只实现了 IL2CPP 的 `il2cpp_*` API，**没有实现
-> `mono_*` API**，所以 Mono 游戏上 `inject_process` / `launch_game` 之后
-> `runtime_class_info` / `find_hook_target` / `hook_method` 拿不到东西。
-> Mono 现在能确定给到的是：类型系统（`search_classes` / `class_detail`）、
-> **反编译源码**（`decompile`）、以及元数据里的字段布局信息。
-> 真要在 Mono 上做运行时 Hook，需要先补 `mono_*` 那套探针实现。
+> **两个引擎的运行时配方基本一致**：`launch_game` → `runtime_class_info` 取真实偏移
+> → `find_hook_target` 取落点 → `hook_method` + `drain_events`。
+> Mono 侧探针走的是 `mono_*` API，与 IL2CPP 的 `il2cpp_*` 是两套实现，
+> 但对外的工具、返回结构与 token 对账方式**完全一样**。
+>
+> Mono 上有五条差异要知道（都是如实声明的，不是缺陷）：
+>
+> 1. **没有 RVA**。方法地址是 `mono_compile_method` 触发 JIT 后的机器码地址，
+>    JIT 代码不在 `mono-2.0-*.dll` 模块内，所以 `in_module: false` 且**不给**
+>    `rva`/`rva_hex`（给一个假 RVA 比不给更糟）。Hook 用 `pointer` 即可。
+> 2. **`gc_control` 在本版 Mono 上不支持**：没有 `mono_gc_disable` / `mono_gc_enable`
+>    导出（四个样本一致核实过）。它会明确返回 `ok:false`，不要当成失败重试。
+> 3. **程序集是懒加载的**，而且**注入成功不等于可以 Hook**。
+>    刚 `launch_game` 完成时只能枚举到十来个程序集（BepInEx 自己那批），
+>    `UnityEngine.*` 要过几秒才出现。实测（Archon Soul）在只有 13 个程序集时
+>    就去 Hook 并强制调用 `get_frameCount`，**游戏进程直接消失**。
+>    所以探针会在注入成功后**等程序集加载稳定再返回**（数量连续 4 次采样不变，
+>    实测等了 4.0 秒、看到 144 个），结论在 `init.assemblies` 里。
+>    若 `settled` 为 `false`，说明游戏还在加载 —— 此时**先别 Hook**，
+>    过几秒再查。判断依据还有返回里的 `searched_images`（实测 13 → 164），
+>    它应当随游戏运行变多；始终不变才是真的没有这个类。
+> 4. **短名解析只认顶层类型**（与 IL2CPP 一致）：`runtime_class_info(name="Time")`
+>    会命中 `UnityEngine.Time`；若某个短名在多个顶层类型里都有，
+>    会返回 `ambiguous: true` + 候选，让你自己指定 `namespace`。
+> 5. **静态索引只覆盖游戏自己的程序集**。Mono 的索引默认只收
+>    `Assembly-CSharp.dll`（实测 1,387 类型），所以 `class_detail("UnityEngine.Component")`
+>    会返回「未找到类」并说明原因 —— 这不是工具坏了，是那份 dll 没被索引。
+>    `UnityEngine.*` 这类框架类型要用 `runtime_class_info` 在**运行时**查（需先注入）。
 
 下面第二节讲的「元数据优先」**只适用于 IL2CPP 与 Mono**。
 如果你确认是 Unreal，直接跳到「引擎差异 → Unreal」与「配方 0」，
@@ -241,17 +262,20 @@ close_session()        # 卸载 Hook + 断开注入 + 关索引
 ### Mono（Unity 的 JIT 后端，老游戏或开发版）
 
 - 程序集在 `<游戏>_Data/Managed/*.dll`，是标准 .NET DLL
-- 主逻辑在 `Assembly-CSharp.dll`
+- 主逻辑在 `Assembly-CSharp.dll`；**静态索引默认只收这一份**，
+  `UnityEngine.*` 等框架类型静态查不到（要用 `runtime_class_info` 运行时查）
 - 运行时里 `mono-2.0-*.dll` 是标志
 - 可以直接用 `decompile` 工具读源码（薄封装 ILSpy）——**比 IL2CPP 好搞得多**
   ```python
   decompile(type_name="SpellEffect")   # 单个类型，源码内联在 source 里
   ```
   反编译是 Mono 独有的能力：IL2CPP 没有托管元数据，必须先造 DummyDll（本工具集暂未实现）。
-- 本工具集提供**静态解析与反编译**；**运行时探针目前不支持 Mono** ——
-  探针里只有 `il2cpp_*` API，`mono_*` 那套还没实现。
-  所以 Mono 游戏上不要期待 `runtime_class_info` / `find_hook_target` /
-  `hook_method` 能用（会明确报错，不是静默给错值）。
+- 本工具集在 Mono 上**静态与运行时都能用**（运行时走 `mono_*` 那套探针）。
+  配方与 IL2CPP 一样：注入 → `runtime_class_info` → `find_hook_target` →
+  `hook_method` + `drain_events`，静态 token 与运行时 token 照样对账。
+  五条差异（无 RVA / `gc_control` 不支持 / 程序集懒加载**且注入后会自动等它稳定** /
+  短名只认顶层 / 静态索引不含框架类型）
+  见本文开头「先判断引擎」一节，都是如实声明，不是「没实现」。
 
 ### Unreal
 
@@ -539,14 +563,15 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 - [ ] `get_diagnostics()` 看 Frida 是否可用
 - [ ] 确认游戏引擎类型（IL2CPP/Mono/UE）——**UE 走完全不同的路线**
 - [ ] 若是 IL2CPP：`open_game` 成功且类型数量合理
-- [ ] 若是 Mono：静态查询与 `decompile` 可用，但**运行时探针不支持**
-      （`inject_process` 之后的 `runtime_*` / `hook_*` 不可用）
+- [ ] 若是 Mono：静态查询与 `decompile` 可用，运行时探针也可用
+      （注入后探针会等程序集加载稳定，看 `init.assemblies.settled`；
+      `settled=false` 时先别 Hook —— 实测过早 Hook 会把游戏打崩）
 - [ ] 若是 UE：`detect_ue()` 确认，再用 `ue_list_entries` 看容器
 
-定位落点时（**仅 IL2CPP**——Mono 的 `mono_*` 探针尚未实现）：
+定位落点时（**IL2CPP 与 Mono 同样适用**）：
 - [ ] 用 `class_detail` 拿到静态 token
 - [ ] 用 `find_hook_target` / `runtime_class_info` 拿到运行时地址
-- [ ] **比对两边的 token 是否一致**
+- [ ] **比对两边的 token 是否一致**（Mono 上同样对账，只是没有 RVA）
 
 改动前：
 - [ ] 字段偏移是用 `runtime_class_info` 拿的真实偏移（不是猜的）

@@ -48,6 +48,7 @@ python devtools\verify_mcp_ue.py       # ← MCP 工具层端到端（UE，静�
 python devtools\verify_mcp_extra.py    # ← 补全工具覆盖（需游戏）
 python devtools\verify_mcp_decompile.py # ← 反编译（薄封装 ilspycmd，需 Mono 样本）
 python devtools\verify_il2cpp_runtime.py   # 静态↔运行时 token 交叉验证（需游戏）
+python devtools\verify_mono_runtime.py      # Mono 运行时探针：导出真值 + 真实偏移/地址 + Hook 端到端（需 Mono 游戏）
 python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
 python devtools\verify_thread_attach.py    # 探针线程附着 IL2CPP 域：就绪判断 + 重试契约 + 崩溃回归（需 IL2CPP 样本）
@@ -117,6 +118,7 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 | `find_il2cpp()` | Garden of Witches | IL2CPP（17 MB 元数据） |
 | `find_mono()` | Archon Soul | Mono（单程序集） |
 | `find_mono_multi()` | Kinny and the Cosmic Cauldron | Mono（多程序集） |
+| `mono_games()` | 上面两个 + Gambonanza + Sephiria | Mono 运行时探针（四个样本一起核导出表） |
 | `find_ue_pak_v12()` | CatapultHero | UE（pak v12 / utoc v8） |
 | `find_ue_pak_v11()` | Dinoblade | UE（pak v11 / utoc v8） |
 | `find_il2cpp_dump()` | `aiMod/dump/*/il2cpp_dump.cs` | IL2CPP 字段类型真值 |

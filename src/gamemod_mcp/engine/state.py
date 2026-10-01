@@ -456,21 +456,111 @@ def ensure_index(
 
 #: spawn 之后等 IL2CPP 就绪的等待预算（秒）。
 #:
-#: 为什么按引擎给不同预算：`GameAssembly.dll` 是**慢慢**加载起来的，
-#: 刚 spawn 完第一次探测几乎必然是「未找到 IL2CPP 运行时模块」，
-#: 所以 IL2CPP 游戏必须给足时间（实测 GoW 约 3 秒、Echoes 约 6 秒就绪）。
-#: 而 Mono / UE 游戏**永远**不会有这个模块，等满 60 秒纯属空转 ——
-#: 实测 4 个 Mono 样本每个 `launch_game` 都要白等 62 秒才如实返回。
+#: 为什么按引擎给不同预算：托管运行时（`GameAssembly.dll` / `mono-2.0-bdwgc.dll`）
+#: 是**慢慢**加载起来的，刚 spawn 完第一次探测几乎必然是「未找到运行时模块」，
+#: 所以 IL2CPP 与 Mono 都必须给足时间（实测 GoW(IL2CPP) 约 3 秒、
+#: Echoes 约 6 秒就绪；Mono 侧要等 `mono_get_root_domain` 返回非 NULL）。
+#: 而 UE 游戏**永远**不会有这两个模块，等满 60 秒纯属空转 ——
+#: 实测 UE 样本每个 `launch_game` 都要白等 62 秒才如实返回。
 #: 引擎在 `open_game` 时已经知道，没有理由再去猜。
-READY_TIMEOUT_IL2CPP = 60.0
+#:
+#: 历史订正：Mono 曾经用 2 秒预算，理由是「Mono 没有运行时探针，等也白等」。
+#: 探针补上 Mono 后端之后这个理由不再成立 —— 现在等下去**真的会**就绪，
+#: 给 2 秒只会让第一次运行时调用拿到「Mono 运行时尚未初始化」。
+READY_TIMEOUT_MANAGED = 60.0
 READY_TIMEOUT_OTHER = 2.0
 
 
 def ready_timeout_for(engine: str | None) -> float:
-    """按引擎决定 spawn 后的 IL2CPP 就绪等待预算（纯函数，便于验收）。"""
-    return (READY_TIMEOUT_IL2CPP
-            if (engine or "").strip().lower() == "il2cpp"
-            else READY_TIMEOUT_OTHER)
+    """按引擎决定 spawn 后的运行时就绪等待预算（纯函数，便于验收）。"""
+    name = (engine or "").strip().lower()
+    if name in ("il2cpp", "mono"):
+        return READY_TIMEOUT_MANAGED
+    return READY_TIMEOUT_OTHER
+
+
+def runtime_label(engine: str | None) -> str:
+    """运行时的可读名（提示语用）。
+
+    为什么需要它：提示语曾经一律写死「IL2CPP 运行时未就绪」，
+    于是在 Mono 游戏上也会这么说 —— 明明是 Mono 探针在等 Mono 域，
+    却告诉 Agent 是 IL2CPP 的问题，属于「说了话但不准」。
+    """
+    name = (engine or "").strip().lower()
+    if name == "il2cpp":
+        return "IL2CPP"
+    if name == "mono":
+        return "Mono"
+    return "托管运行时"
+
+
+#: 判断「程序集加载完了」用的采样参数（Mono 专用）。
+#: 0.5 秒采一次，连续 4 次数量不变就算稳定（≈2 秒静默窗口）。
+ASSEMBLY_POLL_INTERVAL = 0.5
+ASSEMBLY_STABLE_SAMPLES = 4
+#: 等程序集稳定的总预算。实测 Archon Soul 从 13 涨到 164 用了约 2 秒；
+#: 给 30 秒足够宽裕，又不至于让「这游戏本来就只有 3 个程序集」白等太久
+#: （那种情况 2 秒静默窗口一到就返回）。
+ASSEMBLY_SETTLE_BUDGET = 30.0
+
+
+def _settle_assemblies(sess, engine: str | None, budget: float = ASSEMBLY_SETTLE_BUDGET) -> dict:
+    """等 Mono 的懒加载程序集**加载稳定**再放行。
+
+    为什么必须等（实测，不是理论）：注入后 0.5 秒时游戏只有 13 个程序集
+    （`UnityEngine.*` 还没加载），而矩阵在此时就去 Hook 并强制调用
+    `Time.get_frameCount` —— **Archon Soul 进程随后消失**。同一个游戏在
+    程序集加载完（164 个）之后再走同样流程则一切正常。
+    也就是说，「注入成功」不等于「可以 Hook 托管方法」。
+
+    判据用「数量连续 N 次不变」而不是「数量 >= 某个阈值」：实测 Gambonanza
+    在 4 秒时只有 15 个程序集（而 Archon Soul 有 164 个），阈值法会把它判成
+    「永远没加载完」；而静默窗口对「程序集本来就少」的游戏会立刻返回。
+
+    等不到稳定也不报错 —— 只如实说明等了多久、看到多少个，把判断留给调用方。
+    """
+    from .adapt import capabilities_of
+
+    cap = capabilities_of(engine) if engine else {}
+    if not cap.get("lazy_assemblies"):
+        return {}
+    t0 = time.time()
+    last = -1
+    same = 0
+    seen: list[int] = []
+    while time.time() - t0 < budget:
+        try:
+            n = int(sess.runtime_info().get("image_count") or 0)
+        except Exception as exc:  # noqa: BLE001 - 探针挂了不该让注入失败
+            return {"waited": round(time.time() - t0, 1),
+                    "error": f"查询程序集数量失败：{exc}"}
+        seen.append(n)
+        if n == last:
+            same += 1
+            if same >= ASSEMBLY_STABLE_SAMPLES:
+                return {"images": n, "waited": round(time.time() - t0, 1),
+                        "samples": len(seen), "settled": True}
+        else:
+            same = 0
+            last = n
+        time.sleep(ASSEMBLY_POLL_INTERVAL)
+    return {"images": last, "waited": round(time.time() - t0, 1),
+            "samples": len(seen), "settled": False,
+            "note": f"等了 {budget:.0f} 秒程序集仍在增加，未判定为稳定"}
+
+
+def _with_settled_assemblies(sess, engine: str | None, init: dict) -> dict:
+    """把「等程序集加载稳定」的结果并进 init，并记一条会话日志。
+
+    抽出来是因为 spawn 与 attach 两条路径都要做同一件事；
+    漏掉任何一条，那条路径上就会重现「Hook 把游戏打崩」的缺陷。
+    """
+    settled = _settle_assemblies(sess, engine)
+    if not settled:
+        return init
+    _state.note(f"程序集加载稳定：{settled.get('images')} 个"
+                f"（等了 {settled.get('waited')}s）")
+    return {**init, "assemblies": settled}
 
 
 def ensure_runtime(
@@ -552,15 +642,19 @@ def ensure_runtime(
             init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                    preferred_module=preferred_module)
             if not init.get("ok"):
-                # 启动并注入是成功的，只是 IL2CPP 没就绪（可能不是 IL2CPP 游戏）。
+                # 启动并注入是成功的，只是托管运行时没就绪（可能不是 Unity 游戏）。
                 # 如实报告，但仍算成功注入 —— 否则 Agent 会以为注入失败而重试。
-                _state.note(f"IL2CPP 初始化未就绪：{init.get('error')}")
+                label = runtime_label(_state.engine)
+                _state.note(f"{label} 运行时未就绪：{init.get('error')}")
                 return {
                     "ok": True,
-                    "warning": "进程已启动并注入，但 IL2CPP 运行时未就绪",
+                    "warning": f"进程已启动并注入，但 {label} 运行时未就绪",
                     "init": init,
                     **_state.summary(),
                 }
+            # 「注入成功」不等于「可以 Hook 托管方法」：Mono 的程序集是懒加载的，
+            # 此时去 Hook/调用会把游戏打崩（实测见 _settle_assemblies）。
+            init = _with_settled_assemblies(sess, _state.engine, init)
             return {"ok": True, "init": init, **_state.summary()}
 
         # 找 pid
@@ -606,19 +700,23 @@ def ensure_runtime(
 
         _state.runtime = sess
         _state.note(f"已注入 pid={target_pid} ({proc_name})")
-        # 进程已经在跑，模块本该就在；预算仍按引擎给（Mono 不必等）
+        # 进程已经在跑，模块本该就在；预算仍按引擎给
         init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                preferred_module=preferred_module)
         if not init.get("ok"):
-            _state.note(f"IL2CPP 初始化未就绪：{init.get('error')}")
+            label = runtime_label(_state.engine)
+            _state.note(f"{label} 运行时未就绪：{init.get('error')}")
             return {
                 "ok": True,
                 "pid": target_pid,
-                "warning": "已注入，但 IL2CPP 运行时未就绪"
-                           "（非 IL2CPP 游戏属正常）",
+                "warning": f"已注入，但 {label} 运行时未就绪"
+                           "（非 Unity 托管游戏属正常）",
                 "init": init,
                 **_state.summary(),
             }
+        # 与 spawn 路径同理：进程已经在跑时程序集通常已经稳定，
+        # 但「注入一个刚起来的 Mono 游戏」同样会碰到懒加载，所以一并等。
+        init = _with_settled_assemblies(sess, _state.engine, init)
         return {"ok": True, "pid": target_pid, "init": init,
                 **_state.summary()}
 

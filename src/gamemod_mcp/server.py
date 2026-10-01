@@ -148,6 +148,15 @@ mcp = FastMCP(
         "第 4~7 步需要游戏可注入，且运行 agent 的进程要有足够权限\n"
         "（Windows 上通常需要管理员）。\n"
         "\n"
+        "支持三类引擎：IL2CPP / Mono(.NET) / Unreal。**IL2CPP 与 Mono 的配方一致**\n"
+        "（探针里是 il2cpp_* 与 mono_* 两套实现，对外的工具与 token 对账方式相同）。\n"
+        "Mono 上有四点要知道：方法地址是 JIT 机器码、**没有 RVA**（in_module 为 false）；\n"
+        "gc_control 不支持（会如实返回 ok:false，不要当失败重试）；程序集懒加载，\n"
+        "注入成功后探针会**等程序集加载稳定再返回**（看 init.assemblies.settled；\n"
+        "settled 为 false 时先别 Hook —— 实测过早 Hook 会把游戏打崩）；\n"
+        "静态索引默认只收游戏自己的程序集，UnityEngine.* 要用 runtime_class_info\n"
+        "在运行时查（class_detail 会说明这一点）。\n"
+        "\n"
         "响应体积上限：任何一次返回不超过 256 KB。被截断时返回里会有\n"
         "`capped: true` 与 `note`，照 note 给的\n"
         "read_query_result(handle=..., offset=...) 就能取回剩下的（一条不丢）；\n"
@@ -1899,7 +1908,13 @@ def eval_script(code: str) -> dict:
     """在游戏进程内执行 Frida JS 代码 —— 应急逃生舱。
 
     与 AiMod 的 eval_script 同定位：当预置工具不够用时，
-    直接下发 JS 探测。可用全局对象：mod / api / funcs / hooks。
+    直接下发 JS 探测。
+
+    可用全局对象：`mod` / `api` / `funcs` / `hooks`（IL2CPP 侧），
+    以及 `monoFuncs` 与 `BE`（Mono 侧的已绑定导出、以及当前选中的后端对象）。
+    后者是排查 Mono 问题的必需品：例如
+    `"typeof monoFuncs.mono_field_get_offset"` 能直接看出某个导出有没有绑上，
+    不必去复刻绑定逻辑。
 
     **返回值必须是可 JSON 序列化的**（字符串/数字/布尔/数组/普通对象）。
 
@@ -1907,6 +1922,7 @@ def eval_script(code: str) -> dict:
         "Process.arch"
         "mod.base.add(0x1000).toString()"
         "(function(){ return Process.enumerateModules().length; })()"
+        "typeof monoFuncs.mono_get_root_domain"
 
     Args:
         code: JS 表达式或语句块。

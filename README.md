@@ -263,7 +263,7 @@ GameModMCP/
 │   │   ├── index.py             SQLite 索引 + 结果句柄
 │   │   └── state.py             会话状态（发现→索引→运行时的粘合层）
 │   └── runtime/                 动态分析层
-│       ├── agent.js             Frida 探针（59 个 il2cpp API）
+│       ├── agent.js             Frida 探针（IL2CPP 59 + Mono 56 个 API，双后端）
 │       └── session.py           Frida 生命周期管理
 │
 ├── skills/gamemod-mod/SKILL.md  Agent 使用指南
@@ -285,17 +285,36 @@ GameModMCP/
 |---|---|---|---|
 | 静态查询类型 | ✅ 完整 | ✅ 完整 | ❌ 无类型系统可查 |
 | 字段类型精度 | ⚠️ 启发式（~90%） | ✅ 精确（ECMA-335 签名） | — |
-| 字段偏移 | 运行时取 | ❌ 运行时探针未实现（见下） | ❌ 需运行时，未实现 |
-| 方法地址 | 运行时取 | ⚠️ 元数据含 **IL 的 RVA**（不是机器码地址，需再算） | — |
-| 运行时 Hook | ✅ | ❌ 需先补 `mono_*` 探针 | — |
+| 字段偏移 | ✅ 运行时取 | ✅ 运行时取（`mono_field_get_offset`） | ❌ 需运行时，未实现 |
+| 方法地址 | ✅ 运行时取（含 RVA） | ✅ 运行时取（JIT 机器码，**无 RVA**） | — |
+| 运行时 Hook | ✅ | ✅（地址在 mono 模块外，直接按地址挂） | — |
+| GC 暂停 | ✅ `il2cpp_gc_disable` | ❌ 本版 Mono 无 `mono_gc_disable` 导出 | — |
 | **资源容器清单** | — | — | ✅ **pak/utoc 100% 准确** |
 | 可反编译出源码 | ❌（已转 C++） | ✅（ILSpy/dnSpy 接近源码） | ❌ |
 
-> ⚠️ **Mono 目前只有静态能力**：注入用的探针（`runtime/agent.js`）只实现了
-> IL2CPP 的 `il2cpp_*` API，**没有 `mono_*` API**，所以 Mono 游戏上
-> `runtime_class_info` / `find_hook_target` / `hook_method` 拿不到偏移与地址。
-> Mono 现在确定可用的是：类型系统查询、`decompile` 反编译源码、
-> 以及元数据里的字段布局与 IL 的 RVA（后者不是机器码地址）。
+> **两个引擎的运行时配方一致**：注入 → `runtime_class_info` 取偏移 →
+> `find_hook_target` 取落点 → `hook_method` + `drain_events`。
+> 探针里是两套实现（`il2cpp_*` 59 个 API / `mono_*` 56 个 API），
+> 对外工具与 token 对账方式完全相同（静态 token == 运行时 token）。
+> Mono 上有三条差异，都是**如实声明**而非「未实现」：
+>
+> 1. **没有 RVA**：地址来自 `mono_compile_method` 触发的 JIT，
+>    代码不在 `mono-2.0-*.dll` 内，所以 `in_module: false` 且不给 `rva`；
+>    元数据里的 RVA 指向 **IL 字节码**，不能拿来 Hook。
+> 2. **`gc_control` 不支持**：没有 `mono_gc_disable` / `mono_gc_enable`
+>    导出（四个 Mono 样本一致核实），调用会明确返回 `ok:false`。
+> 3. **程序集懒加载**：刚注入时只枚举到十来个程序集，`UnityEngine.*`
+>    要过几秒才出现（实测 13 → 164）。**注入成功后探针会等它加载稳定再返回**
+>    （判据是数量连续 4 次采样不变，实测等了 4.0 秒、看到 144 个），
+>    结果放在 `init.assemblies` 里；返回里的 `searched_images`
+>    也会如实给出当前数量，若仍未稳定可稍后重试。
+>    为什么必须等（不是保险起见）：矩阵实测 Archon Soul 在只有 13 个程序集时
+>    被 Hook 并强制调用 `get_frameCount`，**进程随后消失** ——
+>    「注入成功」与「可以 Hook 托管方法」在 Mono 上不是同一件事。
+> 4. **静态索引的范围**：Mono 的静态索引默认只收游戏自己的程序集
+>    （`Assembly-CSharp.dll`），`UnityEngine.*` 这类框架类型**静态查不到**。
+>    `class_detail` 会明确说明这一点并指向 `runtime_class_info`，
+>    而不是只回一句「用 search_classes 搜短名」（那条路走不通，它压根没被索引）。
 
 实测数据（真实游戏，非构造样本）：
 
@@ -307,6 +326,27 @@ GameModMCP/
   1,387 类型 / 6,611 方法 / 6,343 字段。
   与 Microsoft 官方 `System.Reflection.Metadata` 交叉验证 **45 张表 0 差异**，
   每类型的全名/基类/字段名/方法名 0 差异，签名解析 100%。
+  **运行时**（Frida 注入同一游戏，实测）：
+  `mono_*` 导出绑定 56 个、零缺失（四个样本的 PE 导出表逐个核实）；
+  程序集清单随游戏运行从 **13 涨到 164**（Mono 是懒加载，跨调用缓存会永久漏掉
+  `UnityEngine.*`）；`UnityEngine.Time` 的 token `0x020002e4` 与静态元数据
+  **完全一致**（`Time.get_frameCount` `0x06002468` 亦然，独立复现了
+  `System.Reflection.Metadata` 真值）；短名解析在 27,222 行类型定义里
+  0.1s 完成；Hook 上 `get_frameCount` 后捕获到真实返回值（游戏运行 14.5s 时
+  `retval=872`，与 60fps 自洽）。方法地址是 **JIT 机器码**，`in_module=false`，
+  因此**没有 RVA**（不给假数据）；`gc_control` 如实报不支持。
+  另一个实测到的坑：游戏跑约 90 秒后，**同一个程序集会被加载出两个映像**，
+  `UnityEngine.Time` 于是被枚举出两条**行号/token/命名空间/程序集名全同、
+  只有 klass 指针不同**的记录 —— 不按（程序集名 + 命名空间 + 短名）去重的话，
+  一次本可解析的查询会变成「命中 2 个同名类」，而调用方**无法消解**
+  （两条的 image / namespace / full_name 一模一样）。顺带一提，
+  内存加载的程序集 `mono_image_get_filename` 返回的是 `data-00000219A9D5A040`
+  这种**合成名**，不是路径，按路径去重不会命中。
+  第四个样本 Gambonanza 上复现并修掉了「注入太早就 Hook」这个缺陷：
+  修复前注入后 4 秒时只有 15 个程序集，`Transform` / `Time` 一律「没找到类」；
+  修复后注入即等到 144 个程序集稳定（4.0 秒），`UnityEngine.Transform`、
+  `UnityEngine.Time`、`UnityEngine.GameObject` 全部解析成功，
+  `find_hook_target` 给出候选，10 秒后进程仍在。
 - **Unreal**（CatapultHero + Dinoblade 两个样本）：
   `.pak` v11/v12 索引与 `.utoc` v8 目录索引完整解析，
   **与打包清单交叉校验 4,556/4,556、4,565/4,565、7,178/7,178、18,956/18,956 全部 100% 命中**；
@@ -317,8 +357,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 39 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 38 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 40 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 39 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -340,6 +380,7 @@ GameModMCP/
 | `verify_runtime.py` | Frida 运行时层 |
 | `verify_runtime_target.py` | 运行时定位 Hook 落点（token 对账） |
 | `verify_il2cpp_runtime.py` | 静态 token ↔ 运行时 token 交叉验证 |
+| `verify_mono_runtime.py` | **Mono 运行时探针**：56 个 `mono_*` 导出对四个样本的 PE 导出表逐个核实（含伪造名字反证）、`int/uint32/bool` 返回类型不许用 `.toInt32()`（一个真实崩溃的回归）、程序集清单按 RPC 刷新（13 → 164 的懒加载证据）、**注入后等程序集加载稳定**（用假会话测增长/恒定/一直增长/探针报错四种情形，并反证 IL2CPP 一次都不查）、真游戏上取 `UnityEngine.Time` 的真实地址与 token 对账、Hook + 事件、`gc_control` 如实报不支持 |
 | `verify_mcp_tools.py` | **通过 MCP 工具层**跑完整流程（IL2CPP） |
 | `verify_mcp_mono.py` | **通过 MCP 工具层**跑完整流程（Mono） |
 | `verify_mcp_ue.py` | **通过 MCP 工具层**验证 UE 能力真的接上了 |
