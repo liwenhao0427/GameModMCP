@@ -186,6 +186,8 @@ devtools/
 ├── verify_*.py            验收脚本（上面那批）
 ├── bench_index.py         性能基准（开索引 / 单次查询 / 重复解析）
 ├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
+├── report_multi_game_matrix.py 多游戏兼容性扫描（**报告**，不是门禁：
+│                          逐阶段驱动真服务器，产出矩阵 + 统计 JSON）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
 ├── archive/               归档的过程产物（**不参与验收**，见其中 README）
 │   └── probes/            一次性逆向侦察脚本（31 个）
