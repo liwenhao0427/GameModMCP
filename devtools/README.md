@@ -38,7 +38,17 @@ python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
 python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
 python devtools\verify_tool_coverage.py    # 静态：每个工具是否被脚本调用过（无需游戏）
+python devtools\verify_encoding_console.py # 编码健壮性：GBK 控制台下不崩（无需游戏）
 ```
+
+单跑某一个（排查用）：
+
+```powershell
+python devtools\run_all_verify.py --only verify_index
+```
+
+`--only` 只跑指定脚本，并**自动跳过动态覆盖率门禁** ——
+只跑子集不可能覆盖全部工具，跑门禁只会得到一个恒假的「未覆盖」结论。
 
 ## 确认「38 个工具真的都跑过」——动态覆盖率
 

@@ -26,7 +26,8 @@ _STRICT = "--strict" in sys.argv
 # 不做这一步会抛 UnicodeEncodeError（实测 '\u274c' codec can't encode）——
 # 尤其致命的是**失败路径**：门禁本该列出「哪个工具没被覆盖」时自己崩掉，
 # 把可操作的报错变成看不懂的编码错。
-# run_all_verify.py 会设 PYTHONIOENCODING，所以只有单独运行才暴露。
+# 注意：`run_all_verify.py` **并不设** PYTHONIOENCODING，它只是用
+# encoding="utf-8" 读子进程输出 —— 那是读，管不到本脚本**写** stdout。
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:

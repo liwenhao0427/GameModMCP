@@ -21,7 +21,17 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+# 中文 Windows 的控制台默认 GBK，本模块直接运行时（`python devtools\samples.py`）
+# 会打印 ✅ / ⚠️，不做这一步会抛 UnicodeEncodeError。
+# 注意：本模块是被各 verify_*.py **import** 的，所以这里只影响它自己的
+# 直接运行；被 import 时上层脚本已各自设好编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # ---------------------------------------------------------------- 仓库自身路径
 

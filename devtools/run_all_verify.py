@@ -24,6 +24,14 @@ import subprocess
 import sys
 import time
 
+# 中文 Windows 的控制台默认 GBK，本脚本会打印 ✅ / ❌ / 💥 之类的字符。
+# 不做这一步，**汇总打印会在最后一步崩掉**（实测 'gbk' codec can't encode
+# '\u2705'）—— 所有验收脚本都跑完了、结论却拿不到，是最亏的一种失败。
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -67,6 +75,12 @@ def main() -> int:
                     help="不跑动态覆盖率门禁")
     ap.add_argument("--retries", type=int, default=1,
                     help="崩溃时最多重试次数（默认 1）")
+    ap.add_argument("--only", action="append", default=None,
+                    metavar="脚本名",
+                    help="只跑指定的验收脚本（可重复；可写 verify_x 或 "
+                         "verify_x.py）。用于排查单个脚本，"
+                         "也让 verify_encoding_console.py 能廉价地"
+                         "验证本脚本的汇总打印路径。")
     args = ap.parse_args()
 
     scripts = sorted(
@@ -77,13 +91,29 @@ def main() -> int:
         and f != "verify_tool_coverage.py"
     )
 
+    if args.only:
+        wanted = {
+            (w if w.endswith(".py") else w + ".py") for w in args.only
+        }
+        unknown = sorted(w for w in wanted if w not in scripts)
+        if unknown:
+            print(f"⚠️  --only 指定的脚本不存在或不可跑：{unknown}")
+            print(f"     可用的有：{scripts}")
+            return 2
+        scripts = [s for s in scripts if s in wanted]
+
     print("=" * 74)
     print(f"验收脚本总览：{len(scripts)} 个")
     print("=" * 74)
 
     # 先清掉旧日志：覆盖率必须是**本次**跑出来的证据，
     # 不能与上一轮的结果混在一起。
-    if not args.no_cov:
+    #
+    # `--only` 时**绝不能清**：本脚本会被 verify_encoding_console.py
+    # 以 `--only` 嵌套调用（用来验证汇总打印路径），若嵌套的这次把日志删了，
+    # 就会把外层整套跑到一半、已经积累的覆盖率证据抹掉 ——
+    # 外层门禁随即报「工具没被调用过」的假失败。
+    if not args.no_cov and not args.only:
         try:
             os.remove(COV_LOG)
         except FileNotFoundError:
@@ -147,21 +177,29 @@ def main() -> int:
     rc = 1 if (failed or crashed) else 0
 
     if not args.no_cov:
-        print()
-        print("动态覆盖率门禁（devtools/report_tool_coverage.py --strict）")
-        print("-" * 74)
-        cov = subprocess.run(
-            [sys.executable, os.path.join(HERE, "report_tool_coverage.py"),
-             "--strict"],
-            cwd=ROOT, text=True, encoding="utf-8", errors="replace",
-        )
-        if cov.returncode != 0:
-            print("覆盖率门禁未通过：有工具没被真正调用过。")
-            rc = 1
+        # --only 时**必须**跳过门禁：只跑一两个脚本，不可能覆盖全部工具，
+        # 跑门禁只会得到一个恒假的「未覆盖」结论。这不是放水 ——
+        # 覆盖率门禁的意义是「整套跑完后的证据」，只跑子集时它没有意义。
+        if args.only:
+            print()
+            print("已用 --only 指定子集，跳过动态覆盖率门禁"
+                  "（子集不可能覆盖全部工具，跑了也没有意义）。")
         else:
-            print("覆盖率门禁通过。")
-        print("  注：覆盖率日志由本脚本统一设置（PYTHONPATH=devtools/_cov），")
-        print("     已在开跑前清空，因此是本次运行的证据。")
+            print()
+            print("动态覆盖率门禁（devtools/report_tool_coverage.py --strict）")
+            print("-" * 74)
+            cov = subprocess.run(
+                [sys.executable, os.path.join(HERE, "report_tool_coverage.py"),
+                 "--strict"],
+                cwd=ROOT, text=True, encoding="utf-8", errors="replace",
+            )
+            if cov.returncode != 0:
+                print("覆盖率门禁未通过：有工具没被真正调用过。")
+                rc = 1
+            else:
+                print("覆盖率门禁通过。")
+            print("  注：覆盖率日志由本脚本统一设置（PYTHONPATH=devtools/_cov），")
+            print("     已在开跑前清空，因此是本次运行的证据。")
 
     return rc
 

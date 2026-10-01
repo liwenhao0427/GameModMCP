@@ -35,7 +35,8 @@ import sys
 
 # 中文 Windows 的控制台默认 GBK，本脚本会打印 ✅ / ⚠️ 之类的字符，
 # 不做这一步会抛 UnicodeEncodeError（'\u2705' codec can't encode）。
-# run_all_verify.py 会设 PYTHONIOENCODING，所以只有单独运行才暴露。
+# 注意：`run_all_verify.py` **并不设** PYTHONIOENCODING（它只设
+# PYTHONPATH 与 GAMEMOD_COV_OUT），所以这个坑在套件里同样会踩到。
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
