@@ -621,15 +621,13 @@ def diagnostics(scan_processes: bool = False) -> dict:
             "find_game_processes，或传 scan_processes=True"
         )
 
-    # 顺带报一下 PE 解析能力是否可用
-    try:
-        import importlib.util
-        info["optional_packages"] = {
-            name: importlib.util.find_spec(name) is not None
-            for name in ("capstone", "pefile", "frida", "mcp")
-        }
-    except Exception:
-        info["optional_packages"] = {}
+    # 这里曾有一个 `optional_packages`：报 capstone / pefile / frida / mcp 装没装。
+    # P3 复核后删除，两个理由：
+    #   · `capstone` 与 `pefile` **本仓库从来不 import**（PE 解析是 pe.py 手写的，
+    #     也没有指令级分析），报 `false` 会让 Agent 以为「装个包就能解锁能力」，
+    #     而那个能力根本不存在 —— 这是典型的「说了话但不干活」的字段；
+    #   · `frida` / `mcp` 是真的运行时依赖，且 `frida` 上面已经报过
+    #     （`info["frida"]["installed"]`），`mcp` 恒为 true。
 
     return info
 

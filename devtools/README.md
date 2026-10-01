@@ -181,19 +181,26 @@ devtools/
 ├── bench_index.py         性能基准（开索引 / 单次查询 / 重复解析）
 ├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
-├── probes/                一次性逆向侦察脚本（31 个）
+├── archive/               归档的过程产物（**不参与验收**，见其中 README）
+│   └── probes/            一次性逆向侦察脚本（31 个）
 └── groundtruth/           真值来源
-    ├── mono/
-    │   ├── MonoGroundTruth.csproj   .NET 真值生成器（用官方
-    │   ├── Program.cs               System.Reflection.Metadata 读表，
-    │   └── gt_archon.json           与我们的解析器逐表比对）
-    └── (il2cpp 的真值直接用游戏的 il2cpp_dump.cs，不在此目录)
+    ├── GameModMCP.sln      唯一的 .NET 解决方案（下面这个真值生成器用）
+    └── mono/
+        ├── MonoGroundTruth.csproj   .NET 真值生成器（用官方
+        ├── Program.cs               System.Reflection.Metadata 读表，
+        └── gt_archon.json           与我们的解析器逐表比对）
+    (il2cpp 的真值直接用游戏的 il2cpp_dump.cs，不在此目录)
 ```
 
-`probes/` 里的脚本是**过程产物**——当初用来反推 IL2CPP v31 记录布局、
+`archive/probes/` 里的脚本是**过程产物**——当初用来反推 IL2CPP v31 记录布局、
 找出字段类型解析规则（「比 typeIndex 小的最大 byval 键」）、
-验证 pak 索引头字段顺序等等。它们**不再是验收的一部分**，
+验证 pak 索引头字段顺序等等。它们**不是验收的一部分**，也不保证还能跑；
 保留下来是因为：当格式出问题时，这些逐字节的侦察脚本是重新定位的第一步。
+**别把它和门禁混在一起**：要跑验收请用 `run_all_verify.py`（见 `archive/README.md`）。
+
+`.sln` 原先在仓库根目录（Python 项目里放 .sln 会让人误判技术栈），
+现已移到真值生成器旁边；移动时同步改了里面的相对路径，
+可用 `dotnet sln devtools\groundtruth\GameModMCP.sln list` 复核。
 
 ## 真值从哪来（为什么这些数字可信）
 

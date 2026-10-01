@@ -23,16 +23,16 @@ dependencies = [
     "frida>=16.0.0",
 ]
 
-[project.optional-dependencies]
-# 反汇编能力（可选）：需要看机器码时用
-disasm = ["capstone>=5.0.0"]
-dev = ["pytest>=7.0.0"]
+# 这里曾有两个 optional-dependencies，P3 复核后删除（都是「装了也没人用」）：
+#   · `disasm = ["capstone"]` —— 全仓库 0 处 `import capstone`，没有指令级分析；
+#   · `dev = ["pytest"]` —— 验收套件是 devtools/ 下的普通脚本，从不 import pytest。
+# 真值生成器需要 .NET，不是 pyproject 能表达的可选依赖（见 devtools/groundtruth/）。
 
 [project.scripts]
 gamemod-mcp = "gamemod_mcp.server:main"
 
-[project.urls]
-Documentation = "https://github.com/example/gamemod-mcp"
+# 这里曾有一个 `[project.urls] Documentation = "https://github.com/example/..."`：
+# 占位符，指向 example 组织。没有真实仓库地址就不写，宁可缺字段也不放假链接。
 
 [tool.setuptools]
 package-dir = { "" = "src" }

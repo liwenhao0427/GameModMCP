@@ -117,13 +117,9 @@ class UEClassInfo:
     super: str = ""
     properties: list = field(default_factory=list)
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "full_name": self.full_name,
-            "super": self.super,
-            "properties": list(self.properties),
-        }
+    # 这里曾有一个 `to_dict()`：全仓库 0 处调用（`get_class_info` 直接把
+    # 字段拼进返回值），已删除。@dataclass 还有 `dataclasses.asdict` 可用，
+    # 需要时不必自己写一份。
 
 
 # ---------------------------------------------------------------------------

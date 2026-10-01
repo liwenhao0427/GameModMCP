@@ -45,14 +45,16 @@ LIST_MODULES_ALL = 0x03
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-# 不属于游戏、但常驻的系统/工具进程（用于过滤噪音）
+# 不属于游戏、但常驻的系统/工具进程（用于过滤噪音）。
+# P3 复核时删掉了两项：`"aimodv1"`（上一个项目的工具名，本仓库不该有）与
+# 重复出现的 `"conhost"`。名字比对走 `name.lower()`，所以条目一律小写。
 NOISE_NAMES = {
     "svchost", "conhost", "idle", "system", "runtimebroker", "dwm", "csrss",
     "winlogon", "searchhost", "textinputhost", "shellexperiencehost",
     "startmenuexperiencehost", "webview2", "msedge", "chrome", "chromium",
     "explorer", "tasklist", "python", "python3", "pythonw", "node", "pwsh",
-    "powershell", "cmd", "conhost", "crashpad_handler", "steam", "steamwebhelper",
-    "aimodv1", "devenv", "code", "gameoverlayui", "audiodg", "spoolsv",
+    "powershell", "cmd", "crashpad_handler", "steam", "steamwebhelper",
+    "devenv", "code", "gameoverlayui", "audiodg", "spoolsv",
     "searchindexer", "securityhealthservice", "widgets", "sihost", "ctfmon",
     "taskhostw", "dllhost", "smartscreen", "applicationframehost",
     "backgroundtaskhost", "lockapp", "fontdrvhost", "lsass", "services",

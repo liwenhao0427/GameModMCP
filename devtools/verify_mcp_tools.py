@@ -96,6 +96,40 @@ check("UE 解析器就绪", d["engines"]["ue"]["ready"],
 check("get_diagnostics 如实标注跳过了进程扫描",
       "running_games_skipped" in d,
       "默认不扫本机进程（与 find_game_processes 职责分开）")
+
+# ---- P3-1：这里曾有一个 `optional_packages`「能力探测」字段 --------------
+# 它报的是 capstone / pefile / frida / mcp 装没装，但前两个本仓库**从来不 import**
+# （PE 解析是 pe.py 手写的，也没有指令级分析）。报 `false` 会让 Agent 以为
+# 「装个包就能解锁能力」，而那个能力根本不存在 —— 典型的「说了话但不干活」。
+check("get_diagnostics 不再报 optional_packages（否则是假能力承诺）",
+      "optional_packages" not in d,
+      "它曾把 capstone / pefile 的 find_spec 结果当成可用能力报给客户端")
+# 非空转反证：同一个 membership 判据在**确实存在**的键上必须为 True，
+# 否则上面那条可能是「拿错了字典」而恒真。
+check("（反证）同一判据在确实存在的字段上成立 → 上面那条不是恒真",
+      "decompiler" in d and "engines" in d,
+      f"顶层键={sorted(d.keys())}")
+
+# 删它的**依据**也要钉住：源码里确实没有 import capstone / pefile。
+# 哪天有人真接上指令级分析，这里会报红 —— 那时该做的是**恢复一个真的有读取方的
+# 字段**，而不是把断言删掉。
+_src_root = os.path.join(samples.ROOT, "src")
+_src_files = []
+for _dirpath, _dirnames, _filenames in os.walk(_src_root):
+    for _fn in _filenames:
+        if _fn.endswith(".py"):
+            _src_files.append(os.path.join(_dirpath, _fn))
+_src_text = "\n".join(
+    open(_f, encoding="utf-8").read() for _f in sorted(_src_files))
+check("源码里确实没有 import capstone（删掉那个字段的依据）",
+      "import capstone" not in _src_text,
+      f"扫了 {len(_src_files)} 个源文件")
+check("源码里确实没有 import pefile（PE 解析是手写的）",
+      "import pefile" not in _src_text)
+# 非空转反证：这次扫描确实读到了源码内容（否则「没找到」只是因为读了个空串）。
+check("（反证）同一次扫描能找到真实存在的 import → 扫描不是空转",
+      "import sqlite3" in _src_text,
+      f"{len(_src_text)} 字符")
 gp = S.find_game_processes()
 check("find_game_processes 可用（列运行中的游戏）", gp.get("ok") is True,
       f"本机发现 {gp.get('count')} 个")

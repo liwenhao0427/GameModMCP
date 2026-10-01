@@ -266,7 +266,8 @@ GameModMCP/
 └── devtools/                    验证脚本（见 devtools/README.md）
     ├── verify_*.py              验收脚本（对真实游戏与地面真值）
     ├── check_encoding.ps1       编码校验（UTF-8 无 BOM）
-    ├── probes/                  一次性逆向侦察脚本（格式出问题时重启定位用）
+    ├── archive/                 归档的过程产物（不参与验收）
+    │   └── probes/              一次性逆向侦察脚本（格式出问题时重启定位用）
     └── groundtruth/             真值来源（MonoGroundTruth / 官方 dump）
 ```
 
@@ -445,7 +446,9 @@ IL2CPP 和 Mono 是**两个根本不同的元数据体系**：
 
 - **Python ≥ 3.10**（实测 3.13.1）
 - `mcp ≥ 1.0`、`frida ≥ 16`（实测 17.17.0）
-- 可选：`capstone`（需要看机器码时）
+
+> 没有别的可选依赖。这里曾写着「可选：`capstone`（需要看机器码时）」——
+> 但本工具集**没有**指令级分析能力，装上它也不会多出任何功能，已删除。
 
 ---
 

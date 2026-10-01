@@ -810,21 +810,10 @@ class Index:
         return self._row_to_type(row) if row else None
 
     # ------------------------------------------------------ 查询：成员
-
-    def _member_row(self, row: sqlite3.Row, kind: str, type_name: str) -> dict[str, Any]:
-        keys = row.keys()
-        return {
-            "index": row["idx"],
-            "name": row["name"],
-            "type": type_name,
-            "return_type": (
-                adapt.resolve_method_return(self.meta, row["return_type"])
-                if kind == "method" and "return_type" in keys
-                else None
-            ),
-            "type_index": row["type_index"] if "type_index" in keys else None,
-            "owner": row["owner"],
-        }
+    #
+    # 这里曾有一个 `_member_row(row, kind, type_name)`：把 sqlite 行组装成
+    # 成员 dict。P3 复核时全仓库只有定义本身一处引用（真正在用的组装逻辑
+    # 分别在 `_type_members` / `class_detail` 里就地完成），已删除。
 
     # 句柄里最多留多少条。超过这个数就不再往句柄里堆，但 `total` 仍然是**真实总数**
     # （见下面 _paged 的说明）——「句柄不全」必须如实标注，不能悄悄截断。
