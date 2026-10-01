@@ -244,8 +244,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 22 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 21 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 23 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 22 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -253,6 +253,7 @@ GameModMCP/
 | `verify_parser.py` | IL2CPP 元数据表结构与记录布局 |
 | `verify_index.py` | 索引层：构建 / 缓存复用 / 各类查询 / 结果句柄 |
 | `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |
+| `verify_subtype.py` | 继承过滤反过来查：**与旧的逐条判定逐条相等** + 邻接表只建一次 |
 | `verify_fieldtypes.py` | 字段类型解析率与**精度**（对 27,264 条 dump 真值） |
 | `verify_adapt.py` | **跨引擎**：同一套查询 API 吃 IL2CPP + Mono |
 | `verify_mono.py` | Mono 解析器，对官方 `System.Reflection.Metadata` 真值 |

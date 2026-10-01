@@ -784,6 +784,9 @@ class Metadata:
         self._sorted_type_indexes = sorted(
             range(len(self.types)), key=lambda i: self.types[i].nested_name
         )
+        # P1-4：父下标 → 直接子类下标列表。**惰性**构建（见 `_children_map`），
+        # 因此这里只声明，不建表 —— 不查继承关系的会话一分钱都不用付。
+        self._children: dict[int, list[int]] | None = None
 
     # ------------------------------------------------------ 类型解析
 
@@ -881,6 +884,25 @@ class Metadata:
             cur = parent
         return chain
 
+    def _children_map(self) -> dict[int, list[int]]:
+        """父下标 → 直接子类下标列表，**构建一次后缓存**（P1-4）。
+
+        这是 `derived_set` 的底座：把「每个类型问一次『你继承谁』」倒过来，
+        变成「每个类型登记一次『我继承谁』」。一次 O(类型数)，
+        换来之后每次继承查询都不再重复走链。
+        """
+        cached = self._children
+        if cached is not None:
+            return cached
+        mapping: dict[int, list[int]] = {}
+        for t in self.types:
+            parent = self.parent_of(t)
+            # 自环要挡掉，否则 BFS 会把自己反复压栈（虽不致命，但白转）
+            if parent is not None and parent.index != t.index:
+                mapping.setdefault(parent.index, []).append(t.index)
+        self._children = mapping
+        return mapping
+
     def is_enum(self, type_def: TypeDef) -> bool:
         """判定是否枚举（直接基类为 System.Enum）。
 
@@ -902,6 +924,37 @@ class Metadata:
             if t.nested_name == base_full_name or t.full_name == base_full_name:
                 return True
         return False
+
+    def derived_set(self, base_full_name: str,
+                    include_self: bool = True) -> set[int]:
+        """所有继承自该类的类型**下标**（含间接继承）。P1-4。
+
+        为什么要有它：`is_subclass_of` 每次都要走一遍基类链（O(链长)），
+        而 `subtype_of` / `find_derived` 要对**每个**类型各调一次，
+        合起来是 O(类型数 × 链长)。反过来建一张邻接表只需一次 O(类型数)，
+        之后每次查询只走真正的后代 —— 宽查询实测净增从 +20~33 ms 降下来。
+
+        **语义与 `is_subclass_of` 逐条对齐**（这是硬要求，不是巧合）：
+        `nested_name` 或 `full_name` 命中该名字的类型，连同其全部后代都算；
+        同名多根时**每一个根**都算 —— 原来逐行判时这些根各自都会返回 True。
+        `include_self=False` 只去掉根自身，后代照样算
+        （`find_derived` 要的就是这个）。
+        """
+        children = self._children_map()
+        out: set[int] = set()
+        stack: list[int] = []
+        for t in self.types:
+            if t.nested_name == base_full_name or t.full_name == base_full_name:
+                if include_self:
+                    out.add(t.index)
+                stack.append(t.index)
+        while stack:
+            cur = stack.pop()
+            for child in children.get(cur, ()):
+                if child not in out:
+                    out.add(child)
+                    stack.append(child)
+        return out
 
     def image_of_type(self, type_def: TypeDef) -> str:
         """取某类型所属的程序集名（用于按 dll 过滤）。"""
@@ -995,15 +1048,22 @@ class Metadata:
         return out
 
     def find_derived(self, base_full_name: str, limit: int = 200) -> list[TypeDef]:
-        """列出所有继承自某类的类型（不含自身）。"""
+        """列出所有继承自某类的类型（不含自身）。
+
+        P1-4：改为复用 `derived_set`（邻接表惰性缓存），不再对全表逐个
+        `is_subclass_of`。**结果与顺序都和原来逐条一致**：仍然按 `self.types`
+        的顺序取前 `limit` 个。注意「不含自身」原来只排除了 `full_name` 命中
+        的那一个，这里照旧（保留 `nested_name` 命中的根 —— 原来的行为如此，
+        改语义会让 `find_derived_classes` 的结果静默变化）。
+        """
+        keep = self.derived_set(base_full_name)
         out: list[TypeDef] = []
         for t in self.types:
-            if t.full_name == base_full_name:
+            if t.full_name == base_full_name or t.index not in keep:
                 continue
-            if self.is_subclass_of(t, base_full_name):
-                out.append(t)
-                if len(out) >= limit:
-                    break
+            out.append(t)
+            if len(out) >= limit:
+                break
         return out
 
     # ------------------------------------------------------ 装配体

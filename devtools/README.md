@@ -24,6 +24,7 @@ python devtools\verify_tool_inventory.py  # 文档与代码的工具清单是否
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层
 python devtools\verify_lazy_handles.py # 结果句柄惰性物化（用解析条数断言证明）
+python devtools\verify_subtype.py     # 继承过滤反过来查（与旧的逐条判定逐条相等）
 python devtools\verify_fieldtypes.py   # 字段类型解析率与精度
 python devtools\verify_mono.py         # Mono 解析器（对官方 .NET 库真值）
 python devtools\verify_adapt.py        # 跨引擎（IL2CPP + Mono）
@@ -82,6 +83,8 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 > 另一个佐证：新增 `decompile` 后，覆盖率一度停在 38/39 ——
 > 正是因为只有 engine 层被调用、工具层没人调（`decompile` 当时的
 > **唯一**调用者绕过了工具层）。补上 `verify_mcp_decompile.py` 才回到 39/39。
+> （这里的 39 是**当时**的工具数；后来合并重复工具才降到 38，
+> 所以本节前面写的是 38/38 —— 数字随工具数变，别把 39 当成现值。）
 > 这印证了 §5.1 的结论：**静态检查看不出的「没接上」，动态门禁会立刻发现**。
 
 不需要 `$env:PYTHONPATH`：每个脚本都通过 `samples.add_src_to_path()`

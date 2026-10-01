@@ -17,7 +17,11 @@
    > 时间只用来**量化收益**；「确实没再全量解析」这件事由
    > `devtools/verify_lazy_handles.py` 用**计数断言**证明（解析条数
    > 恰好等于 limit），因为时间会闪、计数不会。
-3. **继承过滤**（P1-4）—— 核实文档里 `subtype_of` 的耗时说法。
+3. **继承过滤**（P1-4，已完成）—— `subtype_of` 原先是逐行走基类链。
+   这里跑多轮打印**分布**（最小/中位/最大）并把首轮单列 ——
+   首轮要建邻接表（一次 O(类型数)），其后才是不变量。
+   语义没变这件事由 `devtools/verify_subtype.py` 用「与旧的逐条判定
+   完全相等」证明（61 项断言）。
 
 用法：
     python devtools/bench_index.py              # 两个引擎都跑
@@ -228,6 +232,11 @@ def bench_query(label: str, mpath: Path) -> None:
     else:
         sign = "全为负 → 过滤免费"
     print(f"  → 符号：{sign}")
+    # P1-4 之后必须把「首轮」单列：第一轮要建邻接表（一次 O(类型数)），
+    # 之后才是不变量。混在一起看会误以为过滤本身很贵。
+    rest = statistics.median(ds[1:]) if len(ds) > 1 else ds[0]
+    print(f"  → 首轮（含建邻接表）净增 {ds[0]:+.1f} ms；"
+          f"其后 {len(ds) - 1} 轮中位 {rest:+.1f} ms")
     print(f"  → 抖动 {max(ds) - min(ds):.1f} ms（文档 §4.8 曾称「秒级」；"
           f"但也不该只看一个数）")
 

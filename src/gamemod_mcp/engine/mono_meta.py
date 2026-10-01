@@ -1989,6 +1989,8 @@ class Metadata:
         self._sorted_type_indexes = sorted(
             range(len(self.types)), key=lambda i: self.types[i].nested_name
         )
+        # P1-4：父下标 → 直接子类下标列表。**惰性**构建（见 `_children_map`）。
+        self._children: dict[int, list[int]] | None = None
 
     # ------------------------------------------------------ 生命周期
 
@@ -2095,6 +2097,31 @@ class Metadata:
             if name == base_full_name:
                 return True
         return False
+
+    def derived_set(self, base_full_name: str,
+                    include_self: bool = True) -> set[int]:
+        """所有继承自该类的类型**下标**（含间接继承）。P1-4。
+
+        与 `il2cpp_meta.derived_set` 的**接口和语义一致**，但这里**不建邻接表**：
+
+        - Mono 样本只有 1,387 个类型，逐条判定的实测净增约 **+1.6 ms**
+          （落在噪声里），建表的收益抵不过多一份要维护的索引；
+        - 更要紧的是 Mono 的基类是**名字**（可能指向外部程序集、解析不出
+          TypeDef 下标），按名字反推子类图容易在「同名」「跨 dll」两处出错 ——
+          不值得为一个量不出来的收益冒语义风险。
+
+        保留这个方法的真正理由是**调用方不必按引擎分叉**：
+        `index.py` 里 `subtype_of` 只有一条代码路径。
+        """
+        out: set[int] = set()
+        for t in self.types:
+            if not include_self and (
+                t.nested_name == base_full_name or t.full_name == base_full_name
+            ):
+                continue
+            if self.is_subclass_of(t, base_full_name):
+                out.add(t.index)
+        return out
 
     def image_of_type(self, type_def: TypeDef) -> str:
         """取某类型所属的模块名（Mono 的一个 .dll = 一个模块）。

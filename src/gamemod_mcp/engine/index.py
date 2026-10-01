@@ -706,12 +706,14 @@ class Index:
 
         rows = list(self.conn.execute(sql, args))
 
-        # subtype_of 需要走继承链，无法纯 SQL 表达，故在 Python 侧过滤
+        # subtype_of 需要走继承链，无法纯 SQL 表达，故在 Python 侧过滤。
+        # P1-4：**反过来查** —— 先在 meta 侧一次算出「后代下标集合」
+        # （IL2CPP 用惰性邻接表 + BFS，Mono 沿用逐条判定），再与行取交集。
+        # 原来对**每一行**调 is_subclass_of（每次都走一遍基类链）是
+        # O(行数 × 链长)，IL2CPP 宽查询实测净增 +20~33 ms。
         if subtype_of:
-            rows = [
-                r for r in rows
-                if self.meta.is_subclass_of(self.meta.types[r["idx"]], subtype_of)
-            ]
+            keep = self.meta.derived_set(subtype_of)
+            rows = [r for r in rows if r["idx"] in keep]
 
         total = len(rows)
         limit = max(1, min(limit, 2000))
