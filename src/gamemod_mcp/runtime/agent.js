@@ -773,8 +773,63 @@
     // ---------------------------------------------------------------- Hook
 
     /**
-     * 按参数规格从寄存器/栈读值。
-     * 规格字符串：int / uint / long / ulong / bool / float / double / ptr / string / cstring
+     * 安全地取第 i 个整型寄存器参数。
+     *
+     * 为什么不能写 `if (i >= args.length) break;`：Frida 17 起 `args` 是
+     * **寄存器视图**，根本不暴露 `length` —— 读 `args.length` 会直接抛
+     * `RangeError: invalid array index`。老代码的判界语句自己就是异常源，
+     * 于是任何带 `args_type` 的 Hook 在 onEnter 里就抛异常，
+     * **整条 enter 事件（含 from / thread / args）全部丢失**，只剩 leave，
+     * 调用方会误以为「参数没捕获到」而不是「探针坏了」。
+     * 所以越界只能一个一个试，失败即视为「没有这个参数」。
+     */
+    function safeArg(args, i) {
+        try {
+            var v = args[i];
+            return (v === undefined) ? null : v;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * 从 XMM 寄存器里读浮点值。
+     *
+     * x64 的浮点参数/返回值**不走** RCX/RDX/R8/R9：`args[i]` 拿到的是与
+     * 该浮点参数无关的整型寄存器（实测 Mathf.Abs(-2.5f) 的 args[0]
+     * 恰好是 RCX 的残留值）。Frida 17 把 xmm 暴露成 16 字节 ArrayBuffer，
+     * 更老的版本是 `{f: [...], d: [...]}`，这里两种都认。
+     */
+    function xmmValue(ctx, index, kind) {
+        try {
+            if (!ctx) { return null; }
+            var reg = ctx['xmm' + index];
+            if (reg === undefined || reg === null) { return null; }
+            if (reg.f && kind === 'float' && reg.f.length > 0) { return reg.f[0]; }
+            if (reg.d && kind === 'double' && reg.d.length > 0) { return reg.d[0]; }
+            var buf = null, off = 0;
+            if (reg instanceof ArrayBuffer) {
+                buf = reg;
+            } else if (typeof reg.byteLength === 'number') {
+                off = reg.byteOffset || 0;
+                buf = reg.buffer;
+            }
+            var need = (kind === 'double') ? 8 : 4;
+            if (!buf || buf.byteLength < off + need) { return null; }
+            var dv = new DataView(buf, off);
+            return (kind === 'double') ? dv.getFloat64(0, true) : dv.getFloat32(0, true);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * 按参数规格从整型寄存器读值。
+     * 规格字符串：int / uint / long / ulong / bool / ptr / string / cstring
+     *
+     * float / double **不经过这里**：x64 的浮点参数与返回值走 XMM 寄存器，
+     * 一律由 xmmValue 处理。这里对 fp 规格显式报错，避免路由漏了之后
+     * 静默按指针去读内存（那会读出垃圾或直接崩）。
      */
     function readArg(spec, raw) {
         try {
@@ -784,8 +839,8 @@
                 case 'long':    return raw.toInt64().toString();
                 case 'ulong':   return raw.toUInt64().toString();
                 case 'bool':    return raw.toInt32() !== 0;
-                case 'float':   return raw.readFloat();
-                case 'double':  return raw.readDouble();
+                case 'float':
+                case 'double':  throw new Error('浮点参数/返回值必须走 xmmValue');
                 case 'ptr':     return raw.toString();
                 case 'cstring': return cstr(raw);
                 case 'string':  return il2cppString(raw);
@@ -825,15 +880,43 @@
                         thread: this.threadId,
                         from: describeAddress(this.returnAddress)
                     };
-                    if (spec.this_type === 'string' && args.length > 0) {
-                        rec.this_str = il2cppString(args[0]);
+                    if (spec.this_type === 'string') {
+                        var selfPtr = safeArg(args, 0);
+                        if (selfPtr !== null) { rec.this_str = il2cppString(selfPtr); }
                     }
+                    // 整型参数按 RCX/RDX/R8/R9 顺序取（`this` 占第一个），
+                    // 浮点参数按 XMM0..3 顺序取 —— 两套计数器互不影响，
+                    // 混用签名时不能拿同一个下标去查两处。
                     var vals = [];
+                    var intIdx = 0, fpIdx = 0, argErr = null;
                     for (var i = 0; i < argSpecs.length; i++) {
-                        if (i >= args.length) { break; }
-                        vals.push(readArg(argSpecs[i], args[i]));
+                        var specI = argSpecs[i];
+                        if (specI === 'float' || specI === 'double') {
+                            var fv = xmmValue(this.context, fpIdx, specI);
+                            fpIdx++;
+                            if (fv === null) {
+                                argErr = 'args[' + i + ']（' + specI + '）取不到：'
+                                       + 'xmm' + (fpIdx - 1) + ' 不可读';
+                                vals.push(null);
+                                continue;
+                            }
+                            vals.push(fv);
+                            continue;
+                        }
+                        var rawI = safeArg(args, intIdx);
+                        intIdx++;
+                        if (rawI === null) { break; }
+                        try {
+                            vals.push(readArg(specI, rawI));
+                        } catch (e) {
+                            argErr = 'args[' + i + '] 读取失败：' + e.message;
+                            break;
+                        }
                     }
                     rec.args = vals;
+                    // 参数读取失败**不能**把整条 enter 事件吞掉：
+                    // 调用方要的是「这次调用发生了、从哪来」，参数是附加值。
+                    if (argErr) { rec.args_error = argErr; }
                     if (wantBacktrace) {
                         try {
                             rec.backtrace = Thread.backtrace(this.context,
@@ -859,7 +942,15 @@
                         thread: this.threadId
                     };
                     if (wantRetval) {
-                        rec.retval = readArg(retvalSpec, retval);
+                        // 浮点返回值在 XMM0，不在 RAX —— 按 ptr 读会给出一个
+                        // 看着像地址、其实毫无意义的整数（实测 0x20da0a48360）。
+                        if (retvalSpec === 'float' || retvalSpec === 'double') {
+                            var rv = xmmValue(this.context, 0, retvalSpec);
+                            rec.retval = (rv === null) ? null : rv;
+                            if (rv === null) { rec.retval_error = 'xmm0 不可读'; }
+                        } else {
+                            rec.retval = readArg(retvalSpec, retval);
+                        }
                     }
                     try { send(rec); } catch (e) { /* 同上 */ }
                 }

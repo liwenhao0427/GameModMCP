@@ -1,6 +1,6 @@
-"""验收：`server.py` 里两个**纯函数助手**（P2-5 剩余项）。
+"""验收：`server.py` / `session.py` 里的**纯函数助手**（P2-5 剩余项）。
 
-这两处原来都有「看起来对、实际是错的」行为，而且都不需要游戏就能验证：
+这几处原来都有「看起来对、实际是错的」行为，而且都不需要游戏就能验证：
 
   1. `_split_argv()` —— `launch_game(args=...)` 原来用 `args.split()`，
      含空格的路径会被拆成多个参数。改的时候差点照抄「应该用 `shlex.split`」
@@ -19,9 +19,21 @@
      （两个字段拼出来的数），也会在字段贴近页尾时把一次本可成功的读取
      变成假失败。
 
-两个都是纯函数，所以本脚本**不需要任何样本**，永远会跑。
-真正端到端的那部分（拿真实字段偏移写标记值再读回来）在
-`verify_mcp_extra.py` 里，那边要一个活着的游戏。
+  3. `_parse_arg_specs()` / `_parse_retval_type()` —— Hook 的规格名原来
+     照单全收，写错的 `flaot` 会静默按指针读一个整型寄存器，给出「看着
+     有值、其实是错值」的结果。契约第 3 条要求收下的参数真的影响行为，
+     所以写错必须报错。
+
+  4. `_retval_spec_for()` —— 返回值读法不能一律按指针：float / double 在
+     XMM0 而不在 RAX，按 ptr 读会给出毫无意义的整数（实测 `Mathf.Abs(-2.5f)`
+     得到 `0x20da0a48360`）。
+
+  5. `_overlapping_hook()` —— `write_memory` 的护栏：写已被 Hook 的函数入口
+     （哪怕写回刚读到的同样字节）实测会让游戏数秒内崩在 `0xc0000005`。
+
+这些都是纯函数，所以本脚本**不需要任何样本**，永远会跑。
+真正端到端的那部分（拿真实字段偏移写标记值再读回来、捕获参数与返回值）
+在 `verify_mcp_extra.py` / `verify_mcp_tools.py` 里，那边要一个活着的游戏。
 """
 
 from __future__ import annotations
@@ -178,6 +190,116 @@ def main() -> int:
     check("4 字节字段不会读成 8 字节（这就是原来的 bug）",
           S._field_read_width("System.Int32") == 4,
           "原来固定读 8，会连带读到相邻字段的 4 个字节")
+
+    section("3. Hook 参数规格校验 —— 收下的参数必须真的影响行为")
+    # 契约第 3 条：`args_type` 以前照单全收，写错的规格名（例如 `flaot`）
+    # 会落到探针的 `default: raw.toString()` —— 于是**悄悄**按指针读一个
+    # 整型寄存器，调用方以为拿到的是 float，实际是个地址字符串。
+    # 这类「看起来有值、其实是错值」比直接报错危险得多。
+    for good in ("int", "uint", "long", "ulong", "bool", "float", "double",
+                 "ptr", "string", "cstring"):
+        got_g = S._parse_arg_specs(good)
+        if got_g != [good]:
+            check(f"合法规格 {good} 被接受", False, f"得到 {got_g}")
+            break
+    else:
+        check("10 个合法规格名全部被接受", True, "int/uint/long/ulong/bool/"
+              "float/double/ptr/string/cstring")
+    check("逗号分隔 + 前后空白被容忍",
+          S._parse_arg_specs(" ptr , int ") == ["ptr", "int"],
+          str(S._parse_arg_specs(" ptr , int ")))
+    check("空串 → 空列表（不解析参数）", S._parse_arg_specs("") == [])
+    for bad_s in ("flaot", "intt", "Int", "float32", "ptr,int,flaot"):
+        try:
+            got_b = S._parse_arg_specs(bad_s)
+            check(f"非法规格 {bad_s!r} 必须报错", False, f"却返回 {got_b}")
+        except ValueError as exc:
+            check(f"非法规格 {bad_s!r} 报错并列出可用值",
+                  bad_s.split(",")[-1] in str(exc), str(exc)[:60])
+    check("retval_type 留空 = 按静态返回类型自动推断",
+          S._parse_retval_type("") == "")
+    try:
+        S._parse_retval_type("flaot")
+        check("非法 retval_type 必须报错", False)
+    except ValueError as exc:
+        check("非法 retval_type 报错", "flaot" in str(exc), str(exc)[:50])
+
+    section("4. `_retval_spec_for()` —— 返回值读法不能一律按指针")
+    # float / double 的返回值在 XMM0，不在 RAX：按 ptr 读会给出一个
+    # 看着像地址、其实毫无意义的整数（实测 Mathf.Abs(-2.5f) 得到
+    # 0x20da0a48360）。所以这个映射必须自动做对。
+    from gamemod_mcp.runtime import session as _sess          # noqa: E402
+    RETVAL_CASES = [
+        ("System.Single", "float"), ("System.Double", "double"),
+        ("System.Boolean", "bool"), ("System.Int32", "int"),
+        ("System.UInt32", "uint"), ("System.Int64", "long"),
+        ("System.UInt64", "ulong"), ("System.String", "string"),
+        # 认不出来的一律 ptr：原样给出寄存器值，不含糊
+        ("UnityEngine.Vector3", "ptr"), ("MyGame.SomeClass", "ptr"),
+        ("", "ptr"), (None, "ptr"),
+    ]
+    badr: list[str] = []
+    for tname, want in RETVAL_CASES:
+        got_r = _sess._retval_spec_for(tname)
+        if got_r != want:
+            badr.append(f"{tname!r} -> {got_r}（期望 {want}）")
+    check(f"{len(RETVAL_CASES)} 条返回类型映射全部正确", not badr,
+          f"不符 {len(badr)} 条：{badr[:3]}" if badr else
+          "浮点→float/double，整型按宽度，其余→ptr")
+    check("浮点返回类型不会退化成 ptr（这就是那个 bug）",
+          _sess._retval_spec_for("System.Single") != "ptr",
+          "按 ptr 读 RAX 会给出无意义的整数")
+    check("映射真的随类型变化（不是恒为 ptr 的常量）",
+          len({_sess._retval_spec_for(t) for t, _ in RETVAL_CASES}) >= 5,
+          str(sorted({_sess._retval_spec_for(t) for t, _ in RETVAL_CASES})))
+
+    section("5. `_overlapping_hook()` —— write_memory 的护栏")
+    # 实测：写已被 Hook 的函数入口（哪怕写回刚读到的同样字节）会让游戏
+    # 在数秒内崩在 0xc0000005；同一操作写在模块头（base）上则完全无害。
+    # 这个纯函数决定「要不要拦」，所以在这里钉住它。
+    class _StubRT:
+        def __init__(self, hooks):
+            self._hooks = hooks
+
+        def hook_status(self):
+            return {"ok": True, "hooks": self._hooks}
+
+    class _StubState:
+        def __init__(self, hooks, boom=False):
+            self.runtime = _StubRT(hooks)
+            self._boom = boom
+
+    hooks = [{"hook_id": "h1", "label": "verify.frameCount",
+              "target": "0x7ffa2cc4b170"}]
+    st_h = _StubState(hooks)
+    check("写入被 Hook 的入口 → 命中（必须拦）",
+          (S._overlapping_hook(st_h, "0x7ffa2cc4b170", 16) or {}).get("hook_id") == "h1",
+          "首地址相同")
+    check("写入入口 +4 字节处 → 仍命中（跳转指令有多字节）",
+          S._overlapping_hook(st_h, "0x7ffa2cc4b174", 4) is not None,
+          f"余量 {S._HOOK_ENTRY_SLACK} 字节")
+    check("写入入口 +32 字节处 → 不命中（不是整段都拦）",
+          S._overlapping_hook(st_h, "0x7ffa2cc4b190", 4) is None)
+    check("写入模块头（base）→ 不命中（实测这样写无害）",
+          S._overlapping_hook(st_h, "0x7ffa29f70000", 16) is None)
+    check("写入跨越入口的一段（起于入口前 8 字节、长 32）→ 命中",
+          S._overlapping_hook(st_h, "0x7ffa2cc4b168", 32) is not None,
+          "重叠判定要按区间，不是只看起点")
+    check("没有 Hook 时一律放行",
+          S._overlapping_hook(_StubState([]), "0x7ffa2cc4b170", 16) is None)
+    check("地址解析不了时放行（护栏只拦已知会崩的写法）",
+          S._overlapping_hook(st_h, "不是地址", 16) is None)
+    check("size<=0 时放行", S._overlapping_hook(st_h, "0x7ffa2cc4b170", 0) is None)
+
+    class _BoomRT:
+        def hook_status(self):
+            raise RuntimeError("探针不通（模拟）")
+
+    class _BoomState:
+        runtime = _BoomRT()
+
+    check("hook_status 抛异常时放行（不把写入变成不可用）",
+          S._overlapping_hook(_BoomState(), "0x7ffa2cc4b170", 16) is None)
 
     print()
     print("=" * 74)

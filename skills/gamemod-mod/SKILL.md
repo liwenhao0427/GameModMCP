@@ -16,8 +16,16 @@ description: 用 GameMod MCP 工具集做游戏 Mod：定位类/字段/方法、
 | 引擎 | 能查类型系统？ | 能查字段偏移？ | 主打能力 |
 |---|---|---|---|
 | **IL2CPP** | ✅ 类/字段/方法/token | ✅ 运行时取 | 精确定位 Hook 落点 |
-| **Mono** | ✅ 同上，且类型更精确 | ✅ 运行时取 | 同上 + 可直接反编译出 C# |
+| **Mono** | ✅ 同上，且类型更精确 | ⚠️ **只有静态偏移**（见下） | 同上 + 可直接反编译出 C# |
 | **Unreal** | ❌ | ❌ | **资源容器**（pak/utoc 里有什么） |
+
+> ⚠️ **Mono 的运行时能力目前是缺的**，不要照 IL2CPP 的配方走：
+> 注入探针（`agent.js`）只实现了 IL2CPP 的 `il2cpp_*` API，**没有实现
+> `mono_*` API**，所以 Mono 游戏上 `inject_process` / `launch_game` 之后
+> `runtime_class_info` / `find_hook_target` / `hook_method` 拿不到东西。
+> Mono 现在能确定给到的是：类型系统（`search_classes` / `class_detail`）、
+> **反编译源码**（`decompile`）、以及元数据里的字段布局信息。
+> 真要在 Mono 上做运行时 Hook，需要先补 `mono_*` 那套探针实现。
 
 下面第二节讲的「元数据优先」**只适用于 IL2CPP 与 Mono**。
 如果你确认是 Unreal，直接跳到「引擎差异 → Unreal」与「配方 0」，
@@ -216,7 +224,10 @@ close_session()        # 卸载 Hook + 断开注入 + 关索引
   decompile(type_name="SpellEffect")   # 单个类型，源码内联在 source 里
   ```
   反编译是 Mono 独有的能力：IL2CPP 没有托管元数据，必须先造 DummyDll（本工具集暂未实现）。
-- 本工具集提供静态解析；运行时 Hook 需要走 Mono 的 `mono_*` API
+- 本工具集提供**静态解析与反编译**；**运行时探针目前不支持 Mono** ——
+  探针里只有 `il2cpp_*` API，`mono_*` 那套还没实现。
+  所以 Mono 游戏上不要期待 `runtime_class_info` / `find_hook_target` /
+  `hook_method` 能用（会明确报错，不是静默给错值）。
 
 ### Unreal
 
@@ -455,6 +466,23 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 - 先不传 `args_type`（只观察调用次数和来源）
 - 再用 `class_detail` 看方法的参数类型
 - 类型表：`int`/`uint`/`long`/`ulong`/`bool`/`float`/`double`/`ptr`/`string`/`cstring`
+- 写错的规格名会**直接报错**（不会静默按指针读出一个错值）
+
+**实例方法的第一个整型位置就是 `this`**：想拿对象指针（例如喂给
+`read_field_value`）就写 `args_type="ptr"`，0 参数的方法也一样 ——
+`args[0]` 即该实例。这是拿到活对象指针的正路。
+
+```python
+hook_method(name="Object", method="get_name", namespace="UnityEngine",
+            args_type="ptr")          # 事件里 args[0] = this
+# 然后：read_field_value(instance=该 args[0], name="Object", field="m_CachedPtr")
+```
+
+**浮点参数/返回值走 XMM，不在整型寄存器里**：`float`/`double` 的规格由探针
+从 `context.xmmN` 取，不要用 `ptr` 去凑（那会读出一个看着像地址、其实毫无
+意义的整数）。返回值**不用你填** —— `hook_method` 会按静态返回类型自动推断
+（`System.Single` → `float`），返回里带 `retval_type` 可以核对；
+`hook_address` 指向原生函数时才需要手填 `retval_type`。
 
 ### 权限问题
 
@@ -472,6 +500,13 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 `write_memory` / `read_field_value` 写错地址会**立刻崩溃游戏**。
 规矩：**先读、确认值符合预期、再写**。写之前把原值记下来。
 
+**绝不要写已装 Hook 的函数入口**：Frida 的 Interceptor 拥有那几字节
+（它在入口写了跳转指令），绕过它直接写同一块内存 —— **哪怕写回刚读到的
+同样字节** —— 实测会让游戏在数秒内崩在 `0xc0000005`（Windows 事件日志里
+正是该方法 RVA 处的访问违例；同样操作写在模块头 `base` 上则完全无害）。
+工具默认会**拒绝**这种写入，要强写只能 `force=True`，正确做法是先 `unhook`。
+改行为请改**数据字段**，不要改代码字节。
+
 ---
 
 ## 自查清单
@@ -479,10 +514,12 @@ Hook `Update`、`get_frameCount` 这类每帧调用的方法时，务必设 `max
 动手前：
 - [ ] `get_diagnostics()` 看 Frida 是否可用
 - [ ] 确认游戏引擎类型（IL2CPP/Mono/UE）——**UE 走完全不同的路线**
-- [ ] 若是 IL2CPP/Mono：`open_game` 成功且类型数量合理
+- [ ] 若是 IL2CPP：`open_game` 成功且类型数量合理
+- [ ] 若是 Mono：静态查询与 `decompile` 可用，但**运行时探针不支持**
+      （`inject_process` 之后的 `runtime_*` / `hook_*` 不可用）
 - [ ] 若是 UE：`detect_ue()` 确认，再用 `ue_list_entries` 看容器
 
-定位落点时（**仅 IL2CPP / Mono**）：
+定位落点时（**仅 IL2CPP**——Mono 的 `mono_*` 探针尚未实现）：
 - [ ] 用 `class_detail` 拿到静态 token
 - [ ] 用 `find_hook_target` / `runtime_class_info` 拿到运行时地址
 - [ ] **比对两边的 token 是否一致**

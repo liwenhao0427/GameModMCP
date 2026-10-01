@@ -180,6 +180,92 @@ def _err(msg: str, **kw: Any) -> dict:
     return {"ok": False, "error": msg, **kw}
 
 
+# ------------------------------------------------------- Hook 参数规格（P1）
+#
+# `args_type` 以前是「照单全收」的：写错的规格名（例如 `flaot`）会走到探针
+# 的 `default: raw.toString()`，于是**悄悄**按指针读一个整型寄存器 ——
+# 调用方以为拿到的是 float，实际是个地址字符串。契约第 3 条要求
+# 「收下的参数必须真的影响行为」，所以这里显式校验，写错就报错。
+#
+# float / double 是特例：它们在 x64 上走 XMM 寄存器，探针会从
+# `context.xmmN` 取（见 agent.js 的 xmmValue），不要用 `ptr` 去凑。
+
+_ARG_SPECS = ("int", "uint", "long", "ulong", "bool", "float", "double",
+              "ptr", "string", "cstring")
+
+
+def _parse_arg_specs(args_type: str) -> list[str]:
+    """解析并校验 `args_type`。非法规格名抛 ValueError（调用方转成 ok:false）。"""
+    if not args_type:
+        return []
+    specs = [s.strip() for s in args_type.split(",") if s.strip()]
+    bad = [s for s in specs if s not in _ARG_SPECS]
+    if bad:
+        raise ValueError(
+            f"args_type 里有无法识别的规格：{', '.join(bad)}；"
+            f"可用：{'/'.join(_ARG_SPECS)}"
+        )
+    return specs
+
+
+def _parse_retval_type(retval_type: str) -> str:
+    """校验 `retval_type`（留空表示按静态返回类型自动推断）。"""
+    if not retval_type:
+        return ""
+    v = retval_type.strip()
+    if v not in _ARG_SPECS:
+        raise ValueError(
+            f"retval_type 无法识别：{v}；可用：{'/'.join(_ARG_SPECS)}"
+        )
+    return v
+
+
+#: 判断「写入是否撞上 Hook 入口」时给入口留的余量（字节）。
+#:
+#: Hook 会改写目标入口处的跳转指令（x64 上 5 字节的 `E9 rel32`，Frida 还可能
+#: 用更长的绝对跳转），所以命中判定不能只比首地址。
+_HOOK_ENTRY_SLACK = 16
+
+
+def _parse_hex_addr(value: Any) -> int | None:
+    """把 `"0x7ffa..."` / 裸十六进制串解析成整数；解析不了给 None。"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(s, 16)
+    except ValueError:
+        return None
+
+
+def _overlapping_hook(st: Any, address: str, size: int) -> dict | None:
+    """找出与 `[address, address+size)` 重叠的已装 Hook；没有则 None。
+
+    这是 `write_memory` 的护栏：写已被 Hook 的函数入口会崩游戏（见该工具
+    docstring 里的实测记录）。拿不到 Hook 列表时**放行**而不是拦下 ——
+    护栏的目的是拦住已知会崩的写法，不是让写入变得不可用。
+    """
+    if size <= 0:
+        return None
+    start = _parse_hex_addr(address)
+    if start is None:
+        return None
+    end = start + size
+    try:
+        res = st.runtime.hook_status()
+    except Exception:  # noqa: BLE001 —— 探针不通就不拦
+        return None
+    for h in (res.get("hooks") or []):
+        tgt = _parse_hex_addr(h.get("target"))
+        if tgt is None:
+            continue
+        if start < tgt + _HOOK_ENTRY_SLACK and tgt < end:
+            return h
+    return None
+
+
 # ------------------------------------------------------- 响应体积上限（P2-4）
 #
 # 契约第 5 条「不返回超大结果」以前靠每个工具各自的 `limit` 自觉遵守，
@@ -1369,6 +1455,7 @@ def hook_method(
     backtrace: bool = False,
     token: str = "",
     param_count: int = -1,
+    retval_type: str = "",
 ) -> dict:
     """在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。
 
@@ -1389,6 +1476,9 @@ def hook_method(
         args_type: 参数类型列表，逗号分隔，用于解析参数值。
                    可选：int/uint/long/ulong/bool/float/double/ptr/string/cstring
                    例："ptr,int,float"。留空则不解析参数值。
+                   写错规格名会直接报错（不再静默按指针读）。
+                   **实例方法的第一个整型位置是 `this`**：想拿对象指针就写
+                   "ptr"（0 参数方法也一样，第 1 个 ptr 即 this）。
         label:     自定义标签，便于在事件里识别（默认 "类名.方法名"）。
         max_calls: 最多记录多少次调用（防止高频方法刷爆事件队列）。
         backtrace: 是否记录调用栈（较慢，排障时用）。
@@ -1396,22 +1486,30 @@ def hook_method(
                    静态元数据的 class_detail / get_method_source 里就有。
         param_count: 目标重载的参数个数（-1 表示不指定）。仅在拿不到 token
                    且各重载参数个数不同时可用。
+        retval_type: 返回值读取类型（int/uint/long/ulong/bool/float/double/
+                   ptr/string/cstring）。留空 = 按静态返回类型自动推断，
+                   这是推荐用法：float/double 的返回值在 XMM0 而不在 RAX，
+                   按 ptr 读会给出毫无意义的整数。
 
     Returns:
         {ok, hook_id, class, method, chosen: {pointer, rva_hex, token},
-         candidate_count, usable_count}
+         retval_type, return_type, candidate_count, usable_count}
         失败时 {ok: false, error, candidates: [...]}。
     """
     st = state.state()
     if not st.has_runtime():
         return _err("当前没有已注入的运行时会话。请先调用 inject_process "
                     "或 launch_game。")
-    specs = [s.strip() for s in args_type.split(",") if s.strip()] if args_type else []
+    try:
+        specs = _parse_arg_specs(args_type)
+        rv = _parse_retval_type(retval_type)
+    except ValueError as exc:
+        return _err(str(exc))
     try:
         res = st.runtime.hook_method(
             namespace=namespace, name=name, method=method, image=image,
             args=specs, label=label, max_calls=max_calls, backtrace=backtrace,
-            token=token, param_count=param_count,
+            token=token, param_count=param_count, retval_type=rv,
         )
         return res if res.get("ok") else _err(res.get("error", "Hook 失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
@@ -1438,6 +1536,7 @@ def hook_address(
     Args:
         address:    目标地址，十六进制（如 "0x7ffa05f7f050"）。
         args_type:  参数类型列表，逗号分隔（同 hook_method）。
+                    写错规格名会直接报错。
         retval_type: 返回值类型（int/uint/float/double/ptr/string/bool）。
         max_calls:  最多记录多少次。
         backtrace:  是否记录调用栈。
@@ -1446,11 +1545,15 @@ def hook_address(
     if not st.has_runtime():
         return _err("当前没有已注入的运行时会话。请先调用 inject_process "
                     "或 launch_game。")
-    specs = [s.strip() for s in args_type.split(",") if s.strip()] if args_type else []
+    try:
+        specs = _parse_arg_specs(args_type)
+        rv = _parse_retval_type(retval_type) or "ptr"
+    except ValueError as exc:
+        return _err(str(exc))
     try:
         res = st.runtime.hook(address=address, args=specs, label=label,
                               max_calls=max_calls, backtrace=backtrace,
-                              retval_type=retval_type)
+                              retval_type=rv)
         if not res.get("ok"):
             return _err(res.get("error", "Hook 失败"), **{
                 k: v for k, v in res.items() if k not in ("ok", "error")
@@ -1557,20 +1660,41 @@ def read_memory(address: str, size: int = 16) -> dict:
 
 @mcp.tool(annotations=_ann("写游戏内存", read_only=False, destroy=True, idempotent=True, open_world=True))
 @_cap_response
-def write_memory(address: str, hex_data: str) -> dict:
+def write_memory(address: str, hex_data: str, force: bool = False) -> dict:
     """写游戏进程内存。
 
     ⚠️ **危险操作**：写错地址会立刻崩溃游戏。
     写之前务必先用 read_memory 确认地址内容符合预期。
     建议只改浮点数/整数这类简单值，并先备份原值。
 
+    **不要写已装 Hook 的函数入口**：Frida 的 Interceptor 拥有那几字节
+    （它在那里写了跳转指令），绕过它直接 `Memory.protect` + 写同一块内存，
+    **哪怕写回刚读到的同样字节**，也会在数秒内让游戏崩溃 ——
+    实测两次：Windows 事件日志里是 `GameAssembly.dll` 在该方法 RVA 处的
+    `0xc0000005`；同样操作写在模块头（`base`）上则完全无害且能原样读回。
+    本工具默认**拒绝**这种写入；确实要写请传 `force=True`，
+    或者先 `unhook` 再写。
+
     Args:
         address:  地址（十六进制）。
         hex_data: 要写入的字节，十六进制串（如 "0000803f" 表示 float 1.0）。
+        force:    明知目标被 Hook 覆盖仍要写（默认 False = 拒绝）。
     """
     st = state.state()
     if not st.has_runtime():
         return _err("当前没有已注入的运行时会话。")
+    size = len(hex_data.strip()) // 2
+    if not force:
+        hit = _overlapping_hook(st, address, size)
+        if hit:
+            return _err(
+                "拒绝写入：目标与已装 Hook 的函数入口重叠"
+                f"（{hit['hook_id']} {hit.get('label')} @ {hit['target']}）。"
+                "Frida 的 Interceptor 拥有那几字节，直接写会让游戏在数秒内崩溃"
+                "（实测 0xc0000005）。要改行为请改数据字段，或先 unhook；"
+                "确实要写请传 force=True。",
+                hook=hit,
+            )
     try:
         res = st.runtime.write_memory(address, hex_data)
         return res if res.get("ok") else _err(res.get("error", "写入失败"), **{

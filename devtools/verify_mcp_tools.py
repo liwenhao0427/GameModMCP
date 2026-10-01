@@ -946,6 +946,126 @@ if pid:
     if r5.get("ok"):
         S.unhook(r5.get("hook_id"))
 
+    # ============================================ 11c. 参数捕获与返回值类型
+    show("11c. args_type 参数捕获 / retval_type 推断（Frida 17 回归）")
+    # 回归背景：Frida 17 起 onEnter 的 `args` 是**寄存器视图**，不再暴露
+    # `length` —— 读 `args.length` 会抛 `RangeError: invalid array index`。
+    # 老代码的判界语句 `if (i >= args.length) break;` 自己就是异常源，于是
+    # **任何带 args_type 的 Hook 在 onEnter 就抛异常，整条 enter 事件
+    # （含 from / thread / args）全部丢失**，只剩 leave。症状极具误导性：
+    # 调用方会以为「这个方法的参数没捕获到」，而不是「探针坏了」。
+    #
+    # 这里拿 Mathf.Abs(float) 当靶子，一次覆盖三条路径：
+    #   · 浮点参数（x64 走 XMM0，根本不在整型寄存器里）
+    #   · 浮点返回值（同样在 XMM0；按 ptr 读 RAX 会给出无意义的整数）
+    #   · 返回值类型按静态返回类型自动推断
+    abs_static = S.class_detail("UnityEngine.Mathf", method_name="Abs")
+    abs_f = [m for m in (abs_static.get("methods") or [])
+             if str(m.get("return_type")) == "System.Single"]
+    check("静态元数据里能看到 Mathf.Abs(float)", bool(abs_f),
+          f"共 {len(abs_static.get('methods') or [])} 个重载")
+    if abs_f:
+        S.drain_events(limit=1000)          # 清空旧事件，避免拿旧事件冒充
+        h_abs = S.hook_method(name="Mathf", method="Abs", namespace="UnityEngine",
+                              token=abs_f[0].get("token"), args_type="float",
+                              max_calls=4, label="verify.args.abs")
+        check("挂 Mathf.Abs(float) 成功", h_abs.get("ok"),
+              str(h_abs.get("error"))[:60])
+        check("返回值类型按静态返回类型自动推断为 float（不用手填）",
+              h_abs.get("retval_type") == "float",
+              f"retval_type={h_abs.get('retval_type')} "
+              f"return_type={h_abs.get('return_type')}")
+        if h_abs.get("ok"):
+            a_addr = (h_abs.get("chosen") or {}).get("pointer")
+            called = S.eval_script(
+                "(function(){"
+                f"  var f = new NativeFunction(ptr('{a_addr}'), 'float', ['float']);"
+                "  return f(-2.5);"
+                "})()"
+            )
+            check("探针之外强制调用 Mathf.Abs(-2.5) 得到 2.5（对照组）",
+                  abs(float(called.get("value") or 0) - 2.5) < 1e-6,
+                  f"value={called.get('value')}")
+            time.sleep(0.5)
+            evs = S.drain_events(limit=200).get("events") or []
+            e_in = [e for e in evs if e.get("phase") == "enter"]
+            e_out = [e for e in evs if e.get("phase") == "leave"]
+            e_err = [e for e in evs if e.get("type") == "script_error"]
+            check("捕获到 enter 事件（老代码这里一条都没有）",
+                  bool(e_in), f"enter={len(e_in)} leave={len(e_out)}")
+            got_args = ((e_in[0].get("args") if e_in else None) or [])
+            check("enter 的 args[0] == -2.5（浮点参数从 XMM0 取）",
+                  bool(got_args) and abs(float(got_args[0]) + 2.5) < 1e-6,
+                  f"args={got_args}")
+            got_rv = e_out[0].get("retval") if e_out else None
+            check("leave 的 retval == 2.5（不再按 ptr 读 RAX）",
+                  got_rv is not None and abs(float(got_rv) - 2.5) < 1e-6,
+                  f"retval={got_rv}")
+            check("onEnter 不再抛异常（无 script_error 事件）",
+                  not e_err,
+                  f"{[str(e.get('description'))[:40] for e in e_err][:2]}")
+            S.unhook(h_abs.get("hook_id"))
+
+    # 规格名写错必须报错：以前静默落到 `default: raw.toString()`，
+    # 于是 `flaot` 会被当成指针读一个整型寄存器，给出看似合理的错值。
+    bad_spec = S.hook_method(name="Mathf", method="Abs", namespace="UnityEngine",
+                             token=(abs_f[0].get("token") if abs_f else ""),
+                             args_type="flaot", max_calls=2,
+                             label="verify.args.bad")
+    check("args_type 写错规格名 → 明确报错（不静默降级）",
+          bad_spec.get("ok") is False and "flaot" in str(bad_spec.get("error")),
+          str(bad_spec.get("error"))[:70])
+    bad_rv = S.hook_address(address="0x1000", args_type="int",
+                            retval_type="flaot", max_calls=1)
+    check("retval_type 写错规格名 → 明确报错",
+          bad_rv.get("ok") is False and "flaot" in str(bad_rv.get("error")),
+          str(bad_rv.get("error"))[:70])
+
+    # 实例方法的第 1 个整型位置就是 this —— 这是「拿对象指针去读字段」的正路，
+    # 也是 read_field_value 唯一能拿到 instance 的来源（静态字段读不了，
+    # 见 read_field_value 的 instance_only 约束）。
+    # 这条同时覆盖「自然调用」（不靠强制调用）与「args[0] 真是对象」。
+    S.drain_events(limit=1000)
+    h_self = S.hook_method(name="Object", method="get_name",
+                           namespace="UnityEngine", args_type="ptr",
+                           max_calls=8, label="verify.args.this")
+    check("挂 UnityEngine.Object.get_name（实例方法）成功", h_self.get("ok"),
+          str(h_self.get("error"))[:60])
+    if h_self.get("ok"):
+        this_ptr, waited = None, 0.0
+        while waited < 25.0 and not this_ptr:
+            time.sleep(1.0)
+            waited += 1.0
+            for e in (S.drain_events(limit=200).get("events") or []):
+                if e.get("id") == h_self.get("hook_id") and e.get("phase") == "enter":
+                    a = e.get("args") or []
+                    if a:
+                        this_ptr = a[0]
+                        break
+        check(f"实例方法的 enter 事件带 args[0]=this（自然调用，等了 {waited:.0f}s）",
+              bool(this_ptr), f"this={this_ptr}")
+        if this_ptr:
+            # 用这个 this 真读一个字段：args[0] 若不是一个真对象，这里必然失败
+            cd_obj = S.class_detail("UnityEngine.Object")
+            flds = [f.get("name") for f in (cd_obj.get("fields") or [])][:3]
+            ok_field, tried = None, []
+            for fn in flds:
+                rv = S.read_field_value(instance=this_ptr, name="Object",
+                                        field=fn, namespace="UnityEngine")
+                tried.append(f"{fn}={'ok' if rv.get('ok') else str(rv.get('error'))[:24]}")
+                if rv.get("ok"):
+                    ok_field = (fn, rv)
+                    break
+            check("read_field_value 能读 this 的实例字段（args[0] 确实是对象）",
+                  ok_field is not None, "；".join(tried) or "该类没有字段")
+            if ok_field:
+                _fr = ok_field[1]
+                print(f"       {ok_field[0]} = {_fr.get('raw_hex')} "
+                      f"（宽度 {_fr.get('read_width')} 字节，"
+                      f"地址 {_fr.get('field_address')}，"
+                      f"as_pointer={_fr.get('as_pointer')}）")
+        S.unhook(h_self.get("hook_id"))
+
     # ============================================================ 12. 内存与扫描
     show("12. read_memory / write_memory / scan_pattern / eval_script")
     # 用持久缓冲区做读写往返（避免 GC 干扰）
@@ -964,6 +1084,38 @@ if pid:
 
     bad = S.read_memory("0x1", 8)
     check("无效地址被正确拒绝", bad.get("ok") is False, bad.get("error", "")[:40])
+
+    # 护栏：写已被 Hook 的函数入口实测会让游戏数秒内崩在 0xc0000005
+    # （Windows 事件日志里就是该方法 RVA 处的访问违例），所以默认必须拦住。
+    # 这里**只验拒绝**，不验 force=True 的放行 —— 那一下真的会崩游戏，
+    # 放行路径的判定逻辑由 verify_server_helpers.py 的纯函数用例覆盖。
+    h_guard = S.hook_method(name="Time", method="get_frameCount",
+                            namespace="UnityEngine", max_calls=2,
+                            label="verify.mem.guard")
+    check("为内存护栏准备一个 Hook", h_guard.get("ok"),
+          str(h_guard.get("error"))[:60])
+    if h_guard.get("ok"):
+        g_tgt = h_guard.get("target") or (h_guard.get("chosen") or {}).get("pointer")
+        g_bytes = S.read_memory(g_tgt, 8).get("hex") or "90"
+        blocked = S.write_memory(g_tgt, g_bytes)
+        check("write_memory 拒绝写已 Hook 的函数入口（实测会崩游戏）",
+              blocked.get("ok") is False and "Hook" in str(blocked.get("error")),
+              str(blocked.get("error"))[:80])
+        check("拒绝时给出是哪个 Hook 被撞上",
+              (blocked.get("hook") or {}).get("hook_id") == h_guard.get("hook_id"),
+              f"hook={blocked.get('hook')}")
+        # 卸载之后同一地址就能写了（护栏不是按地址永久拉黑）。
+        # 注意：必须**重新读**一次字节 —— Hook 期间读到的是 Frida 写的跳转，
+        # 卸载后它已被还原成原序言，写回旧字节等于把跳转又贴回去。
+        S.unhook(h_guard.get("hook_id"))
+        g_now = S.read_memory(g_tgt, 8).get("hex") or "90"
+        after_unhook = S.write_memory(g_tgt, g_now)
+        check("unhook 之后同一地址可以正常写（护栏不是永久拉黑）",
+              after_unhook.get("ok") is True,
+              f"写回原字节 {g_now}：{str(after_unhook.get('error'))[:50]}")
+        check("卸载前后同一入口的字节确实不同（说明读到的真是跳转）",
+              g_now.lower() != g_bytes.lower(),
+              f"Hook 中 {g_bytes} → 卸载后 {g_now}")
 
     sp = S.scan_pattern("4D 5A", max_results=8)
     check("scan_pattern 返回 ok", sp.get("ok"), sp.get("error", ""))

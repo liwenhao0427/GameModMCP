@@ -108,6 +108,40 @@ def agent_source() -> str:
 # ---------------------------------------------------------------- 重载选择
 
 
+# .NET 类型名 → 探针的读值规格。
+#
+# 为什么需要它：返回值读法**不能**一律按指针。x64 上 float / double 的返回值
+# 在 XMM0，按 ptr 去读 RAX 会给出一个看着像地址、其实毫无意义的整数
+# （实测 Mathf.Abs(-2.5f) 的 retval 是 0x20da0a48360）。整型家族按各自宽度读，
+# 引用类型/结构体/枚举一律给 ptr（枚举的底层整型值就在 RAX 里，读出来即原值）。
+_RETVAL_SPECS = {
+    "System.Single": "float",
+    "System.Double": "double",
+    "System.Boolean": "bool",
+    "System.Int32": "int",
+    "System.UInt32": "uint",
+    "System.Int16": "int",
+    "System.UInt16": "uint",
+    "System.SByte": "int",
+    "System.Byte": "uint",
+    "System.Char": "uint",
+    "System.Int64": "long",
+    "System.UInt64": "ulong",
+    "System.String": "string",
+}
+
+
+def _retval_spec_for(return_type: Any) -> str:
+    """把 .NET 返回类型名映射成探针的读值规格；认不出来就给 `ptr`。
+
+    认不出来时给 `ptr` 而不是猜：`ptr` 至少是「原样给出寄存器值」这个
+    不含糊的语义，调用方可以自己判断。
+    """
+    if not return_type:
+        return "ptr"
+    return _RETVAL_SPECS.get(str(return_type).strip(), "ptr")
+
+
 def _norm_token(tok: Any) -> str:
     """把 token 归一化成 8 位小写十六进制，便于跨表示比较。
 
@@ -415,7 +449,8 @@ class RuntimeSession:
                     image: str = "", args: list[str] | None = None,
                     label: str = "", max_calls: int = 200,
                     backtrace: bool = False, preferred_module: str = "",
-                    token: str = "", param_count: int = -1) -> dict:
+                    token: str = "", param_count: int = -1,
+                    retval_type: str = "") -> dict:
         """便捷入口：按 类+方法名 直接 Hook。
 
         这是「元数据优先」工作流的收口：Agent 用静态元数据查到目标方法，
@@ -429,6 +464,12 @@ class RuntimeSession:
         - 给了 `param_count`：按参数个数匹配；若仍有多个，返回歧义错误。
         - 都没给且候选唯一：直接挂（保持简单场景好用）。
         - 都没给且候选多个：**拒绝猜测**，返回 `ok: False` + 候选清单。
+
+        **返回值类型**：`retval_type` 留空时按运行时给出的 `return_type`
+        自动推断（见 `_retval_spec_for`）。这件事必须自动做对，因为
+        float / double 返回值在 XMM0 而不在 RAX：按 `ptr` 读会给出一个
+        看着像地址、其实毫无意义的整数（实测 `Mathf.Abs(-2.5f)` 得到
+        `0x20da0a48360`）。
         """
         tgt = self.method_target(namespace, name, method, image=image,
                                  preferred_module=preferred_module)
@@ -451,8 +492,10 @@ class RuntimeSession:
         if err is not None:
             return err
         chosen = selected
+        rv_type = retval_type or _retval_spec_for(chosen.get("return_type"))
         out = self.hook(chosen["pointer"], args=args, label=label or f"{name}.{method}",
                         max_calls=max_calls, backtrace=backtrace,
+                        retval_type=rv_type,
                         preferred_module=preferred_module)
         if out.get("ok"):
             out["class"] = tgt.get("class")
@@ -464,6 +507,10 @@ class RuntimeSession:
             }
             out["candidate_count"] = len(cands)
             out["usable_count"] = len(usable)
+            # 把「返回值按什么类型读」如实回报：float/double 走 XMM，
+            # 读错寄存器会给出看着像地址、其实毫无意义的整数。
+            out["retval_type"] = rv_type
+            out["return_type"] = chosen.get("return_type")
         return out
 
     def unhook(self, hook_id: str) -> dict:
