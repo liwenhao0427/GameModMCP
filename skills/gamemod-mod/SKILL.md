@@ -164,9 +164,25 @@ launch_game(exe="D:\\...\\Game.exe")          # 还没启动（能抢在初始�
 `launch_game` 更强：能在对象被创建**之前**装好 Hook，适合拦截只执行一次的初始化逻辑。
 但它需要等游戏加载 DLL，返回里的 `init.waited` 会告诉你等了多久。
 
+**同名进程已经在跑时它会直接拒绝**（`ok:false` + `running_pid` + `hint`）：
+Unity 游戏普遍带单实例锁，第二个进程**不会**加载 `GameAssembly.dll`，
+继续启动只会白等 60 秒再报「IL2CPP 运行时未就绪」—— 那个报错会把你带向
+「探针坏了」的错误方向。出路在 `hint` 里：`inject_process(pid=...)` 注入已在跑的
+那个，或先 `taskkill` 掉它。**注意**：这种情况下也说明游戏其实**已经开着**了，
+先想想是不是该直接注入它。
+
 附带的 `args=` 按 **Windows** 习惯拆：空白分隔、双引号内保留空白、反斜杠**不是**
 转义符（所以 `-path "C:\\Games\\My Game\\a.txt"` 里的反斜杠照原样传进去，
 含空格的路径**必须**加引号）。
+
+**`init.attempts` 大于 2 是正常的**，不是故障：`GameAssembly.dll` 加载完、
+导出能解析，**并不等于** IL2CPP 运行时已经初始化好。域还没建好时探针会明确
+返回「IL2CPP 域尚未初始化」并**继续重试**（最多 60 秒），直到域真的可用才附着线程。
+早期版本在这里「静默降级」——把附着失败记一笔就继续跑，结果后续每次 il2cpp 调用
+都在未附着的线程上执行，**直接把游戏搞崩**（实测 9 个 IL2CPP 游戏里 6 个中招，
+Windows 事件日志里是 `GameAssembly.dll` 的 `0x80000003`）。
+所以：如果注入返回里带这类错误、且长时间拿不到就绪，**别硬上**——
+去 `runtime_info` 看 `image_count`，先确认探针是不是真的活着。
 
 ### 第 5 步：拿真实落点
 
@@ -175,6 +191,14 @@ runtime_class_info(name="PresetLoaderV2")
 # → fields: [{name, type, offset: 32, is_static}]       ← 真实字段偏移
 # → methods: [{name, token, pointer, rva_hex, in_module}] ← 真实方法地址
 ```
+
+**类名怎么传**（`runtime_class_info` / `find_hook_target` / `read_field_value` 通用）：
+
+| 你要找的 | 怎么传 | 结果 |
+|---|---|---|
+| 带命名空间的顶层类 | `name="Transform"`（namespace 可省） | 按**顶层**类型短名解析，唯一就采用，多个则 `ambiguous:true` + `candidates` |
+| 同上，想精确 | `name="Transform", namespace="UnityEngine"`，或 `name="UnityEngine.Transform"` | 同一个类，三条路返回的 `full_name` 与字段偏移完全一致 |
+| **嵌套类型**（状态机 `State`、协程体 `<Xxx>d__4`、私有内部类） | 必须给**完整嵌套名**（`search_classes` 的 `nested_name`，如 `ChapterE3_FinalBossCorridor.<ProcessSequence>d__4`） | 只用短名会被拒绝：嵌套类型在静态索引里 namespace 为空，拿短名兜会撞上一堆同名类 |
 
 **这是整个流程的核心产出**。到这里你就有：
 - 字段的字节偏移 → 可以用 `read_memory` / `read_field_value` 读写数值

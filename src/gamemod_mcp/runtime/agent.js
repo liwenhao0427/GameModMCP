@@ -158,6 +158,26 @@
         return '0x' + s;
     }
 
+    /**
+     * 取 IL2CPP 域指针，**取不到有效指针就返回 null**。
+     *
+     * 为什么不直接 `funcs.il2cpp_domain_get()`：IL2CPP 初始化完成前它会返回
+     * 野指针（实测 0x135）。野指针本身读不出异常，但一旦传给
+     * `il2cpp_thread_attach` 就是 access violation；而那个异常被吞掉之后，
+     * 后续 il2cpp 调用会在未附着的线程上执行，**把游戏搞崩**。
+     * 所以这里主动读一下它指向的第一个指针：能读通才算「域真的建好了」。
+     */
+    function domainPointer() {
+        try {
+            var d = funcs.il2cpp_domain_get();
+            if (!d || d.isNull()) { return null; }
+            d.readPointer();
+            return d;
+        } catch (e) {
+            return null;
+        }
+    }
+
     /** 安全读 C 字符串，空指针返回 null 而不是抛异常。 */
     function cstr(p) {
         if (p === null || p === undefined) { return null; }
@@ -214,6 +234,17 @@
             return cstr(funcs.il2cpp_class_get_namespace(klass));
         }
         return null;
+    }
+
+    /** 是否嵌套类型（IL2CPP 里嵌套类型的 namespace 为空、只有短名）。 */
+    function isNestedClass(klass) {
+        if (!funcs.il2cpp_class_get_declaring_type) { return false; }
+        try {
+            var outer = funcs.il2cpp_class_get_declaring_type(klass);
+            return !!(outer && !outer.isNull());
+        } catch (e) {
+            return false;
+        }
     }
 
     /** 由类拼出完整名（嵌套类型会补上外层链）。 */
@@ -415,13 +446,35 @@
                         { module: mod.name, missing: apiMissing });
         }
 
-        // 附着当前 Frida 线程到 GC 域，否则调用 il2cpp 接口可能崩溃
+        // 附着当前 Frida 线程到 GC 域，否则调用 il2cpp 接口可能崩溃。
+        //
+        // **这里的判断很关键，是实测踩出来的**：`GameAssembly.dll` 已加载、
+        // 导出也解析得到，并不代表 IL2CPP 运行时已经初始化好 ——
+        // `il2cpp_init` 还没跑完时 `il2cpp_domain_get()` 会返回**野指针**。
+        // 实测 9 个 IL2CPP 游戏里有 6 个命中：`il2cpp_thread_attach` 报
+        // `access violation accessing 0x135`，而老代码把它当作「可降级的
+        // fallback」吞掉继续跑 → 之后每一次 il2cpp 调用都在**未附着的线程**
+        // 上执行 → 游戏触发 IL2CPP 断言（0x80000003）**当场崩溃**。
+        // 事件日志里的证据：Meta Ghost / PassTheFear / Wanderburg 的
+        // GameAssembly.dll 0x80000003，且只在这 6 个游戏上出现。
+        //
+        // 所以：域没好就返回**可重试**的失败，让宿主继续轮询
+        // （`RuntimeSession.wait_ready` 会每 0.5s 重试，最多 60s）；
+        // 附着失败也一律拒绝继续，绝不「静默降级后带着一个会崩游戏的会话」。
         if (funcs.il2cpp_thread_attach) {
+            var dom = domainPointer();
+            if (!dom) {
+                return fail('IL2CPP 域尚未初始化（il2cpp_domain_get 还没返回有效指针），' +
+                            '稍后重试即可',
+                            { module: mod.name });
+            }
             try {
-                var domain = funcs.il2cpp_domain_get();
-                funcs.il2cpp_thread_attach(domain);
+                funcs.il2cpp_thread_attach(dom);
             } catch (e) {
-                fallbacks.push('il2cpp_thread_attach 调用失败：' + e.message);
+                return fail('无法把探针线程附着到 IL2CPP 域：' + e.message +
+                            '。未附着的线程上调用 il2cpp 接口会让游戏崩溃，' +
+                            '因此这里拒绝继续（稍后重试通常就能成功）',
+                            { module: mod.name, domain: dom.toString() });
             }
         }
 
@@ -533,7 +586,12 @@
                     image: imgs[i],
                     name: shortName,
                     namespace: classNamespace(k) || '',
-                    full_name: nestedFullName(k)
+                    full_name: nestedFullName(k),
+                    // 嵌套与否必须问 declaring_type，**不能**用
+                    // `full_name !== name` 去猜 —— 带命名空间的顶层类型
+                    // （UnityEngine.Transform）也满足那个条件，会把它们
+                    // 一起误判成嵌套类型。
+                    is_nested: isNestedClass(k)
                 };
                 if (ent.full_name) {
                     if (!byFull[ent.full_name]) { byFull[ent.full_name] = []; }
@@ -598,11 +656,25 @@
         for (var i = 0; i < pool.length; i++) {
             var e = pool[i];
             if (img && e.image.name !== img.name) { continue; }
-            // 命中条件：完整名相等，或（命名空间 + 短名）相等
+            // 嵌套类型：namespace 是空的（IL2CPP 的 namespace 只属于最外层），
+            // 判定必须问 declaring_type，见 classIndex 里的 is_nested。
+            var isNested = (e.is_nested === true);
+            // 命中条件三条：
+            //   ① 完整名相等（调用方给了含嵌套外层的完整名）
+            //   ② 调用方**显式**给了 namespace：按 namespace + 短名匹配
+            //   ③ 调用方没给 namespace：只匹配**顶层**类型
+            // ③ 里必须排除嵌套类型 —— 老写法是
+            // `e.namespace === '' && e.name === name`，而嵌套类型的 namespace
+            // 正好也是空，于是 `name="Transform"` 会命中
+            // `UnityEngine.RuleTile.TilingRuleOutput.Transform` 这个嵌套枚举，
+            // **静默返回完全不相干的类**（实测 RIP_nz 上就是这样，
+            // 而且 fields 非空，看起来一切正常）。
             var byFullName = (e.full_name === wantFull);
-            var byNsShort = (e.namespace === (namespace || '') &&
-                             e.name === String(name));
-            if (!byFullName && !byNsShort) { continue; }
+            var byNsShort = (namespace !== '' &&
+                             e.namespace === namespace && e.name === String(name));
+            var byTopShort = (namespace === '' && !isNested &&
+                              e.name === String(name));
+            if (!byFullName && !byNsShort && !byTopShort) { continue; }
             var key = e.full_name + '@' + e.image.name;
             if (seen[key]) { continue; }
             seen[key] = 1;
@@ -643,8 +715,9 @@
             return {
                 ok: false,
                 error: '类名有歧义：' + label + ' 在运行时匹配到 ' +
-                       r.candidate_count + ' 个类。请用 image= 或' +
-                       '**完整嵌套名**（candidates[].full_name）指定唯一目标。',
+                       r.candidate_count + ' 个类。请用 namespace= 或 image= ' +
+                       '缩小范围；嵌套类型请用完整嵌套名' +
+                       '（candidates[].full_name）指定唯一目标。',
                 ambiguous: true,
                 candidate_count: r.candidate_count,
                 want_full: r.want_full,
@@ -654,7 +727,15 @@
                       '要定位它请把 name 传成完整的嵌套名。'
             };
         }
-        return fail('未找到类 ' + label, { image: imageName || '(全部映像)' });
+        // 找不到时把「命名空间」这条硬门槛说清楚 —— 老错误信息
+        // 「未找到类 Transform」会让 Agent 以为类不存在，然后放弃。
+        return fail('未找到类 ' + label, {
+            image: imageName || '(全部映像)',
+            hint: '带命名空间的类型（如 UnityEngine.Transform）需要同时给 ' +
+                  'namespace=（或把 name 传成完整名）。可用静态侧 ' +
+                  'search_classes(pattern="' + name + '") 先确认它的 ' +
+                  'namespace 与 nested_name。'
+        });
     }
 
     function fieldOffset(fieldInfo) {
@@ -1192,7 +1273,23 @@
                 if (!(n > 0) || n > 0x1000000) {
                     return fail('size 不合法（需 1..16777216）', { size: size });
                 }
-                var bytes = new Uint8Array(p.readByteArray(n));
+                // readByteArray 对**不可读地址返回 null**（不像 readU8 会抛异常），
+                // 而 `new Uint8Array(null)` 会得到一个长度 0 的数组 —— 于是老写法
+                // 会把「读不到」报成 `{ok:true, size:4, hex:""}`：假成功。
+                // 实测 read_memory(address="0x0", size=4) 就命中了这条。
+                var raw = p.readByteArray(n);
+                if (raw === null || raw === undefined) {
+                    return fail('读取失败：地址不可读（' + p.toString() +
+                                '，' + n + ' 字节）',
+                                { address: p.toString(), size: n });
+                }
+                var bytes = new Uint8Array(raw);
+                if (bytes.length !== n) {
+                    return fail('读取不完整：要求 ' + n + ' 字节，实际读到 ' +
+                                bytes.length + ' 字节',
+                                { address: p.toString(), size: n,
+                                  got: bytes.length });
+                }
                 var hex = [];
                 for (var i = 0; i < bytes.length; i++) {
                     hex.push(('0' + bytes[i].toString(16)).slice(-2));

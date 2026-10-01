@@ -723,6 +723,10 @@ if pid:
         print(f"     静态同名类型数: {_short} → {_n_short} 个")
         if _n_short > 1:
             _ra = S.runtime_class_info(name=_short, namespace="")
+            # 用 `.get(...) or []` 而不是 `_ra["candidates"]`：会话万一中途失效，
+            # 返回里根本没有 candidates 键，直接下标会抛 KeyError ——
+            # 那是**测试脚本崩了**，而不是「断言失败」，两者不能混。
+            _cands = _ra.get("candidates") or []
             check("短名歧义时拒绝而不是静默取第一个",
                   _ra.get("ok") is False and _ra.get("ambiguous") is True,
                   f"ok={_ra.get('ok')} ambiguous={_ra.get('ambiguous')} "
@@ -731,11 +735,11 @@ if pid:
                   (_ra.get("candidate_count") or 0) > 1,
                   f"candidate_count={_ra.get('candidate_count')}")
             check("候选平铺在顶层（与静态侧拒绝形状一致）",
-                  isinstance(_ra.get("candidates"), list)
-                  and len(_ra["candidates"]) > 0,
-                  "Agent 不必按工具记两套读法")
+                  len(_cands) > 0,
+                  f"candidates={len(_cands)} 条"
+                  f"（err={str(_ra.get('error'))[:40]}）")
             # 候选里的 full_name 必须真能回灌定位（否则等于空头支票）
-            _cand0 = (_ra.get("candidates") or [{}])[0]
+            _cand0 = _cands[0] if _cands else {}
             if _cand0.get("full_name"):
                 _rc2 = S.runtime_class_info(name=_cand0["full_name"],
                                             namespace="")
@@ -744,8 +748,8 @@ if pid:
                       and _rc2.get("full_name") == _cand0["full_name"],
                       f"回灌 {_cand0['full_name']!r} → ok={_rc2.get('ok')}")
             check("候选有上限（不许把上百条全倒出来）",
-                  len(_ra["candidates"]) <= 30,
-                  f"返回 {len(_ra['candidates'])} 条，"
+                  len(_cands) <= 30,
+                  f"返回 {len(_cands)} 条，"
                   f"truncated={_ra.get('candidates_truncated')}")
 
         # (3) 修嵌套不许把顶层类型弄坏
@@ -1085,6 +1089,17 @@ if pid:
     bad = S.read_memory("0x1", 8)
     check("无效地址被正确拒绝", bad.get("ok") is False, bad.get("error", "")[:40])
 
+    # 0x0 单独要验：Frida 的 `readByteArray` 对**不可读地址返回 null**（不像
+    # `readU8` 会抛异常），而 `new Uint8Array(null)` 得到长度 0 的数组 ——
+    # 老写法于是把「读不到」报成 `{ok: true, size: 4, hex: ""}`：**假成功**。
+    # 实测 `read_memory("0x0", 4)` 就命中过这条（多游戏矩阵里读模块头时
+    # 拿到空 hex 却 ok=true）。0x1 走的是抛异常那条路，覆盖不到它。
+    zero = S.read_memory("0x0", 4)
+    check("空指针 0x0 也必须 ok=false（不许拿空 hex 冒充成功）",
+          zero.get("ok") is False and not zero.get("hex"),
+          f"ok={zero.get('ok')} hex={zero.get('hex')!r} "
+          f"error={str(zero.get('error'))[:60]}")
+
     # 护栏：写已被 Hook 的函数入口实测会让游戏数秒内崩在 0xc0000005
     # （Windows 事件日志里就是该方法 RVA 处的访问违例），所以默认必须拦住。
     # 这里**只验拒绝**，不验 force=True 的放行 —— 那一下真的会崩游戏，
@@ -1231,6 +1246,29 @@ check("子步骤失败时 restored 为 False",
       _cs_bad.get("restored") is False)
 check("关闭失败时保留 runtime 以便重试", _st_now.runtime is not None)
 _st_now.runtime = None
+
+# ---- 同名进程已在跑：必须**当场**拦住，不许白等 60 秒 ----
+# 实测踩到过：Unity 的单实例锁会让第二个进程不加载 GameAssembly.dll，
+# 于是 `launch_game` 轮询 60 秒后报「IL2CPP 运行时未就绪」—— 看起来像探针
+# 坏了，实际是「已经有一个同名进程在跑」。反证：上面第 7 节在**没有**同名
+# 进程时 launch 成功，说明这条拦截不是无差别拒绝。
+show("15. launch_game —— 同名进程已在跑时当场拦住")
+if pid:
+    _dup = S.launch_game(exe=GAME_EXE)
+    print(f"     第二次 launch_game -> ok={_dup.get('ok')} "
+          f"running_pid={_dup.get('running_pid')} "
+          f"error={str(_dup.get('error'))[:70]}")
+    check("同名进程已在跑时返回 ok:False（不是白等超时）",
+          _dup.get("ok") is False, str(_dup.get("error"))[:90])
+    check("指出是哪个 pid 在跑", _dup.get("running_pid") == pid,
+          f"running_pid={_dup.get('running_pid')} 期望={pid}")
+    check("给出两条出路（注入已有进程 / 先结束它）",
+          "inject_process" in str(_dup.get("hint"))
+          and "taskkill" in str(_dup.get("hint")),
+          str(_dup.get("hint"))[:110])
+else:
+    check("能验证同名进程拦截（需要先成功 launch 一次）", False,
+          "第 7 节没拿到 pid", warn_only=True)
 
 # ================================================================ 结果
 show("端到端结果汇总（通过 MCP 工具层）")

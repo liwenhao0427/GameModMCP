@@ -454,6 +454,25 @@ def ensure_index(
 # ---------------------------------------------------------------- 运行时
 
 
+#: spawn 之后等 IL2CPP 就绪的等待预算（秒）。
+#:
+#: 为什么按引擎给不同预算：`GameAssembly.dll` 是**慢慢**加载起来的，
+#: 刚 spawn 完第一次探测几乎必然是「未找到 IL2CPP 运行时模块」，
+#: 所以 IL2CPP 游戏必须给足时间（实测 GoW 约 3 秒、Echoes 约 6 秒就绪）。
+#: 而 Mono / UE 游戏**永远**不会有这个模块，等满 60 秒纯属空转 ——
+#: 实测 4 个 Mono 样本每个 `launch_game` 都要白等 62 秒才如实返回。
+#: 引擎在 `open_game` 时已经知道，没有理由再去猜。
+READY_TIMEOUT_IL2CPP = 60.0
+READY_TIMEOUT_OTHER = 2.0
+
+
+def ready_timeout_for(engine: str | None) -> float:
+    """按引擎决定 spawn 后的 IL2CPP 就绪等待预算（纯函数，便于验收）。"""
+    return (READY_TIMEOUT_IL2CPP
+            if (engine or "").strip().lower() == "il2cpp"
+            else READY_TIMEOUT_OTHER)
+
+
 def ensure_runtime(
     pid: int = 0,
     auto_find: bool = True,
@@ -530,7 +549,7 @@ def ensure_runtime(
                 return {"ok": False, "error": str(exc)}
             _state.runtime = sess
             _state.note(f"已启动并注入 {Path(launcher_exe).name} (pid={sess.pid})")
-            init = sess.wait_ready(timeout=60.0,
+            init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                    preferred_module=preferred_module)
             if not init.get("ok"):
                 # 启动并注入是成功的，只是 IL2CPP 没就绪（可能不是 IL2CPP 游戏）。
@@ -587,7 +606,9 @@ def ensure_runtime(
 
         _state.runtime = sess
         _state.note(f"已注入 pid={target_pid} ({proc_name})")
-        init = sess.wait_ready(timeout=30.0, preferred_module=preferred_module)
+        # 进程已经在跑，模块本该就在；预算仍按引擎给（Mono 不必等）
+        init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
+                               preferred_module=preferred_module)
         if not init.get("ok"):
             _state.note(f"IL2CPP 初始化未就绪：{init.get('error')}")
             return {

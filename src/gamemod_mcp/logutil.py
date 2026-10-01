@@ -42,6 +42,17 @@ def progress(message: str) -> None:
     log.info(message)
 
 
+def debug(message: str) -> None:
+    """输出一条调试信息（默认级别 INFO 下不显示）。
+
+    用途：把「必须留着但不能默认刷屏」的东西落到 stderr，例如
+    `launch_game` 启动的游戏自己的 stdout —— 它绝不能进 stdout（那是
+    JSON-RPC 通道），但丢掉又会让排障少一大块信息。
+    需要时设 `GAMEMOD_LOG_LEVEL=DEBUG` 就能看到。
+    """
+    log.debug(message)
+
+
 def warn(message: str) -> None:
     """输出一条警告。"""
     log.warning(message)

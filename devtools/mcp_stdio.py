@@ -54,6 +54,8 @@ class McpStdioServer:
         self._next_id = 0
         #: stdout 里出现过的非 JSON 行数（协议污染，正常必须为 0）
         self.non_json_lines = 0
+        #: 污染样本（前 8 条原文，便于定位是谁在往 stdout 写）
+        self.bad_lines: list[str] = []
 
     # ------------------------------------------------------------ 生命周期
 
@@ -130,6 +132,17 @@ class McpStdioServer:
             except json.JSONDecodeError:
                 # stdout 里出现非 JSON = 违反「stdout 只跑协议」这条硬规矩
                 self.non_json_lines += 1
+                if len(self.bad_lines) < 8:
+                    self.bad_lines.append(line[:200])
+                continue
+            if not isinstance(msg, dict):
+                # 合法 JSON 但**不是** JSON-RPC 消息（例如被启动的游戏往同一个
+                # stdout 里打了 `"..."`）—— 同样是协议污染。
+                # 这里以前会直接 `msg.get` 抛 AttributeError，把「被测游戏
+                # 污染了协议流」这个真问题伪装成脚本自己的 TypeError。
+                self.non_json_lines += 1
+                if len(self.bad_lines) < 8:
+                    self.bad_lines.append(line[:200])
                 continue
             if msg.get("id") == want_id:
                 return msg

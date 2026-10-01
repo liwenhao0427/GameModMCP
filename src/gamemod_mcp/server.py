@@ -412,6 +412,34 @@ def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
     return _ok(**res)
 
 
+def _same_named_processes(exe: str) -> list[dict]:
+    """找出与 `exe` 同映像名的正在运行的进程（按 pid 升序）。
+
+    为什么按**映像名**而不是完整路径比对：拿不到 exe 路径时（权限不足）
+    `exe_path` 会是空串，而「名字一样」已经足够触发 Unity 的单实例锁。
+    """
+    want = Path(exe).name.lower()
+    out: list[dict] = []
+    try:
+        for p in discovery.find_processes(Path(exe).stem, only_games=False):
+            name = (getattr(p, "name", "") or "").lower()
+            path_name = Path(getattr(p, "exe_path", "") or "").name.lower()
+            if name == want or path_name == want:
+                out.append({"pid": p.pid, "name": getattr(p, "name", ""),
+                            "exe_path": getattr(p, "exe_path", "")})
+    except Exception:  # noqa: BLE001 - 平台不支持 / 枚举失败时按「没有」处理
+        return []
+    return sorted(out, key=lambda d: d["pid"])
+
+
+def _has_live_session() -> bool:
+    """当前是否已经有一个活着的运行时会话（有就不该再 spawn 新进程）。"""
+    try:
+        return bool(state.state().has_runtime())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _split_argv(text: str) -> list[str]:
     """按 Windows 习惯拆分命令行参数串。
 
@@ -1304,6 +1332,24 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
         return _err(f"可执行文件不存在：{target or '(未指定)'}",
                     hint="先用 open_game 或 inspect_game 确认主程序路径")
 
+    # 同名进程已经在跑？**必须**在这里拦住，不能放它去白等超时。
+    # 原因：Unity 游戏普遍带单实例锁，第二个进程不会加载 GameAssembly.dll，
+    # 于是 `ensure_runtime(spawn=True)` 会轮询 60 秒后报「IL2CPP 运行时未就绪」——
+    # 把 Agent 引向「探针坏了」的错误方向。实测踩过：探针脚本异常残留了一个
+    # 旧进程，之后每次 launch_game 都是 60 秒超时 + 这个误导性错误。
+    if not _has_live_session():
+        running = _same_named_processes(target)
+        if running:
+            pid0 = running[0]["pid"]
+            return _err(
+                f"已经有同名进程在运行：{Path(target).name}（pid={pid0}）。"
+                "Unity 游戏通常带单实例锁，新进程不会加载 GameAssembly.dll，"
+                "继续启动只会白等到超时。",
+                hint=f"二选一：① 直接注入已在跑的那个进程："
+                     f"inject_process(pid={pid0})；"
+                     f"② 先结束它：taskkill /F /PID {pid0}，再 launch_game。",
+                running_pid=pid0, target=target)
+
     argv = _split_argv(args) if args else []
     res = ensure_runtime(spawn=True, launcher_exe=target,
                          preferred_module=preferred_module)
@@ -1376,7 +1422,11 @@ def runtime_class_info(
 
     Args:
         name:          类名（短名；嵌套类型请传完整嵌套名）。
-        namespace:     命名空间（可选，用于精确匹配）。
+        namespace:     命名空间（可选）。**不给也能用**：会按短名在**顶层类型**
+                       里解析，唯一才采用；命中多个则返回 `ambiguous: true` +
+                       `candidates`，让你自己指定。嵌套类型必须用完整嵌套名
+                       （`candidates[].full_name`）—— 只用短名会被拒绝，
+                       不会随便挑一个（短名会撞上同名的嵌套枚举/状态机）。
         image:         程序集名（可选，如 "TeamTapas.ProjectR.dll"）。
         method_filter: 只看名字含该子串的方法（类方法很多时用）。
 
@@ -1415,9 +1465,10 @@ def find_hook_target(name: str, method: str, namespace: str = "",
     `rva_hex` 可与静态元数据的 RVA 对照，`token` 用于确认是同一个重载。
 
     Args:
-        name:      类名。
+        name:      类名（短名即可；嵌套类型传完整嵌套名）。
         method:    方法名（重载时看 candidates 的 param_count 区分）。
-        namespace: 命名空间。
+        namespace: 命名空间（可选）。不给时按短名在**顶层类型**里解析，
+                   唯一才采用，多个则返回 `ambiguous: true` + `candidates`。
         image:     程序集名。
     """
     st = state.state()

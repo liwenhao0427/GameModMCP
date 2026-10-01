@@ -211,6 +211,53 @@ def main() -> int:
 
     reset()
 
+    # ---------------------------------------------------------------- 8
+    show("8. spawn 后的就绪等待预算按引擎给（Mono 不许白等 60 秒）")
+
+    # 纯函数层：IL2CPP 才给 60 秒，其余 2 秒
+    print(f"  ready_timeout_for('il2cpp')={S.ready_timeout_for('il2cpp')} "
+          f"('IL2CPP')={S.ready_timeout_for('IL2CPP')} "
+          f"('mono')={S.ready_timeout_for('mono')} "
+          f"('ue')={S.ready_timeout_for('ue')} ('')={S.ready_timeout_for('')} "
+          f"(None)={S.ready_timeout_for(None)}")
+    check("il2cpp → 60 秒", S.ready_timeout_for("il2cpp") == 60.0,
+          str(S.ready_timeout_for("il2cpp")))
+    check("大小写不敏感（'IL2CPP' 也认）",
+          S.ready_timeout_for("IL2CPP") == 60.0,
+          str(S.ready_timeout_for("IL2CPP")))
+    check("mono → 2 秒（实测此前每个 Mono 样本白等 62 秒）",
+          S.ready_timeout_for("mono") == 2.0, str(S.ready_timeout_for("mono")))
+    check("ue → 2 秒", S.ready_timeout_for("ue") == 2.0,
+          str(S.ready_timeout_for("ue")))
+    check("引擎未知 → 2 秒（不拿 60 秒赌它是 IL2CPP）",
+          S.ready_timeout_for("") == 2.0 and S.ready_timeout_for(None) == 2.0,
+          f"{S.ready_timeout_for('')}/{S.ready_timeout_for(None)}")
+
+    # 端到端层：确认 ensure_runtime 真的把预算传下去了（不是写死 60 秒）
+    seen: list[float] = []
+
+    class TimeoutSpy(FakeRuntime):
+        def wait_ready(self, timeout: float = 30.0,
+                       preferred_module: str = "") -> dict:
+            seen.append(timeout)
+            return {"ok": True, "pid": self.pid, "module": "FakeAssembly.dll"}
+
+    rt_mod.spawn_and_attach = lambda exe, **kw: TimeoutSpy(8888, spawned=True)
+    try:
+        for eng, want in (("mono", 2.0), ("il2cpp", 60.0), ("ue", 2.0)):
+            reset()
+            st.engine = eng
+            res = S.ensure_runtime(spawn=True, launcher_exe="D:/fake/game.exe")
+            got = seen[-1] if seen else None
+            print(f"  engine={eng:<7} spawn 后 wait_ready(timeout={got}) "
+                  f"ok={res.get('ok')}")
+            check(f"engine={eng} → 传下去的 timeout 是 {want}", got == want,
+                  f"got={got}")
+    finally:
+        rt_mod.spawn_and_attach = real_spawn
+    st.engine = ""
+    reset()
+
     print()
     print("=" * 74)
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

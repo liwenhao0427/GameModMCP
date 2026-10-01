@@ -89,6 +89,8 @@ NON_TOOL_IDENTIFIERS = {
     "has_more", "cache_hit", "readOnlyHint", "destructiveHint",
     # P2-4a 起句柄失败时会返回它（可用句柄清单），是返回字段不是工具
     "available_handles",
+    # launch_game 被同名进程拦下时返回「是哪个 pid 在跑」，是返回字段不是工具
+    "running_pid",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",

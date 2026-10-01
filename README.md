@@ -183,7 +183,7 @@ Agent 会自动：
 | 工具 | 作用 |
 |---|---|
 | `inject_process` | 注入已在运行的进程 |
-| `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**） |
+| `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**；同名进程已在跑时直接拒绝，避免白等 60 秒） |
 | `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检 |
 | `runtime_class_info` | **真实字段偏移**与**方法真实地址**。嵌套类型请传完整嵌套名（`search_classes` 的 `nested_name`）；短名命中多个时拒绝并给 `candidates` |
 | `find_hook_target` | 定位 Hook 落点并比对 token（同样支持完整嵌套名，歧义时拒绝） |
@@ -317,8 +317,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 36 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 35 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 39 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 38 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -351,6 +351,9 @@ GameModMCP/
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
 | `verify_mcp_context.py` | **P2-3 的决策门禁**（不是行为测试）：钉住「进度无消费方、取消够不着、tasks 会弄坏」这三条否决依据，变了就报红 |
 | `verify_stdio_entry.py` | **进程级入口**：脚本形式（`python <repo>/src/gamemod_mcp/server.py`，且不带 `PYTHONPATH`）与模块形式都能握手；两种形式的工具清单一致；stdout 只有 JSON-RPC；脚本形式下真调 `ue_*` / `decompile`（惰性导入曾在这里炸） |
+| `verify_spawn_stdio.py` | **子进程 stdout 不许污染协议**：`launch_game` 启动的游戏会往同一个 stdout 打 30 行日志（其中 `"memorysetup-..."` 是合法 JSON 字符串）；断言产品用的是 `stdio="pipe"`、默认 `inherit` 确实会漏（反证）、`pipe` 不漏且 4 MB 洪水不会卡死子进程 |
+| `verify_thread_attach.py` | **探针线程附着 IL2CPP 域**：模块已加载 ≠ 域已建好（实测 6/9 个 IL2CPP 游戏上 `il2cpp_domain_get()` 返回野指针 0x135）；断言不再「附着失败 → 记一笔就继续」（附旧写法反证）、`wait_ready` 重试契约（桩对象确定性验证）、真游戏上没有任何一次「ok=true 却带着附着失败」、附着后 il2cpp 调用可用且**游戏进程仍活着**、读野指针确实抛 access violation |
+| `verify_class_resolve.py` | **运行时类解析的三条规则**：只给短名要能解析到顶层类型（老版本在 4 个游戏上报「未找到类 Transform」）、三条路（短名/显式 namespace/完整名）必须指向同一个类（比字段偏移表）、嵌套类型只认完整嵌套名（反证：7056 个嵌套类型里挑一个短名不撞顶层的，短名必须查不到、完整名必须查到）、不存在的类要给出 namespace 提示 |
 | `verify_cache.py` | **索引缓存的生命周期**（P3-2）：只许删形状正确的文件（含反证）、三条护栏、命中时 touch、`cache` 统计与磁盘一致 |
 | `verify_lazy_meta.py` | **元数据解析何时发生**（P1-3b 的决策门禁）：命中不解析不许退化、解析每次 open 只发生一次、逐题量哪些查询会逼出解析器、以及「载入失败不许被降级成『没有基类』」（含把旧写法搬回来的反证） |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
@@ -387,6 +390,25 @@ python devtools\run_all_verify.py --only verify_lazy_handles
 > `verify_mcp_tools.py` 会**真的启动一个游戏**并在结束时结束它。
 > 它需要 Frida 和管理员权限，且本机要有 Garden of Witches。
 > 样本不存在的脚本会记为「无法验证」并跳过 —— **跳过不算通过**。
+
+### 多游戏矩阵：能力边界不靠单一样本推断
+
+单一样本只能证明「在某个游戏上能用」。`devtools/` 下有两个**跑遍全部样本**
+的报告脚本（只出报告、不改代码，退出码恒为 0）：
+
+```powershell
+python devtools\report_multi_game_matrix.py   # 静态：样本 × 工具的候选分类
+python devtools\report_runtime_matrix.py      # 运行时：真的启动/注入/Hook，逐工具判定
+```
+
+`report_runtime_matrix.py` 会**真的**启动每个游戏、注入探针、装 Hook、
+强制调用并读回参数与返回值，最后按「游戏 × 38 个工具」输出
+`ok / 不适用 / 失败` 三态（`--json` 落盘 + `--md` 出报告）。
+最近一次全量结果见 [`docs/多游戏运行时兼容性报告.md`](docs/多游戏运行时兼容性报告.md)。
+
+> 它对「正确拒绝」与「工具坏了」分得很清：`decompile` 在 IL2CPP 上返回
+> 「不是 .NET 程序集」、短名有歧义时返回 `ambiguous` + 候选，都算
+> **不适用 / 正确拒绝**，不算失败 —— 否则报告会把设计行为统计成缺陷。
 
 ---
 

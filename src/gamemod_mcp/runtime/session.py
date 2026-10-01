@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..logutil import progress, warn
+from ..logutil import debug, progress, warn
 
 # ---------------------------------------------------------------- 异常
 
@@ -356,6 +356,11 @@ class RuntimeSession:
 
         spawn 之后必须用它而不是一次性 init：
         DLL 加载 + il2cpp 初始化需要时间，抢跑只会拿到「模块未找到」。
+        所以**不能**把「模块未找到」当成「没救了」—— 游戏刚起来时
+        `GameAssembly.dll` 往往还没加载完（实测刚 spawn 完第一次 init
+        就是模块未找到）。等待预算该给多少由调用方按引擎决定：
+        IL2CPP 给 60 秒，Mono/UE 游戏永远不会有这个模块，给 2 秒就够
+        （见 `engine/state.py` 的 `ready_timeout_for`）。
         """
         deadline = time.time() + max(0.0, timeout)
         last: dict = {"ok": False, "error": "尚未尝试初始化"}
@@ -756,6 +761,73 @@ def attach(pid: int, name: str = "", timeout: float = 10.0,
     return rs
 
 
+#: spawn 子进程时的 stdio 策略。**默认的 `inherit` 会破坏 MCP 协议**：
+#: 本服务器用 stdout 跑 JSON-RPC，而 `launch_game` 启动的 Unity 游戏会往
+#: 同一个 stdout 打日志 —— 实测 Garden of Witches 一启动就灌进 30 行，
+#: 头两行是 `[UnityMemory] Configuration Parameters - Can be set up in
+#: boot.config` 与 `"memorysetup-bucket-allocator-granularity=16"`。
+#: 后者是**合法 JSON 字符串**，客户端 `json.loads` 会成功，然后把一个 `str`
+#: 当 JSON-RPC 消息用 —— 实测把客户端的
+#: `AttributeError: 'str' object has no attribute 'get'` 伪装成脚本自身 bug。
+#: 换成 `pipe` 后子进程输出由 Frida 自己接住（实测 4 MB 洪水也不会让子进程
+#: 卡在 write 上），再经 device 的 `output` 信号转发到 stderr。
+#: 注意 Frida 17 的 `FridaStdio` 只有 `inherit` / `pipe` 两个值，**没有** `ignore`。
+_SPAWN_STDIO = "pipe"
+
+#: 子进程输出转发只注册一次（device 级信号）
+_output_hooked = False
+_output_lock = threading.Lock()
+
+
+def _hook_child_output(device) -> None:
+    """把 spawn 出来的子进程输出转发到 **stderr**。
+
+    不做这件事的话，`stdio="pipe"` 会让游戏的日志彻底消失（被 Frida 读走后
+    丢掉）—— 那对排障是净损失。转发到 stderr 既保住了信息，又不碰协议通道。
+    """
+    global _output_hooked
+    with _output_lock:
+        if _output_hooked:
+            return
+        try:
+            def _on_output(pid, fd, data) -> None:
+                try:
+                    text = (data.decode("utf-8", "replace")
+                            if isinstance(data, (bytes, bytearray)) else str(data))
+                    text = text.rstrip()
+                    if text:
+                        debug(f"[子进程 {pid} fd={fd}] {text}")
+                except Exception:  # noqa: BLE001 - 回调里绝不能抛
+                    pass
+
+            device.on("output", _on_output)
+            _output_hooked = True
+        except Exception as exc:  # noqa: BLE001 - 转发失败不该挡住注入
+            warn(f"无法转发子进程输出（不影响注入，但游戏日志会丢失）：{exc}")
+
+
+def _spawn_detached_stdout(device, argv: list[str], exe: str,
+                           cwd: str) -> int:
+    """spawn 游戏，并把它的 stdout 从我们的协议通道上摘下来。"""
+    try:
+        return device.spawn(argv, cwd=cwd or None, stdio=_SPAWN_STDIO)
+    except (TypeError, ValueError) as exc:
+        # 只可能是「这个 Frida 版本不认 stdio 参数 / 不认 pipe」，
+        # 不是游戏本身起不来。退化为继承，但把风险**说出来**。
+        warn(f"当前 Frida 不支持 spawn(stdio={_SPAWN_STDIO!r})：{exc}；"
+             "游戏输出将与 MCP 的 stdout 混流，可能污染 JSON-RPC")
+    except Exception as exc:
+        raise SessionError(
+            f"启动 {exe} 失败：{exc}。请确认路径正确且可执行。"
+        ) from exc
+    try:
+        return device.spawn(argv, cwd=cwd or None)
+    except Exception as exc:
+        raise SessionError(
+            f"启动 {exe} 失败：{exc}。请确认路径正确且可执行。"
+        ) from exc
+
+
 def spawn_and_attach(exe: str, args: list[str] | None = None,
                      cwd: str = "", timeout: float = 20.0,
                      init: bool = True,
@@ -771,12 +843,8 @@ def spawn_and_attach(exe: str, args: list[str] | None = None,
         raise RuntimeUnavailable(f"无法访问本地 Frida 设备：{exc}") from exc
 
     argv = [exe] + list(args or [])
-    try:
-        pid = device.spawn(argv, cwd=cwd or None)
-    except Exception as exc:
-        raise SessionError(
-            f"启动 {exe} 失败：{exc}。请确认路径正确且可执行。"
-        ) from exc
+    _hook_child_output(device)
+    pid = _spawn_detached_stdout(device, argv, exe, cwd)
 
     try:
         session = device.attach(pid)

@@ -50,6 +50,9 @@ python devtools\verify_mcp_decompile.py # ← 反编译（薄封装 ilspycmd，�
 python devtools\verify_il2cpp_runtime.py   # 静态↔运行时 token 交叉验证（需游戏）
 python devtools\verify_runtime.py          # 运行时层分组（需游戏）
 python devtools\verify_runtime_target.py   # 注入目标选择（假 Runtime，无需游戏）
+python devtools\verify_thread_attach.py    # 探针线程附着 IL2CPP 域：就绪判断 + 重试契约 + 崩溃回归（需 IL2CPP 样本）
+python devtools\verify_class_resolve.py    # 运行时类解析：短名/namespace/完整嵌套名三条规则（需 IL2CPP 样本）
+python devtools\verify_spawn_stdio.py      # spawn 子进程的 stdout 不许污染 JSON-RPC（自建假子进程，无需游戏）
 python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
 python devtools\verify_tool_coverage.py    # 静态：每个工具是否被脚本调用过（无需游戏）
 python devtools\verify_encoding_console.py # 编码健壮性：GBK 控制台下不崩（无需游戏）
@@ -190,7 +193,12 @@ devtools/
 ├── bench_index.py         性能基准（开索引 / 单次查询 / 重复解析）
 ├── report_tool_coverage.py 动态覆盖率汇总（配合 _cov/ 垫片）
 ├── report_multi_game_matrix.py 多游戏兼容性扫描（**报告**，不是门禁：
-│                          逐阶段驱动真服务器，产出矩阵 + 统计 JSON）
+│                          逐阶段驱动真服务器，产出矩阵 + 统计 JSON；
+│                          **只走静态阶段**，另含「候选目录为什么不算游戏」的分类）
+├── report_runtime_matrix.py 多游戏**运行时**矩阵（**报告**，不是门禁：
+│                          每个游戏真开进程、真注入、真装 Hook，
+│                          38 个工具逐个过一遍 → 逐游戏 × 逐工具可用性矩阵。
+│                          静态部分复用 report_multi_game_matrix 的发现逻辑）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
 ├── archive/               归档的过程产物（**不参与验收**，见其中 README）
 │   └── probes/            一次性逆向侦察脚本（31 个）
