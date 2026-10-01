@@ -296,7 +296,7 @@ GameModMCP/
 > `find_hook_target` 取落点 → `hook_method` + `drain_events`。
 > 探针里是两套实现（`il2cpp_*` 59 个 API / `mono_*` 56 个 API），
 > 对外工具与 token 对账方式完全相同（静态 token == 运行时 token）。
-> Mono 上有三条差异，都是**如实声明**而非「未实现」：
+> Mono 上有四条差异，都是**如实声明**而非「未实现」：
 >
 > 1. **没有 RVA**：地址来自 `mono_compile_method` 触发的 JIT，
 >    代码不在 `mono-2.0-*.dll` 内，所以 `in_module: false` 且不给 `rva`；
