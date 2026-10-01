@@ -122,6 +122,17 @@ class _RowSource:
         return [self._convert(r) for r in self._rows]
 
 
+def list_source(items: list[dict[str, Any]]) -> _RowSource:
+    """把**已经物化好**的 dict 列表包成句柄可用的来源（P2-4 的响应上限用）。
+
+    `_RowSource` 的契约本来就是「`len` + `slice` + `all`」，与背后是
+    `sqlite3.Row` 还是 dict 无关，所以这里只要一个恒等解析函数，
+    不必再新增一个类。做成模块级函数是因为它有**第二个调用方**
+    （`cap.py`），不该从那边 import 私有名。
+    """
+    return _RowSource(list(items), lambda it: it)
+
+
 @dataclass
 class QueryResult:
     """一次查询的结果句柄。
@@ -220,6 +231,14 @@ class ResultStore:
 
     def handles(self) -> list[str]:
         return list(self._items)
+
+    def clear(self) -> None:
+        """作废全部句柄（切游戏 / 关会话时用，见 `state.close_index`）。
+
+        代次号**不重置** —— 这正是要点：清空后新句柄不会与旧的同名，
+        于是「已经作废的句柄」永远是查不到的，不会静默命中新数据。
+        """
+        self._items.clear()
 
 
 # ---------------------------------------------------------------- 索引主体

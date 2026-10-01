@@ -38,6 +38,18 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
     · 所有工具返回 dict，且**必定**带 `ok` 字段（成功 True / 失败 False）。
     · 失败时带 `error` 字段说明原因，绝不返回看似成功的空数据。
     · 日志一律走 stderr（见 logutil），因为 stdout 是 JSON-RPC 通道。
+    · **单次返回不超过 256 KB**，由 `cap.py` 在外层统一兜底（见下）。
+      超限时截断最大的顶层列表、完整列表进句柄，返回里会有 `capped: true`
+      与 `note`（写明用 `read_query_result` 怎么取回剩下的）。
+
+响应体积上限（P2-4）
+------------------------------------------------------------
+    每个工具都被 `@_cap_response` 包了一层。为什么不在返回里各写各的：
+    38 个工具里只有 25 个走 `_ok()`，而超限最严重的
+    find_derived_classes / class_hierarchy / class_detail / runtime_class_info
+    恰恰都不走它 —— 想要「一处拦住」就只能包在工具函数外层。
+    已有的 `handle` 会被复用（不另造句柄）；`has_more` / `returned`
+    一律按**实际**返回改写：明明还有却说没有，比超限更糟。
 
 静态与运行时的能力边界（**不许说反**）
 ------------------------------------------------------------
@@ -50,6 +62,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from pathlib import Path
@@ -57,7 +70,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__
+from . import __version__, cap
 from .engine import discovery, state
 from .engine.state import ensure_index, ensure_runtime, select_game
 
@@ -88,7 +101,12 @@ mcp = FastMCP(
         "\n"
         "注意：第 1~3 步是纯静态查询，**不需要启动游戏**；\n"
         "第 4~7 步需要游戏可注入，且运行 agent 的进程要有足够权限\n"
-        "（Windows 上通常需要管理员）。"
+        "（Windows 上通常需要管理员）。\n"
+        "\n"
+        "响应体积上限：任何一次返回不超过 256 KB。被截断时返回里会有\n"
+        "`capped: true` 与 `note`，照 note 给的\n"
+        "read_query_result(handle=..., offset=...) 就能取回剩下的（一条不丢）；\n"
+        "此时 `has_more` / `returned` 已按**实际**返回改写，不是原来的请求值。"
     ),
 )
 
@@ -102,6 +120,60 @@ def _ok(**kw: Any) -> dict:
 
 def _err(msg: str, **kw: Any) -> dict:
     return {"ok": False, "error": msg, **kw}
+
+
+# ------------------------------------------------------- 响应体积上限（P2-4）
+#
+# 契约第 5 条「不返回超大结果」以前靠每个工具各自的 `limit` 自觉遵守，
+# 但 `limit` 上限是 2000，Agent 完全可以合法地要 2000 条 —— 实测那样一条
+# `search_classes('')` 的线上文本是 **856 KB**。现在由 cap.py 统一兜底：
+# 超限就截断最大的那个顶层列表，完整列表进句柄，并如实说明剩下的怎么取。
+#
+# 为什么用装饰器而不是在 `_ok` 里拦：**38 个工具里只有 25 个走 `_ok`**，
+# 而超限最严重的 `find_derived_classes` / `class_hierarchy` /
+# `class_detail` / `runtime_class_info` 恰恰都不走它。装饰器挂在工具函数上，
+# 拿到的是「最终要发出去的 dict」，不会漏。
+#
+# 装饰器顺序：`@mcp.tool(...)` 在上、`@_cap_response` 在下 —— 于是
+# 先套上限再注册，注册进去的就是套好的那个函数。
+# `functools.wraps` 保住 `__wrapped__`，`inspect.signature` 会跟着它走，
+# 所以**入参 schema 一个字节都不会变**（由 verify_cap.py 逐字比对钉住）。
+
+
+#: 未套响应上限的**原函数**：`{工具名: 函数}`，在装饰时登记。
+#:
+#: 用途有两个，都是「必须拿到截断前的真实返回」：
+#:   · `verify_response_size.py` 量「截断前有多大」做前后对比；
+#:   · `verify_cap.py` 比对「装饰器有没有改变入参签名」。
+#:
+#: 为什么不直接用 `S.<工具>.__wrapped__`（明明 `functools.wraps` 就给了）：
+#: 动态覆盖率垫片（`devtools/_cov/sitecustomize.py`）会在导入完成后把
+#: `server` 模块上的工具属性换成它自己的**记录包装器**，那个包装器没有
+#: `__wrapped__`。于是脚本会「单独跑全绿、进套件就红」——
+#: 本轮真的踩到了（`verify_cap` / `verify_response_size` 都是这样挂的）。
+#: 显式登记原函数就不受任何外层替换影响。
+RAW_TOOLS: dict[str, Any] = {}
+
+
+def _cap_response(fn: Any) -> Any:
+    """给工具函数套上响应体积上限。"""
+    RAW_TOOLS[fn.__name__] = fn
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        payload = fn(*args, **kwargs)
+        try:
+            return cap.enforce(payload, tool=fn.__name__,
+                               store=state.state().cap_results)
+        except Exception as exc:      # noqa: BLE001
+            # 上限检查是**附加**保护，绝不能因为它自己出问题就让一个
+            # 本来正常的工具失败（那会把「省上下文」变成「功能坏了」）。
+            # 但也不许静默：打到 stderr，让人看得见。
+            from .logutil import warn
+            warn(f"响应体积上限检查失败，已按原样返回：{type(exc).__name__}: {exc}")
+            return payload
+
+    return wrapper
 
 
 # ------------------------------------------------------- MCP 工具语义标注
@@ -268,6 +340,7 @@ def _field_read_width(type_name: Any) -> int:
 
 
 @mcp.tool(annotations=_ann("列出运行中的游戏进程", read_only=True, open_world=True))
+@_cap_response
 def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
     """列出正在运行的游戏进程，并识别其运行时（il2cpp / mono / 其它）。
 
@@ -303,6 +376,7 @@ def find_game_processes(name_filter: str = "", only_games: bool = True) -> dict:
 
 
 @mcp.tool(annotations=_ann("探测游戏安装目录", read_only=True))
+@_cap_response
 def inspect_game(game_dir: str) -> dict:
     """探测一个游戏目录：识别引擎、找出主程序与关键文件。
 
@@ -327,6 +401,7 @@ def inspect_game(game_dir: str) -> dict:
 
 
 @mcp.tool(annotations=_ann("分析可执行文件结构", read_only=True))
+@_cap_response
 def inspect_binary(path: str) -> dict:
     """分析 PE 文件（exe/dll）：架构、节区、导出表、导入表、运行时类型。
 
@@ -359,6 +434,7 @@ def inspect_binary(path: str) -> dict:
 
 
 @mcp.tool(annotations=_ann("选定游戏并准备索引", read_only=False, destroy=False, idempotent=True))
+@_cap_response
 def open_game(
     game_dir: str = "",
     metadata_path: str = "",
@@ -405,6 +481,7 @@ def open_game(
 
 
 @mcp.tool(annotations=_ann("查看当前会话状态", read_only=True))
+@_cap_response
 def get_session() -> dict:
     """查看当前会话状态：选中的游戏、索引统计、运行时注入情况。
 
@@ -415,6 +492,7 @@ def get_session() -> dict:
 
 
 @mcp.tool(annotations=_ann("关闭会话", read_only=False, destroy=False, idempotent=True))
+@_cap_response
 def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
     """关闭当前会话：卸载所有 Hook、断开注入、关闭索引。
 
@@ -451,6 +529,7 @@ def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
 
 
 @mcp.tool(annotations=_ann("搜索类/结构/枚举", read_only=True))
+@_cap_response
 def search_classes(
     pattern: str = "",
     offset: int = 0,
@@ -491,6 +570,7 @@ def search_classes(
 
 
 @mcp.tool(annotations=_ann("查看类的完整细节", read_only=True))
+@_cap_response
 def class_detail(full_name: str, include_inherited: bool = False,
                  method_name: str = "", assembly: str = "") -> dict:
     """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链。
@@ -583,6 +663,7 @@ def class_detail(full_name: str, include_inherited: bool = False,
 
 
 @mcp.tool(annotations=_ann("搜索字段", read_only=True))
+@_cap_response
 def search_fields(
     pattern: str,
     offset: int = 0,
@@ -628,6 +709,7 @@ def search_fields(
 
 
 @mcp.tool(annotations=_ann("搜索方法", read_only=True))
+@_cap_response
 def search_methods(
     pattern: str,
     offset: int = 0,
@@ -665,6 +747,7 @@ def search_methods(
 
 
 @mcp.tool(annotations=_ann("查看类继承关系", read_only=True))
+@_cap_response
 def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
                     assembly: str = "") -> dict:
     """查看类的继承体系（向上找基类、向下找派生类）。
@@ -689,6 +772,7 @@ def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
 
 
 @mcp.tool(annotations=_ann("查找继承自某类的类型", read_only=True))
+@_cap_response
 def find_derived_classes(base_full_name: str, limit: int = 200,
                          assembly: str = "") -> dict:
     """找出所有继承自某个基类的类型（含间接继承）。
@@ -728,6 +812,7 @@ def find_derived_classes(base_full_name: str, limit: int = 200,
 
 
 @mcp.tool(annotations=_ann("分析类型依赖", read_only=True))
+@_cap_response
 def analyze_dependency(full_name: str, assembly: str = "") -> dict:
     """分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。
 
@@ -750,6 +835,7 @@ def analyze_dependency(full_name: str, assembly: str = "") -> dict:
 
 
 @mcp.tool(annotations=_ann("列出程序集", read_only=True))
+@_cap_response
 def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
     """列出游戏里的程序集（dll）及各自的类型数量。
 
@@ -791,6 +877,7 @@ def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
 
 
 @mcp.tool(annotations=_ann("反编译 Mono 程序集", read_only=False, destroy=False, idempotent=True))
+@_cap_response
 def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
               split_files: bool = True) -> dict:
     """反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（外部工具 ilspycmd）。
@@ -871,6 +958,7 @@ def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
 
 
 @mcp.tool(annotations=_ann("翻页/过滤读取查询结果", read_only=True))
+@_cap_response
 def read_query_result(handle: str, offset: int = 0, limit: int = 50,
                       pattern: str = "") -> dict:
     """按句柄翻页读取之前某次查询的完整结果；给了 `pattern` 就在结果内再过滤。
@@ -891,36 +979,64 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
     > 输出完全相同 —— 它就是本工具的特例。按契约第 3 条（单一职责：
     > 一个是另一个的特例就合并）已删除，并入 `pattern` 参数。
 
+    > **句柄有两个来源，本工具都能读**：`search_*` 这类静态查询登记的索引句柄，
+    > 以及响应超限被截断时登记的 `cap-` 句柄（那种句柄可能在没有索引时也存在）。
+    > 句柄只在**它所属的那一个会话**内有效；过期时返回 `available_handles`
+    > 列出当前还能用的，绝不静默换成另一个结果集。
+
     Args:
         handle:  search_classes 等返回的 handle。
         offset:  起始位置。
         limit:   本页条数（上限 2000）。
         pattern: 在结果集内二次过滤的子串；留空表示不过滤（纯翻页）。
     """
-    idx, err = _need_index()
-    if err:
-        return err
-    try:
-        res = idx.read_query_result(handle, offset=offset, limit=limit,
-                                    pattern=pattern)
-    except Exception as exc:
-        return _err(f"读取失败：{exc}")
-    if not res or not res.get("found", True):
-        return _err(
-            f"句柄不存在或已过期：{handle}",
-            available_handles=(res or {}).get("available_handles", []),
-            hint=("句柄只在**它所属的那一个会话**内有效：句柄前缀带引擎与代次"
-                  f"（当前会话前缀 {idx.results.prefix!r}）。切换游戏或重建索引后"
-                  "旧句柄一律失效 —— 这是刻意的：否则旧句柄会静默读到"
-                  "另一个结果集（实测过，见 index.py 模块上方说明）"),
-        )
-    out = _ok(**res)
-    if pattern and not (res.get("items") or []):
-        # 过滤零命中必须说清是「过滤没中」还是「句柄本身是空的」
-        out["note"] = (f"句柄内共 {res.get('total', 0)} 条，但过滤条件 "
-                       f"{pattern!r} 没有命中（或该页已越界）；"
-                       f"去掉 pattern 可看全部。")
-    return out
+    # 句柄有两个来源，都要能读（P2-4）：
+    #   1. 索引句柄表 —— `search_*` 这类静态查询登记的；
+    #   2. 会话级 cap 句柄表 —— 响应超限被截断时登记的完整列表。
+    # 第 2 种可能在**没有索引**时也存在（纯运行时工具返回的大列表），
+    # 所以这里不能一上来就 `_need_index()` 报错，否则那种句柄永远读不出来。
+    st = state.state()
+    idx = st.index
+    res: dict | None = None
+    if idx is not None:
+        try:
+            res = idx.read_query_result(handle, offset=offset, limit=limit,
+                                        pattern=pattern)
+        except Exception as exc:
+            return _err(f"读取失败：{exc}")
+        if res and res.get("found", True):
+            out = _ok(**res)
+            if pattern and not (res.get("items") or []):
+                # 过滤零命中必须说清是「过滤没中」还是「句柄本身是空的」
+                out["note"] = (f"句柄内共 {res.get('total', 0)} 条，但过滤条件 "
+                               f"{pattern!r} 没有命中（或该页已越界）；"
+                               f"去掉 pattern 可看全部。")
+            return out
+
+    qr = st.cap_results.get(handle)
+    if qr is not None:
+        out = _ok(found=True, **qr.page(offset, limit, pattern=pattern))
+        if pattern and not (out.get("items") or []):
+            out["note"] = (f"句柄内共 {out.get('total', 0)} 条，但过滤条件 "
+                           f"{pattern!r} 没有命中（或该页已越界）；"
+                           f"去掉 pattern 可看全部。")
+        return out
+
+    # 两个表都没有：如实报错，并把**两边**能用的句柄都给出来
+    available = list((res or {}).get("available_handles") or [])
+    available += [h for h in st.cap_results.handles() if h not in available]
+    prefixes = []
+    if idx is not None:
+        prefixes.append(idx.results.prefix)
+    prefixes.append(st.cap_results.prefix)
+    return _err(
+        f"句柄不存在或已过期：{handle}",
+        available_handles=available,
+        hint=("句柄只在**它所属的那一个会话**内有效：句柄前缀带引擎与代次"
+              f"（当前会话前缀 {'、'.join(prefixes)}）。切换游戏或重建索引后"
+              "旧句柄一律失效 —— 这是刻意的：否则旧句柄会静默读到"
+              "另一个结果集（实测过，见 index.py 模块上方说明）"),
+    )
 
 
 # ================================================================
@@ -929,6 +1045,7 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
 
 
 @mcp.tool(annotations=_ann("注入游戏进程", read_only=False, destroy=False, idempotent=True, open_world=True))
+@_cap_response
 def inject_process(pid: int = 0, auto_find: bool = True,
                    preferred_module: str = "") -> dict:
     """把运行时探针注入正在运行的游戏进程。
@@ -963,6 +1080,7 @@ def inject_process(pid: int = 0, auto_find: bool = True,
 
 
 @mcp.tool(annotations=_ann("启动并注入游戏", read_only=False, destroy=False, open_world=True))
+@_cap_response
 def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> dict:
     """启动游戏并**在游戏初始化之前**注入探针。
 
@@ -1002,6 +1120,7 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
 
 
 @mcp.tool(annotations=_ann("查看运行时概况", read_only=True, open_world=True))
+@_cap_response
 def runtime_info() -> dict:
     """查看已注入游戏的运行时概况：IL2CPP 模块、映像数量、可用 API。
 
@@ -1030,6 +1149,7 @@ def runtime_info() -> dict:
 
 
 @mcp.tool(annotations=_ann("查询类的运行时信息", read_only=True, open_world=True))
+@_cap_response
 def runtime_class_info(
     name: str,
     namespace: str = "",
@@ -1080,6 +1200,7 @@ def runtime_class_info(
 
 
 @mcp.tool(annotations=_ann("定位方法的 Hook 落点", read_only=True, open_world=True))
+@_cap_response
 def find_hook_target(name: str, method: str, namespace: str = "",
                      image: str = "") -> dict:
     """定位某个方法可 Hook 的地址（含 RVA 与 token）。
@@ -1121,6 +1242,7 @@ def find_hook_target(name: str, method: str, namespace: str = "",
 
 
 @mcp.tool(annotations=_ann("Hook 方法", read_only=False, destroy=False, open_world=True))
+@_cap_response
 def hook_method(
     name: str,
     method: str,
@@ -1184,6 +1306,7 @@ def hook_method(
 
 
 @mcp.tool(annotations=_ann("在指定地址安装 Hook", read_only=False, destroy=False, open_world=True))
+@_cap_response
 def hook_address(
     address: str,
     args_type: str = "",
@@ -1230,6 +1353,7 @@ def hook_address(
 
 
 @mcp.tool(annotations=_ann("卸载 Hook", read_only=False, destroy=True, idempotent=True, open_world=True))
+@_cap_response
 def unhook(hook_id: str = "") -> dict:
     """卸载 Hook。hook_id 留空则卸载全部。
 
@@ -1251,6 +1375,7 @@ def unhook(hook_id: str = "") -> dict:
 
 
 @mcp.tool(annotations=_ann("查看 Hook 状态", read_only=True, open_world=True))
+@_cap_response
 def hook_status() -> dict:
     """列出当前所有 Hook 及其触发次数。
 
@@ -1267,6 +1392,7 @@ def hook_status() -> dict:
 
 
 @mcp.tool(annotations=_ann("读取 Hook 事件", read_only=False, destroy=True, open_world=True))
+@_cap_response
 def drain_events(limit: int = 200, kind: str = "") -> dict:
     """取走探针缓冲的 Hook 事件（调用记录）。
 
@@ -1292,6 +1418,7 @@ def drain_events(limit: int = 200, kind: str = "") -> dict:
 
 
 @mcp.tool(annotations=_ann("读游戏内存", read_only=True, open_world=True))
+@_cap_response
 def read_memory(address: str, size: int = 16) -> dict:
     """读取游戏进程内存（十六进制返回）。
 
@@ -1314,6 +1441,7 @@ def read_memory(address: str, size: int = 16) -> dict:
 
 
 @mcp.tool(annotations=_ann("写游戏内存", read_only=False, destroy=True, idempotent=True, open_world=True))
+@_cap_response
 def write_memory(address: str, hex_data: str) -> dict:
     """写游戏进程内存。
 
@@ -1338,6 +1466,7 @@ def write_memory(address: str, hex_data: str) -> dict:
 
 
 @mcp.tool(annotations=_ann("读实例字段的值", read_only=True, open_world=True))
+@_cap_response
 def read_field_value(
     instance: str,
     name: str,
@@ -1447,6 +1576,7 @@ def read_field_value(
 
 
 @mcp.tool(annotations=_ann("内存特征码扫描", read_only=True, open_world=True))
+@_cap_response
 def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
     """在游戏模块里做 AOB（特征码）扫描。
 
@@ -1474,6 +1604,7 @@ def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
 
 
 @mcp.tool(annotations=_ann("在游戏内执行 JS", read_only=False, destroy=True, open_world=True))
+@_cap_response
 def eval_script(code: str) -> dict:
     """在游戏进程内执行 Frida JS 代码 —— 应急逃生舱。
 
@@ -1503,6 +1634,7 @@ def eval_script(code: str) -> dict:
 
 
 @mcp.tool(annotations=_ann("开关 GC", read_only=False, destroy=False, idempotent=True, open_world=True))
+@_cap_response
 def gc_control(disable: bool = True) -> dict:
     """暂停/恢复游戏的 GC（垃圾回收）。
 
@@ -1556,6 +1688,7 @@ def _ue_exe(exe: str) -> tuple[str, dict | None]:
 
 
 @mcp.tool(annotations=_ann("识别 Unreal 游戏", read_only=True))
+@_cap_response
 def detect_ue(exe: str = "") -> dict:
     """判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据。
 
@@ -1580,6 +1713,7 @@ def detect_ue(exe: str = "") -> dict:
 
 
 @mcp.tool(annotations=_ann("提取 Unreal 游戏概况", read_only=False, destroy=False, idempotent=True))
+@_cap_response
 def ue_profile(exe: str = "", output_path: str = "") -> dict:
     """汇总一个 Unreal 游戏的可提取信息（资源容器、清单、脚本对象）。
 
@@ -1606,6 +1740,7 @@ def ue_profile(exe: str = "", output_path: str = "") -> dict:
 
 
 @mcp.tool(annotations=_ann("列出 Unreal 资源容器条目", read_only=True))
+@_cap_response
 def ue_list_entries(container: str, kind: str = "auto",
                     pattern: str = "", limit: int = 200,
                     offset: int = 0) -> dict:
@@ -1697,6 +1832,7 @@ def ue_list_entries(container: str, kind: str = "auto",
 
 
 @mcp.tool(annotations=_ann("列出 Unreal 脚本对象", read_only=True))
+@_cap_response
 def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
     """从 UE 游戏 exe 里提取 /Script/ 模块名与对象路径。
 
@@ -1742,6 +1878,7 @@ def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
 
 
 @mcp.tool(annotations=_ann("读取 Unreal 打包清单", read_only=True))
+@_cap_response
 def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
                 offset: int = 0, limit: int = 200) -> dict:
     """读取 UE 的打包清单 Manifest_UFSFiles_*.txt。
@@ -1812,6 +1949,7 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
 
 
 @mcp.tool(annotations=_ann("环境与能力诊断", read_only=True))
+@_cap_response
 def get_diagnostics(scan_processes: bool = False) -> dict:
     """检查运行环境：Python、Frida、各引擎解析器是否可用。
 

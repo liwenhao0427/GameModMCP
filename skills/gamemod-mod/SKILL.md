@@ -405,6 +405,19 @@ read_query_result(r["handle"], pattern="Controller")      # 在结果内再过�
 意思是「一共 644 个，这次只给了 200 个」，**不要**把 200 当成总数。
 `find_derived_classes` 也遵守同一约定。
 
+> **还有一个你没法用 `limit` 控制的截断：256 KB 的响应体积上限。**
+> 任何一次返回都不超过 256 KB（外层统一兜底，不是各工具自觉）。
+> 超限时返回里会多出 `capped: true`，并且：
+>
+> - `items` 只给前 N 条，**`has_more` 一定是 `true`**、`returned` 是**实际**条数；
+> - `note` 直接告诉你续读命令，照抄即可：
+>   `read_query_result(handle='il2cpp-g3-classes-1', offset=612)`
+>   —— 注意 `offset` 是「原 offset + 已回条数」，**照 note 抄，别自己算**；
+> - **一条数据都不会丢**：完整列表就在那个句柄里。
+>
+> 所以「我要 2000 条」可能只回 600 条，这不是工具坏了，也不是没有那么多 ——
+> 接着翻页就行。自己主动用 `pattern` / `limit` 收窄，比事后翻页更省事。
+
 ---
 
 ## 坑与注意事项

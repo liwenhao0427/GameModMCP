@@ -123,7 +123,10 @@ def code_tools() -> set[str]:
     于是**一个工具都抽不出来**。当时靠本文件的「解析出 0 个工具 = 解析规则
     失效」这条自检才发现 —— 否则会退化成「两边都是空集，所以完全一致」。
 
-    按行判断则与括号层数无关（本项目的装饰器都写成一行）。
+    P2-4 又踩了同一个坑的另一种形态：响应上限是**第二个装饰器**
+    （`@_cap_response`），而它既不是空行也不是注释，于是这里 `break` 掉，
+    又变成「一个工具都抽不出来」。所以规则改成**跳过所有装饰器行**，
+    找第一个真正的 `def` —— 装饰器以后还会增加，这条规则不该再改。
     """
     lines = SERVER.read_text(encoding="utf-8").splitlines()
     out: set[str] = set()
@@ -132,7 +135,8 @@ def code_tools() -> set[str]:
             continue
         for nxt in lines[i + 1:]:
             s = nxt.strip()
-            if not s or s.startswith("#"):
+            # 空行 / 注释 / **还有别的装饰器** 都继续往下找
+            if not s or s.startswith("#") or s.startswith("@"):
                 continue
             m = re.match(r"def\s+([A-Za-z_]\w*)\s*\(", s)
             if m:

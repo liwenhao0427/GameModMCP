@@ -146,6 +146,24 @@ Agent 会自动：
 所以切游戏或重建索引后旧句柄一律失效，失败时会返回 `available_handles`。
 见 `devtools/verify_handle_scope.py`。
 
+### 响应体积上限（256 KB）
+**任何**工具返回都不会超过 256 KB —— 这不是各工具自觉，而是
+`src/gamemod_mcp/cap.py` 在**所有**工具外面统一兜底（`@_cap_response`）。
+
+超限时截断**最大的那个顶层列表**，并把完整列表登记成句柄：
+
+- 返回里多出 `capped: true`、`cap_bytes`，`note` 写明「只回了前 N 条」；
+- `has_more` 一律改成 `true`、`returned` 改成实际条数（**不许**明明还有却说没有）；
+- `note` 里给出续读方式 `read_query_result(handle=..., offset=N)`，
+  **一条数据都不会丢** —— 完整列表在句柄里。
+- 已有 `handle` 的返回（`search_*`）**复用**它的句柄，不再另造一个；
+  此时续读的 `offset` 是「原 offset + 已回条数」，按「已回条数」算会跳过前面的条目。
+
+为什么必须有：契约第 5 条原先只靠各工具的 `limit` 自觉遵守，但 `limit` 上限是
+2000，Agent 完全可以合法地要 2000 条 —— 实测 `search_classes('', limit=2000)`
+的线上文本是 **856 KB**。截断后同一调用是 260 KB。
+见 `devtools/verify_cap.py`（机制）与 `devtools/verify_response_size.py`（体积）。
+
 ### Unreal 引擎层
 | 工具 | 作用 |
 |---|---|
@@ -250,8 +268,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 27 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 26 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 28 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 27 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -276,7 +294,8 @@ GameModMCP/
 | `verify_mcp_decompile.py` | `decompile` 工具（`ilspycmd` 薄封装） |
 | `verify_mcp_extra.py` | 补全主流程没覆盖到的工具 |
 | `verify_server_helpers.py` | `server.py` 的纯函数：命令行拆分（`launch_game`）与字段读取宽度（`read_field_value`） |
-| `verify_response_size.py` | **响应体积**：与 FastMCP 完全相同的序列化下，最大的只读查询有多大（P2-4 的基线） |
+| `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
+| `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
@@ -376,3 +395,4 @@ IL2CPP 和 Mono 是**两个根本不同的元数据体系**：
 ## 许可
 
 MIT
+

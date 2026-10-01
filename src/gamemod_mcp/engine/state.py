@@ -31,7 +31,7 @@ from typing import Any
 from ..logutil import progress, warn
 from . import discovery
 from .il2cpp_meta import MetadataError
-from .index import Index
+from .index import Index, ResultStore
 from .pe import summarize as pe_summarize
 
 # ---------------------------------------------------------------- 状态对象
@@ -47,6 +47,11 @@ class SessionState:
         self.exe: str = ""
         self.metadata_path: str = ""
         self._index: Index | None = None
+        # 响应上限（P2-4）截断下来的完整列表放这里，而不是放进 Index 的句柄表：
+        # 那样的话「没有索引」的工具（纯运行时那几个）就没有句柄可用，
+        # 而这里的东西必须在任何工具下都能登记。
+        # `close_index` 会清掉它，于是「切游戏 ⇒ 旧句柄全失效」是一条统一规则。
+        self.cap_results = ResultStore(owner="cap")
         self.runtime = None            # RuntimeSession 或 None
         self.notes: list[str] = []     # 操作留痕，便于 Agent 自查
         self.opened_at: float = 0.0
@@ -69,6 +74,11 @@ class SessionState:
 
     def close_index(self) -> dict:
         """关闭索引。**返回结果**（以前只 warn，失败对上层不可见）。"""
+        # 索引句柄与 cap 句柄一起作废：切游戏后旧句柄一律失效是一条统一规则，
+        # 不能让「cap 句柄」成为例外（它的数据同样属于上一个游戏）。
+        # 注意放在 early-return **之前** —— 纯运行时工具也会往这里登记句柄，
+        # 那时 _index 可能本来就是 None。
+        self.cap_results.clear()
         if self._index is None:
             return {"ok": True, "already_closed": True}
         try:
