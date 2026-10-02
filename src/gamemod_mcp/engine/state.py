@@ -581,6 +581,19 @@ def ensure_runtime(
                            RuntimeUnavailable, probe_available)
 
     with _state.lock:
+        #: 非 None 表示「新会话建好之后要断开的那个旧会话对象」。
+        #:
+        #: 为什么不在下面**立刻**断开旧会话（那是修复前的写法）：旧代码是
+        #: 「先断开旧的，再去连新的」，于是**新目标连不上时旧会话已经没了**。
+        #: 实测：`inject_process(pid=<不存在的 pid>)` 会先 detach 掉正常工作的
+        #: 游戏会话，然后返回 `unable to find process with pid` —— 调用方只是想
+        #: 试一个 pid，却把**正在用的会话弄没了**（后续所有 runtime_* 都报
+        #: 「当前没有已注入的运行时会话」）。这是典型的「失败还带副作用」。
+        #:
+        #: 现在的规则：**先连新的，连上了才断旧的**；连不上就原样保留旧会话，
+        #: 并在返回值里如实说明「旧会话仍在」。
+        switching_from = None
+
         # ---------------------------------------------------------- 已有会话
         # 这里的判断很关键：早期实现是无条件 `if has_runtime(): return reused`，
         # 于是 inject_process(pid=B) 在已有 pid=A 的会话时**静默返回 A**，
@@ -590,7 +603,7 @@ def ensure_runtime(
         # 现在的规则：
         #   · 没指定目标            → 复用现有会话（这是「懒注入」的正常路径）
         #   · 指定的 pid 就是当前会话 → 复用
-        #   · 指定了另一个 pid       → 切换：断开旧的，接上新的
+        #   · 指定了另一个 pid       → 切换：**连上新目标后**再断开旧的
         #   · 要求 spawn 新进程      → 拒绝并说明，绝不静默起第二个游戏进程
         if _state.has_runtime():
             cur = _state.runtime
@@ -617,13 +630,10 @@ def ensure_runtime(
             if pid and pid == cur_pid:
                 return {"ok": True, "reused": True, **_state.summary()}
 
-            # 指定了另一个 pid：切换过去。
+            # 指定了另一个 pid：**先只记下来**，等新会话真建好再断开旧的。
             # close() 只 detach（卸载 Hook、断开连接），**不会杀掉进程**，
             # 所以旧目标会恢复到未被修改的状态并继续运行。
-            old_pid = cur_pid
-            _state.close_runtime()
-            _state.note(f"目标变更（pid {old_pid} → {pid}），"
-                        f"已断开旧会话 pid={old_pid}（进程未被结束）")
+            switching_from = cur
 
         # launcher_exe：spawn 模式
         if launcher_exe and spawn:
@@ -696,7 +706,25 @@ def ensure_runtime(
             sess = attach(target_pid, name=proc_name,
                           preferred_module=preferred_module, init=False)
         except (SessionError, RuntimeUnavailable) as exc:
-            return {"ok": False, "error": str(exc), "pid": target_pid}
+            # **连不上新目标时不许有副作用**：旧会话原样保留，并如实说明，
+            # 免得调用方以为「只是这次失败」，其实已经把在用的会话弄丢了。
+            out: dict = {"ok": False, "error": str(exc), "pid": target_pid}
+            if switching_from is not None:
+                old_pid = getattr(switching_from, "pid", 0)
+                out["hint"] = (f"原有会话未受影响（仍是 pid={old_pid}），"
+                               f"可以继续使用 runtime_* / hook_* 工具。")
+                out["kept_pid"] = old_pid
+            return out
+
+        # 新会话已经连上 —— 此刻才断开旧会话（切换语义）。
+        if switching_from is not None:
+            old_pid = getattr(switching_from, "pid", 0)
+            try:
+                switching_from.close()
+            except Exception as exc:      # noqa: BLE001 - 关旧会话失败不该毁掉新会话
+                warn(f"断开旧会话 pid={old_pid} 失败：{exc}")
+            _state.note(f"目标变更（pid {old_pid} → {target_pid}），"
+                        f"已断开旧会话 pid={old_pid}（进程未被结束）")
 
         _state.runtime = sess
         _state.note(f"已注入 pid={target_pid} ({proc_name})")
