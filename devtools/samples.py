@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -107,6 +108,62 @@ def find_il2cpp() -> Path | None:
     """IL2CPP 样本：Garden of Witches（元数据实测约 17 MB）。"""
     return _find_dir(["Garden of Witches"],
                      marker=r"Garden of Witches_Data/il2cpp_data/Metadata/global-metadata.dat")
+
+
+#: 解析器**声明支持**的 IL2CPP 元数据版本区间（见 `engine/il2cpp_meta.py` 的
+#: 「支持版本：v24 ~ v31」）。这里**故意另写一份常量**，不去 import 被测代码：
+#: 样本可用性判定必须独立于被测实现，否则解析器一改版本区间，
+#: 「哪个样本能用」也跟着变，测试就变成空转了。
+_IL2CPP_SUPPORTED_VERSIONS = (24, 31)
+
+
+def _il2cpp_meta_version(meta: Path) -> int | None:
+    """读元数据头里的版本号；魔术数不对或读不出来返回 None（不猜）。"""
+    try:
+        with open(meta, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return None
+    if len(head) < 8:
+        return None
+    sanity, version = struct.unpack("<Ii", head)
+    return version if sanity == 0xFAB11BAF else None
+
+
+def find_il2cpp_any() -> Path | None:
+    """**任意一个**可用的 IL2CPP 样本（不限定具体游戏）。
+
+    为什么需要它：有一类验收与**具体是哪个游戏无关** —— 它们验的是
+    「切换游戏时会话身份不串」「目录布局判定 / 容器目录识别」，
+    只要是个真的 IL2CPP 游戏就能跑（实测：把 `find_il2cpp()` 换成别的
+    IL2CPP 游戏，`verify_session_switch` 14 项、`verify_mcp_discovery`
+    49 项全绿）。
+
+    而此前它们硬依赖 Garden of Witches：样本不在本机时整条门禁直接
+    `return 1`，于是**长期没有运行**。`AGENTS.md` §5.3 要求「缺样本记为
+    无法验证并跳过」，但**长期跳过等于没有保护** —— 这两个门禁一个管
+    状态污染、一个管容器目录误判，都是曾经真出过缺陷的地方。
+
+    选取规则：先用规范样本 `find_il2cpp()`；没有再退而求其次，
+    在样本根下找**版本号在解析器支持区间内**的 IL2CPP 游戏。
+    为什么要看版本号：本机存在 v39 的样本（Unity 6.3），解析器不支持，
+    拿它当样本只会把「样本不支持」误报成「代码坏了」。
+
+    取不到返回 `None` —— 调用方仍须按「无法验证」处理，不许假装通过。
+    """
+    exact = find_il2cpp()
+    if exact is not None:
+        return exact
+    lo, hi = _IL2CPP_SUPPORTED_VERSIONS
+    for root in SAMPLE_ROOTS:
+        if not root.is_dir():
+            continue
+        for meta in sorted(root.glob(
+                "*/*_Data/il2cpp_data/Metadata/global-metadata.dat")):
+            version = _il2cpp_meta_version(meta)
+            if version is not None and lo <= version <= hi:
+                return meta.parents[3]      # <游戏目录>
+    return None
 
 
 def find_mono() -> Path | None:
@@ -327,6 +384,7 @@ if __name__ == "__main__":
     print("-" * 66)
     for label, fn in [
         ("IL2CPP (Garden of Witches)", find_il2cpp),
+        ("IL2CPP（任意受支持的）", find_il2cpp_any),
         ("Mono (Archon Soul)", find_mono),
         ("Mono 多程序集 (Kinny)", find_mono_multi),
         ("UE pak v12 (CatapultHero)", find_ue_pak_v12),

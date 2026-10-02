@@ -328,7 +328,13 @@ if Path(NEGATIVES[1]).is_file():
 section("6. ue_manifest / ue_script_objects")
 
 for sp in SAMPLES:
-    if not Path(sp["root"]).is_dir():
+    # **先判空串**：样本缺失时 `root` 是 `""`，而 `Path("")` 等于 `Path(".")`、
+    # `.is_dir()` 返回 **True** —— 于是「缺样本就跳过」失效，脚本会拿着
+    # 当前目录去调 ue_manifest，报「需要提供 path 或 game_dir」，
+    # 看起来像产品缺陷，实际是样本缺失（实测：失败 1 项就是这么来的）。
+    if not sp["root"] or not Path(sp["root"]).is_dir():
+        print(f"  ⚠️  无法验证：样本「{sp['name']}」不在本机，跳过该样本")
+        WARN += 1
         continue
     mf = S.ue_manifest(game_dir=sp["root"], limit=10)
     check(f"{sp['name']}：ue_manifest 返回 ok", mf.get("ok") is True,

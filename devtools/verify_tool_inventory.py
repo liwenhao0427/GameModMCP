@@ -105,6 +105,9 @@ NON_TOOL_IDENTIFIERS = {
     "domain_released",
     # 类名没解析出来时返回的「已搜过几个程序集」，是返回字段不是工具
     "searched_images",
+    # decompile 返回的「实际反编译出来的类型名」（嵌套类型会退让到最外层，
+    # 所以它与 requested 不一定相同），是返回字段不是工具
+    "decompiled_type",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
 }

@@ -36,7 +36,12 @@ src = AGENT.read_text(encoding="utf-8")
 print(f"  编码: UTF-8  行数: {src.count(chr(10)) + 1:,}")
 # BOM 检查
 raw = AGENT.read_bytes()
-print(f"  BOM : {'存在（不符合要求）' if raw[:3] == b'\xef\xbb\xbf' else '无（符合要求）'}")
+# 表达式提到 f-string 外面：3.12 之前 f-string 的 {} 里不许出现反斜杠。
+# 这处与下面那处是同一个毛病 —— 修掉下面那处之后，脚本才第一次真正
+# 编译到这里，于是这处**紧跟着**暴露出来。两处都是「声明支持 3.10 却用了
+# 3.12 语法」，所以一起改。
+_has_bom = raw[:3] == b"\xef\xbb\xbf"
+print(f"  BOM : {'存在（不符合要求）' if _has_bom else '无（符合要求）'}")
 
 # ---------- node 语法检查
 print()
@@ -86,8 +91,10 @@ try:
 
     exports = [m for m in msgs if m.get("type") == "send"]
     if exports:
-        print(f"  探针加载期消息：{json.dumps(exports[0].get('payload'),
-                                              ensure_ascii=False)}")
+        # 表达式必须提到 f-string 外面：`pyproject.toml` 声明 requires-python
+        # >=3.10，而 3.12 之前 f-string 的 {} 里不允许跨行/反斜杠。
+        _payload = json.dumps(exports[0].get("payload"), ensure_ascii=False)
+        print(f"  探针加载期消息：{_payload}")
     errors = [m for m in msgs if m.get("type") == "error"]
     if errors:
         print("  ⚠️  加载期错误：")

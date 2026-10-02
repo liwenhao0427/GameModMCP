@@ -116,6 +116,7 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 | 访问器 | 样本 | 用于 |
 |---|---|---|
 | `find_il2cpp()` | Garden of Witches | IL2CPP（17 MB 元数据） |
+| `find_il2cpp_any()` | Garden of Witches，缺则本机任意受支持版本 | **与具体游戏无关**的验收（切游戏身份不串、目录布局判定） |
 | `find_mono()` | Archon Soul | Mono（单程序集） |
 | `find_mono_multi()` | Kinny and the Cosmic Cauldron | Mono（多程序集） |
 | `mono_games()` | 上面两个 + Gambonanza + Sephiria | Mono 运行时探针（四个样本一起核导出表） |
@@ -128,6 +129,15 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 即样本与仓库并列存放）与 `~/Projects`；可用环境变量 `GAMEMOD_SAMPLES` 整体重定向。
 
 样本不在时脚本记为**「无法验证」并跳过**，不会假装通过。
+
+> 但**长期跳过等于没有保护**。`verify_session_switch`（管状态污染）与
+> `verify_mcp_discovery`（管容器目录误判）曾硬依赖 Garden of Witches，
+> 该样本一不在本机，两条门禁就整轮 `return 1`、长期不跑 ——
+> 而它们管的正是曾经真出过缺陷的地方。实测这两条验收**与具体是哪个
+> IL2CPP 游戏无关**（换成别的 IL2CPP 游戏分别 14 项 / 49 项全绿），
+> 所以改用 `find_il2cpp_any()`：优先规范样本，没有就退用本机任意一个
+> **版本号在解析器支持区间内**的 IL2CPP 游戏（本机有 v39 的样本，
+> 解析器不支持，拿它当样本只会把「样本不支持」误报成「代码坏了」）。
 
 > 历史教训：脚本曾各自硬编码
 > `C:\Users\Administrator\Documents\deepseek-harness\默认工作区\...`，
@@ -249,3 +259,36 @@ devtools/
 - 跑运行时脚本前建议先 `Get-Process -Name '<游戏名>' | Stop-Process -Force`，
   残留的同名进程会让新实例的 IL2CPP 加载异常，
   表现为「注入成功但 IL2CPP 未就绪」这种假象。
+
+> **但「跑之前手工清一次」不能替代脚本自己收拾。** 一条验收如果跑完留下
+> 游戏进程，它就是**不可重复**的：第二次跑会撞上 `launch_game` 的
+> 「已有同名进程」故意拒绝，后面几十条断言连坐报红，看起来像产品缺陷。
+> 实测 `verify_mono_runtime` 就踩过（跑一次绿、再跑一次红）。
+>
+> 所以规矩是：**凡 `launch_game` 起过游戏，收尾必须结束它自己 spawn 的那个
+> pid**（`S.close_session()` 只 detach，**不结束进程**）。参考实现见
+> `verify_mono_runtime.py` 收尾处与 `verify_mcp_tools.py` / `verify_mcp_extra.py`。
+>
+> 清理时**按精确可执行文件路径核对**再结束（`Get-CimInstance … .ExecutablePath`），
+> **不要**用 `taskkill /IM <游戏名>` 这类按进程名的宽泛清理 ——
+> 那会误伤用户机器上同名的无关进程。
+
+## 动态覆盖率门禁（`report_tool_coverage.py --strict`）
+
+`run_all_verify.py` 跑完会在最后卡这一关：**每个 MCP 工具都必须有真实的
+调用证据**。静态检查（`verify_tool_coverage.py`）只看「工具名有没有出现在
+脚本里」，证明不了它真被跑过 —— 脚本完全可以在缺样本的 `if` 分支里跳过它。
+
+这个门禁**必须一直是绿的**：它曾经长期是红的（基线 21/38），因为 13 个运行时
+工具**只有 IL2CPP 侧**验过，而 IL2CPP 样本一不在本机，那两条脚本就整段跳过。
+补齐的办法是把这些**与引擎无关**的工具（读内存 / 扫特征码 / 按绝对地址挂钩 /
+字段读取）也放到 Mono 侧验一遍 —— 见 `verify_mono_runtime.py` §3b 与
+`verify_mcp_mono.py` 的 `list_images` 断言。现在 **38/38**。
+
+> 补覆盖时**别写空转断言**。三条实测教训：
+> · 扫特征码要拿**目标模块内**的字节当模式（从模块里读出来再扫回去）；
+>   拿 `Memory.alloc` 的缓冲区当模式会假红 —— 它不在目标模块内，扫不到是对的。
+> · 按静态索引挑样本类之后，还要**逐个试到运行时真能解析出来**为止；
+>   只取静态第一名会空转（实测 `DiceBody` 运行时拿不到）。
+> · 宽度断言要挑**基础类型**字段；引用类型按 8 字节读是正确行为，
+>   拿它断言 4 字节是测试自己写错。

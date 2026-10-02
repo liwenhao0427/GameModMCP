@@ -238,12 +238,16 @@ def main() -> int:
     print(f"样本根: {[str(p) for p in samples.SAMPLE_ROOTS]}")
 
     samples.ensure_cache_dirs()
-    il2cpp = samples.find_il2cpp()
+    # 本脚本验的是「切换游戏时会话身份不串」，与**具体哪个** IL2CPP 游戏无关，
+    # 所以用 `find_il2cpp_any()`：没有规范样本时退用本机任意一个受支持的
+    # IL2CPP 游戏。此前硬依赖 Garden of Witches，样本一缺整条门禁就
+    # `return 1` 长期不跑 —— 而它管的正是「状态污染」这类真实缺陷。
+    il2cpp = samples.find_il2cpp_any()
     mono = samples.find_mono()
     ue = samples.find_ue_pak_v12()
 
-    if not samples.require(il2cpp, "IL2CPP (Garden of Witches)"):
-        print("\n没有 IL2CPP 样本，无法验证。")
+    if not samples.require(il2cpp, "IL2CPP 样本（任意一款受支持的）"):
+        print("\n没有可用的 IL2CPP 样本，无法验证。")
         return 1
     print(f"  IL2CPP 样本: {il2cpp}")
     print(f"  Mono   样本: {mono}")

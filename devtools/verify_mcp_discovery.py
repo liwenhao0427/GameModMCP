@@ -435,7 +435,9 @@ def main() -> int:
 
     samples.ensure_cache_dirs()
     container = samples.find_container()
-    il2cpp = samples.find_il2cpp()
+    # 布局判定与容器识别**与具体哪个** IL2CPP 游戏无关，故用 find_il2cpp_any()：
+    # 缺 Garden of Witches 时退用本机任意一个受支持的 IL2CPP 游戏。
+    il2cpp = samples.find_il2cpp_any()
     mono = samples.find_mono()
     ue = samples.find_ue_pak_v12()
     unsupported_pair = samples.find_unsupported()
@@ -445,7 +447,7 @@ def main() -> int:
     missing = []
     if not samples.require(container, "容器目录（装着 ≥2 款游戏）"):
         missing.append("container")
-    if not samples.require(il2cpp, "IL2CPP (Garden of Witches)"):
+    if not samples.require(il2cpp, "IL2CPP 样本（任意一款受支持的）"):
         missing.append("il2cpp")
     if not samples.require(mono, "Mono (Archon Soul)"):
         missing.append("mono")

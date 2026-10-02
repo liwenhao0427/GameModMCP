@@ -180,7 +180,14 @@ if have(GAME_EXE):
               (ib2.get("export_count") or 0) > 0,
               f"{ib2.get('export_count')} 个")
 else:
-    check("游戏主程序存在", False, GAME_EXE)
+    # 缺样本是「无法验证」，不是「断言失败」—— 与本文件开头
+    # `HAVE_GAME = samples.require(...)` 的口径保持一致。
+    # 这里以前调 `check(..., False, ...)`，于是同一个「样本不在本机」
+    # 在别处记「无法验证」、在这里记一条红，汇总行的「失败 N 项」
+    # 就混进了环境问题。
+    print(f"  ⚠️  无法验证：IL2CPP 样本主程序不在本机 —— {GAME_EXE}")
+    print("      上面这段 inspect_binary 断言跳过（跳过不算失败）")
+    WARN += 1
 
 # 不存在的文件必须报错
 bad = S.inspect_binary(r"C:\这个文件根本不存在_xyz.exe")

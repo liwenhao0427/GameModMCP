@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
@@ -243,11 +244,21 @@ check("RPC 层确实经过后端对象（非空转）",
       rpc_tail.count("be.") >= 8, f"be.* 出现 {rpc_tail.count('be.')} 次")
 # 非空转反证：同一个正则在后端实现区必须**大量命中**，
 # 否则「RPC 层 0 次」可能只是因为正则写错了（永远匹配不上）。
-backend_zone = text[:text.index("rpc.exports = {")] if "rpc.exports = {" in text else ""
-print(f"  同一正则在后端实现区的命中次数：{len(re.findall(r'funcs\\.il2cpp_[a-zA-Z0-9_]+', backend_zone))}")
+# 正则提到 f-string 外面：`pyproject.toml` 声明 requires-python >=3.10，
+# 而 3.12 之前 f-string 的 {} 里不允许出现反斜杠。
+# 顺带订正一处真错：原来 print 里写的是 `funcs\\.il2cpp_`（**两个**反斜杠），
+# 在非 raw 的 Python 字符串里那是「字面反斜杠 + 任意字符」，
+# 匹配不到 agent.js 里实际存在的 `funcs.il2cpp_`；而下面断言用的是
+# 单个反斜杠（正确）。于是「打印 0 次 / 断言 >20」自相矛盾 ——
+# 现在两边共用同一个常量，不可能再各写各的。
+backend_zone = (text[:text.index("rpc.exports = {")]
+                if "rpc.exports = {" in text else "")
+_BACKEND_CALL_RE = r"funcs\.il2cpp_[a-zA-Z0-9_]+"
+_backend_hits = len(re.findall(_BACKEND_CALL_RE, backend_zone))
+print(f"  同一正则在后端实现区的命中次数：{_backend_hits}")
 check("「RPC 层 0 次」不是正则写错（后端实现区里同一正则命中很多）",
-      len(re.findall(r"funcs\.il2cpp_[a-zA-Z0-9_]+", backend_zone)) > 20,
-      f"后端区命中 {len(re.findall(r'funcs\.il2cpp_[a-zA-Z0-9_]+', backend_zone))} 次")
+      _backend_hits > 20,
+      f"后端区命中 {_backend_hits} 次")
 
 # ---- 假 RVA 防护
 desc = _agent_slice(r"function describeAddress\(addr\)", r"\n    \}")
@@ -376,6 +387,49 @@ else:
     check("open_game 认出 mono 引擎", op.get("engine") == "mono",
           f"实际={op.get('engine')}")
 
+    # 开场先清掉可能残留的同名进程。
+    #
+    # 为什么必须做：`launch_game` 对「已有同名进程在跑」是**故意拒绝**的
+    # （Unity 单实例锁，新进程不会加载 mono/GameAssembly，只会白等到超时）。
+    # 而本脚本跑完只 `close_session()`（那只是 detach，**不结束游戏进程**），
+    # 于是**第二次运行必然失败**：报「已经有同名进程在运行」。
+    # 实测就踩到了 —— 上一轮留下的 Archon Soul.exe 让下一轮的
+    # `launch_game` 直接 ok:False，后面所有运行时断言全部连坐报红。
+    #
+    # 只清**本项目样本游戏自己**那一个 exe（按精确路径核对），
+    # 不做按进程名的宽泛清理 —— 那种写法会误伤同名的无关进程。
+    _exe_path = Path(str(op.get("exe") or ""))
+    if _exe_path.is_file():
+        try:
+            import subprocess as _sp
+            _found = _sp.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {_exe_path.name}",
+                 "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=30,
+            )
+            for _line in (_found.stdout or "").splitlines():
+                if '"' not in _line:
+                    continue
+                _parts = [p.strip('"') for p in _line.split('","')]
+                if len(_parts) < 2 or not _parts[1].isdigit():
+                    continue
+                _stale = int(_parts[1])
+                # 核对可执行文件路径，确保结束的确实是本样本游戏
+                _m = _sp.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter "
+                     f"'ProcessId={_stale}').ExecutablePath"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                _path = (_m.stdout or "").strip()
+                if _path and os.path.normcase(_path) == os.path.normcase(str(_exe_path)):
+                    print(f"  清理上一轮残留的样本游戏进程 pid={_stale}")
+                    _sp.run(["taskkill", "/F", "/T", "/PID", str(_stale)],
+                            capture_output=True, timeout=30)
+            time.sleep(1.0)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  残留检查跳过：{exc}")
+
     lg = S.launch_game()
     init = lg.get("init") or {}
     print(f"  launch_game ok={lg.get('ok')} pid={lg.get('pid')} "
@@ -385,6 +439,12 @@ else:
           f"waited={init.get('waited')}")
     print(f"  api_missing={init.get('api_missing')}")
     print(f"  string_layout={init.get('string_layout')}")
+    if not lg.get("ok"):
+        # 启动失败就把原因打全（含 hint），否则后面几十条断言会一起报红，
+        # 真正的原因被埋在中间。
+        print(f"  ❌ launch_game 失败：{str(lg.get('error'))[:200]}")
+        print(f"     hint={str(lg.get('hint'))[:200]}")
+    _spawned_pid = lg.get("pid")
     check("Mono 游戏上探针初始化成功", init.get("ok") is True,
           str(init.get("error"))[:120])
     check("探针报告引擎为 mono", init.get("engine") == "mono",
@@ -592,7 +652,272 @@ else:
     if gc.get("ok"):
         S.gc_control(disable=False)
 
+    # ------------------------------------------------------------------
+    # 其余运行时工具（inject_process / find_hook_target / hook_address /
+    # read_memory / write_memory / scan_pattern / read_field_value）
+    #
+    # 为什么补在这里：这些工具此前**只有 IL2CPP 侧**验过
+    # （`verify_mcp_extra.py` / `verify_mcp_tools.py` 都用 Garden of Witches）。
+    # 该样本不在本机时那两条脚本整段跳过，于是动态覆盖率门禁里它们长期是空的
+    # —— 实测基线只有 21/38。而它们**与引擎无关**（读内存 / 扫特征码 /
+    # 按绝对地址挂钩），Mono 会话照样能跑，且本机有 Mono 样本，稳定可复验。
+    #
+    # ------------------------------------------------------------------
+    # 其余运行时工具（inject_process / find_hook_target / hook_address /
+    # read_memory / write_memory / scan_pattern / read_field_value）
+    #
+    # 为什么补在这里：这些工具此前**只有 IL2CPP 侧**验过
+    # （`verify_mcp_extra.py` / `verify_mcp_tools.py` 都用 Garden of Witches）。
+    # 该样本不在本机时那两条脚本整段跳过，于是动态覆盖率门禁里它们长期是空的
+    # —— 实测基线只有 21/38。而它们**与引擎无关**（读内存 / 扫特征码 /
+    # 按绝对地址挂钩），Mono 会话照样能跑，且本机有 Mono 样本，稳定可复验。
+    section("3b. 其余运行时工具（Mono 会话下，与引擎无关的那几个）")
+
+    # ---- inject_process：目标不存在时必须**如实失败且不动现有会话**
+    #
+    # 这里用**一个不存在的 pid**（不是本进程 pid）。两个原因：
+    #   · 本进程 pid 是真进程，Frida 能 attach 上去 —— 那会把会话从游戏
+    #     切到我们自己身上，后续断言全部失去意义（实测踩过）；
+    #   · 不存在的 pid 才能测出下面这条**真缺陷的回归**：
+    #     修复前 `inject_process(pid=不存在)` 是「先断开旧会话、再去连新目标」，
+    #     于是返回失败的同时**把正在用的游戏会话弄没了** ——
+    #     调用方只是想试一个 pid，却发现所有 runtime_* 都报「没有已注入的会话」。
+    _live_before = (S.get_session().get("runtime") or {}).get("pid")
+    _bad_pid = 999999
+    _bad_inj = S.inject_process(pid=_bad_pid, auto_find=False)
+    print(f"  inject_process(pid={_bad_pid}): ok={_bad_inj.get('ok')} "
+          f"error={str(_bad_inj.get('error'))[:70]}")
+    check("inject_process 对不存在的 pid 如实失败（不假成功）",
+          _bad_inj.get("ok") is False and bool(_bad_inj.get("error")),
+          str(_bad_inj.get("error"))[:100])
+    check("失败时如实说明「原会话未受影响」",
+          _bad_inj.get("kept_pid") == _live_before
+          and "未受影响" in str(_bad_inj.get("hint") or ""),
+          f"kept_pid={_bad_inj.get('kept_pid')} hint={str(_bad_inj.get('hint'))[:60]}")
+    # 关键回归：旧会话必须**还在**
+    _live_after = (S.get_session().get("runtime") or {}).get("pid")
+    check("失败的注入**没有**把正在用的会话弄丢（旧会话仍在）",
+          bool(_live_after) and _live_after == _live_before,
+          f"注入前 pid={_live_before}，注入后 pid={_live_after}"
+          "（不一致 = 失败还带副作用）")
+
+    # ---- find_hook_target：拿真实绝对地址
+    _tgt = S.find_hook_target(name="Time", method="get_frameCount",
+                              namespace="UnityEngine")
+    print(f"  find_hook_target: ok={_tgt.get('ok')} "
+          f"候选={len(_tgt.get('candidates') or [])}")
+    check("find_hook_target 返回 ok", _tgt.get("ok") is True,
+          str(_tgt.get("error"))[:100])
+    _cands = _tgt.get("candidates") or []
+    _addr = _cands[0].get("address") if _cands else None
+    if _cands:
+        _c0 = _cands[0]
+        print(f"     {_c0.get('name')} address={_addr} rva={_c0.get('rva_hex')} "
+              f"in_module={_c0.get('in_module')} token={_c0.get('token')}")
+        check("候选带可直接挂钩的绝对地址", bool(_addr), f"{_addr!r}")
+        # Mono 的关键差异：JIT 代码不在 mono 模块内 → 不许给假 RVA
+        check("Mono 上 in_module=False 且**不给**假 RVA",
+              _c0.get("in_module") is False and _c0.get("rva") is None,
+              f"in_module={_c0.get('in_module')} rva={_c0.get('rva')}")
+
+    # ---- hook_address：按绝对地址挂钩（与 hook_method 不同的代码路径）
+    if _addr:
+        _ha = S.hook_address(address=_addr, label="mono.hook_address",
+                             max_calls=100)
+        print(f"  hook_address({_addr}): ok={_ha.get('ok')} "
+              f"hook_id={_ha.get('hook_id')} error={str(_ha.get('error'))[:60]}")
+        check("hook_address 返回 ok", _ha.get("ok") is True,
+              str(_ha.get("error"))[:100])
+        if _ha.get("ok"):
+            time.sleep(1.0)
+            _hev = S.drain_events(limit=10)
+            print(f"     hook_address 事件数={_hev.get('returned')}")
+            S.unhook()
+
+    # ---- read_memory / write_memory：在**自建缓冲区**上验（不碰游戏内存）
+    #
+    # 为什么不用游戏模块头：写游戏内存有副作用，而这两个工具的正确性
+    # （地址解析、hex 编解码、宽度）在一块自己分配的内存上就能完整验证。
+    _buf = S.eval_script(
+        "(function(){"
+        "  globalThis.__mono_verify_buf = Memory.alloc(64);"
+        "  globalThis.__mono_verify_buf.writeByteArray([0x11,0x22,0x33,0x44]);"
+        "  return globalThis.__mono_verify_buf.toString();"
+        "})()"
+    ).get("value")
+    check("分配了自建缓冲区", bool(_buf), f"{_buf!r}")
+    if _buf:
+        _rm = S.read_memory(address=_buf, size=4)
+        print(f"  read_memory({_buf}, 4): ok={_rm.get('ok')} hex={_rm.get('hex')}")
+        check("read_memory 返回 ok", _rm.get("ok") is True,
+              str(_rm.get("error"))[:80])
+        check("read_memory 读回写入的字节", (_rm.get("hex") or "").lower()
+              == "11223344", f"实际={_rm.get('hex')!r}")
+        # 写回一组新字节，再读出来核对（写→读闭环）
+        _wm = S.write_memory(address=_buf, hex_data="deadbeef")
+        print(f"  write_memory({_buf}, 'deadbeef'): ok={_wm.get('ok')} "
+              f"error={str(_wm.get('error'))[:60]}")
+        check("write_memory 返回 ok", _wm.get("ok") is True,
+              str(_wm.get("error"))[:80])
+        _rm2 = S.read_memory(address=_buf, size=4)
+        check("写进去的字节能原样读回（写→读闭环）",
+              (_rm2.get("hex") or "").lower() == "deadbeef",
+              f"实际={_rm2.get('hex')!r}")
+
+    # ---- scan_pattern：兜底手段，但必须真的能扫
+    #
+    # 怎么做到「非空转」：先从**目标模块自己的内存**里读一小段字节，
+    # 再把这段字节当特征码去扫同一个模块 —— 这些字节一定存在
+    # （就在我们刚读的那个地址上），扫不到就说明扫描路径坏了，
+    # 而不是「游戏里恰好没有这个模式」。
+    #
+    # 注意不能拿前面 `Memory.alloc` 的缓冲区当特征码：那段内存在
+    # Frida 自己分配的页里，**不在目标模块内**，而 scan_pattern 只扫
+    # 目标模块内的可读段 —— 扫不到是正确行为，断言会假红（实测踩过）。
+    _ri = S.runtime_info()
+    _mod_name = _ri.get("module") or ""
+    _mod_base = _ri.get("base") or _ri.get("module_base") or ""
+    print(f"  目标模块={_mod_name} base={_mod_base}")
+    if _mod_base:
+        # 取模块头之后 4 字节（模块头通常是 MZ/PE，取靠后一点更有代表性）
+        _probe_at = hex(int(_mod_base, 16) + 0x1000)
+        _probe = S.read_memory(address=_probe_at, size=4)
+        _probe_hex = (_probe.get("hex") or "").lower()
+        if _probe.get("ok") and len(_probe_hex) == 8:
+            _pat = " ".join(_probe_hex[i:i + 2] for i in range(0, 8, 2)).upper()
+            _sp = S.scan_pattern(pattern=_pat, module=_mod_name, max_results=64)
+            _n = len(_sp.get("results") or [])
+            print(f"  scan_pattern('{_pat}', module={_mod_name}): "
+                  f"ok={_sp.get('ok')} matched={_sp.get('matched')} "
+                  f"results={_n}")
+            check("scan_pattern 返回 ok", _sp.get("ok") is True,
+                  str(_sp.get("error"))[:100])
+            check("扫到了刚从该模块读出的已知字节（非空转，证明扫描真的在跑）",
+                  _n > 0, f"results={_n}（期望 ≥1，含 {_probe_at}）")
+            check("报出的 scanned_module 就是被扫的模块",
+                  _sp.get("scanned_module") == _mod_name,
+                  f"实际={_sp.get('scanned_module')!r}")
+            # 命中的地址里应当包含我们读的那个地址（同源证据）
+            _addrs = {str(r.get("address", "")).lower()
+                      for r in (_sp.get("results") or [])}
+            check("命中列表里含我们读取的那个地址",
+                  _probe_at.lower() in _addrs,
+                  f"{_probe_at} in {sorted(_addrs)[:4]}")
+        else:
+            check("能读出模块内 4 字节用于构造特征码", False,
+                  f"hex={_probe_hex!r} err={str(_probe.get('error'))[:60]}",
+                  warn_only=True)
+    else:
+        check("runtime_info 给出模块基址（scan_pattern 的前置）", False,
+              f"module={_mod_name!r} base={_mod_base!r}", warn_only=True)
+
+    # ---- read_field_value：伪造实例 + 真实字段偏移（与 IL2CPP 侧同一手法）
+    #
+    # 选一个**游戏自有**的类，取其真实字段偏移，在一块自建内存上按该偏移
+    # 写标记值，再看 read_field_value 能否按同一偏移读回来。
+    # 这验证了「偏移算术 + 按类型宽度读」整条链路。
+    #
+    # 必须挑**基础类型**字段（int/bool/float）：引用类型字段按 8 字节读，
+    # 拿它断言 4 字节会假红（实测踩过 —— 一开始挑到
+    # `m_CancellationTokenSource`，它是引用类型，读 8 字节是**正确**行为）。
+    # 所以先用静态索引找一个真有 System.Int32 字段的非编译器生成类，
+    # 而不是在运行时字段表里随便取第一个。
+    _WANT_TYPES = ("System.Int32", "System.Single", "System.UInt32")
+    _cands: dict[str, list[str]] = {}
+    for _ch in "abcdefghijklmnopqrstuvwxyz":
+        _sf = S.search_fields(pattern=_ch, limit=2000)
+        for _it in (_sf.get("items") or []):
+            _own = str(_it.get("owner") or "")
+            # 跳过编译器生成的状态机（属性名带尖括号），它们不是稳定的样本
+            if "<" in _own or "d__" in _own or ">" in _own:
+                continue
+            if _it.get("field_type") in _WANT_TYPES:
+                _cands.setdefault(_own, []).append(_it["name"])
+    print(f"  宽度验收候选类 {len(_cands)} 个（按基础类型字段数排序）")
+    # 逐个试到**运行时真能解析**为止。
+    #
+    # 为什么不能只按静态字段数取第一名：静态索引里有这个类，不代表运行时
+    # 也解析得出来 —— 实测第一名 `DiceBody` 静态有 60+ 个 Int32 字段，
+    # 但运行时 `runtime_class_info` 拿不到（该类型在本轮程序集加载状态下
+    # 没有实例化/未加载）。只取第一名会让这条断言**空转跳过**，
+    # 而「跳过」看起来和「通过」一样绿。
+    _cls = ""
+    _rfc: dict = {"ok": False}
+    for _cand_cls in [c for c, _f in sorted(_cands.items(),
+                                            key=lambda kv: -len(kv[1]))][:12]:
+        _r = S.runtime_class_info(name=_cand_cls)
+        _has = [f for f in (_r.get("fields") or [])
+                if f.get("offset") is not None and not f.get("is_static")
+                and f.get("type") in _WANT_TYPES]
+        if _r.get("ok") and _has:
+            _cls, _rfc = _cand_cls, _r
+            break
+    print(f"  运行时可用且含基础类型实例字段的类：{_cls!r}")
+    if _rfc.get("ok"):
+        _flds = [f for f in (_rfc.get("fields") or [])
+                 if f.get("offset") is not None and not f.get("is_static")]
+        _pick = next((f for f in _flds if f.get("type") in _WANT_TYPES), None)
+        print(f"  {_cls} 实例字段 {len(_flds)} 个，选中 "
+              f"{_pick and (_pick['name'], _pick.get('type'), _pick['offset'])}")
+        if _pick:
+            _off = int(_pick["offset"])
+            _marker = 0x11223344
+            _inst = S.eval_script(
+                "(function(){"
+                "  globalThis.__mono_verify_inst = Memory.alloc(512);"
+                f"  globalThis.__mono_verify_inst.add({_off})"
+                f".writeU32(0x{_marker:08x});"
+                "  return globalThis.__mono_verify_inst.toString();"
+                "})()"
+            ).get("value")
+            if _inst:
+                _rf = S.read_field_value(instance=_inst, name=_cls,
+                                        field=_pick["name"])
+                print(f"     read_field_value: ok={_rf.get('ok')} "
+                      f"read_width={_rf.get('read_width')} "
+                      f"raw_hex={_rf.get('raw_hex')} as_int32={_rf.get('as_int32')}")
+                check("read_field_value 返回 ok", _rf.get("ok") is True,
+                      str(_rf.get("error"))[:90])
+                if _rf.get("ok"):
+                    check("按字段类型宽度读（4 字节基础类型 → read_width=4）",
+                          _rf.get("read_width") == 4,
+                          f"字段类型={_pick.get('type')} "
+                          f"实际 read_width={_rf.get('read_width')}")
+                    check("读回的正是写在真实偏移上的标记值",
+                          (_rf.get("raw_hex") or "").lower() == "44332211",
+                          f"raw_hex={_rf.get('raw_hex')!r} 期望=44332211")
+        else:
+            check("找到可用于 read_field_value 的实例字段", False,
+                  f"{_cls} 没有带偏移的基础类型实例字段")
+    else:
+        # **硬失败**，不是警告：上面已经逐个试过若干候选类，只要有一个能在
+        # 运行时解析出来就够了。全部失败说明 Mono 的类解析/字段枚举真的坏了
+        # （这正是本脚本该拦的那类缺陷）。记成 warn_only 会让这条断言
+        # 「看起来绿、实际没跑」—— 那是本文件反复强调要避免的空转。
+        check("能找到运行时可用、且含基础类型实例字段的类", False,
+              f"试过 {min(12, len(_cands))} 个候选，均无法在运行时取得"
+              f"带偏移的基础类型字段")
+
+    # ---- 收尾（含上面 hook_address 可能留下的 hook）
+    S.unhook()
+
     S.close_session()
+
+    # 结束**本脚本 spawn 出来**的那个游戏进程。
+    #
+    # `close_session()` 只是 detach（卸载 Hook、断开连接），**不结束进程** ——
+    # 不把它收掉，下一轮 `launch_game` 就会被「已有同名进程」拦下，
+    # 本脚本变成「只能跑一次」。其他运行时脚本
+    # （verify_mcp_tools / verify_mcp_extra）都是这么收尾的，这里对齐。
+    if _spawned_pid:
+        print(f"  清理：结束本脚本启动的游戏进程 pid={_spawned_pid} …")
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/F", "/T", "/PID", str(_spawned_pid)],
+                    capture_output=True, timeout=30)
+            print("  已结束")
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  结束失败，请手动检查：{exc}")
 
 # ============================================================ 4. 程序集懒加载
 section("4. 「注入成功 ≠ 可以 Hook」：等 Mono 程序集加载稳定（纯函数，不开游戏）")

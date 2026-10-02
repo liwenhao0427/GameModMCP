@@ -198,6 +198,43 @@ check("search_methods 返回 ok", sm.get("ok") is True)
 check("搜到 Update 方法", (sm.get("total") or 0) > 0,
       f"命中 {sm.get('total')}")
 
+# list_images：**工具层**断言。
+#
+# 为什么补在这里：它是唯一「只有会话对象调用、没有工具层调用」的工具
+# （`verify_il2cpp_runtime.py` 走的是 `sess.list_images()`），
+# 于是动态覆盖率门禁里它长期是空的 —— AGENTS.md §5.1 记的就是这条。
+# Mono 会话同样能列程序集，且**不需要注入**，所以放在这里是稳定的。
+li = S.list_images()
+check("list_images 返回 ok", li.get("ok") is True, li.get("error", ""))
+print(f"     程序集 {li.get('total')} 个")
+check("列出了程序集（Mono 游戏通常有多个）", (li.get("total") or 0) > 0,
+      f"total={li.get('total')}")
+_li_items = li.get("items") or []
+if _li_items:
+    print(f"     首条: {_li_items[0].get('image')} "
+          f"类型数={_li_items[0].get('type_count')}")
+    check("每条带程序集名与类型数",
+          bool(_li_items[0].get("image"))
+          and isinstance(_li_items[0].get("type_count"), int),
+          str(_li_items[0])[:80])
+    # 分页必须真的生效（不许「收下参数但不干活」—— AGENTS.md §3.1）
+    _li_p1 = S.list_images(limit=3, offset=0)
+    _li_p2 = S.list_images(limit=3, offset=3)
+    if (_li_p1.get("total") or 0) > 3:
+        _n1 = [i.get("image") for i in (_li_p1.get("items") or [])]
+        _n2 = [i.get("image") for i in (_li_p2.get("items") or [])]
+        check("offset 真的改变了返回内容（不是死参数）",
+              bool(_n1) and bool(_n2) and _n1 != _n2,
+              f"p1={_n1[:2]} p2={_n2[:2]}")
+        check("limit 真的生效", len(_n1) <= 3, f"{len(_n1)} 条")
+    # 过滤也必须是活的
+    _li_f = S.list_images(pattern="Assembly-CSharp")
+    check("pattern 过滤生效（命中项都含该子串）",
+          _li_f.get("ok") is True
+          and all("Assembly-CSharp" in str(i.get("image"))
+                  for i in (_li_f.get("items") or [])),
+          f"命中 {_li_f.get('total')}")
+
 
 # ============================================================ 4. 类详情
 section("4. class_detail —— 字段/方法/继承链")
