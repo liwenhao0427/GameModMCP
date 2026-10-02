@@ -55,9 +55,20 @@ METADATA_MAGIC = 0xFAB11BAF
 
 # ---------------------------------------------------------------- 常量
 
-# v31 的 typeDefinitions 记录大小；v24~v29 为 92
+# typeDefinitions 记录大小（字节）。
+#
+# 这里曾把 v24~v29 写成 92，**是错的**：实测 v29（Ved，19.4 MB 元数据）用 92
+# 会解析出 21,290 个类型，且 Σfield_count = 650,148,194（真值 96,094）——
+# 每个「类型」的 field_start/field_count 全部错位，建索引时撞上
+# `UNIQUE constraint failed: fields.idx`，open_game 直接失败。
+#
+# 正确的判据不是「版本号」，而是**字段区间必须恰好铺满 fields 表**：
+#   ∪ [field_start, field_start+field_count) == {0 .. len(fields)-1}，且不重叠。
+# 按这个判据在 10 份真实样本上实测（v29 ×1、v31 ×9），88 全部通过；
+# 92 在这些样本上连 `typeDefinitions.size % 92 == 0` 都不成立，直接用不了。
+# field_count == 0 的记录要跳过：它们的 field_start 是哨兵值、不是真实区间。
 TYPEDEF_SIZE_V31 = 88
-TYPEDEF_SIZE_LEGACY = 92
+TYPEDEF_SIZE_LEGACY = 88
 
 # v31 的 methods 记录大小；更早版本为 32
 METHOD_SIZE_V31 = 36
@@ -419,7 +430,81 @@ class Metadata:
 
     @property
     def _typedef_size(self) -> int:
-        return TYPEDEF_SIZE_V31 if self.version >= 31 else TYPEDEF_SIZE_LEGACY
+        """推断 typeDefinitions 记录大小（自验证，不靠版本号硬猜）。
+
+        **为什么不能只按版本号**：这里曾写死「v31 用 88、v24~v29 用 92」，
+        而 92 对 v29 是错的 —— 实测 Ved（v29，19.4 MB 元数据）用 92 解析出
+        21,290 个类型、Σfield_count = 650,148,194（真值 96,094），
+        每个类型的 field_start/field_count 全部错位，建索引时撞上
+        `UNIQUE constraint failed: fields.idx`，`open_game` 直接失败。
+
+        **判据**：正确的 stride 必须让「字段区间恰好铺满 fields 表」——
+            ∪ [field_start, field_start+field_count) == {0 .. len(fields)-1}
+        且互不重叠。这条性质与版本号无关，是布局正确性的直接证据。
+        （field_count == 0 的记录要跳过：它们的 field_start 是哨兵值。）
+
+        先信版本号给出的期望值；只有在它**通不过铺满检验**时才逐个试候选，
+        并在改选时 warn 出来 —— 静默换一个 stride 会让「解析错了」
+        伪装成「解析对了」。
+        """
+        expected = TYPEDEF_SIZE_V31 if self.version >= 31 else TYPEDEF_SIZE_LEGACY
+        entry = self.tables.get("typeDefinitions")
+        fields_entry = self.tables.get("fields")
+        if entry is None or not entry.size or fields_entry is None:
+            return expected
+        if self._tiles_fields(entry, expected):
+            return expected
+        for candidate in (88, 92, 84, 96, 80, 100):
+            if candidate == expected or entry.size % candidate:
+                continue
+            if self._tiles_fields(entry, candidate):
+                warn(
+                    f"typeDefinitions 期望 {expected} 字节/记录（v{self.version}），"
+                    f"但它无法铺满 fields 表；改用 {candidate} 字节/记录"
+                )
+                return candidate
+        warn(
+            f"typeDefinitions 没有任何候选 stride 能铺满 fields 表"
+            f"（v{self.version}，表 {entry.size} 字节）—— 布局可能已变，"
+            "解析结果不可信"
+        )
+        return expected
+
+    def _tiles_fields(self, entry: TableEntry, stride: int) -> bool:
+        """`stride` 是否让 typeDefinitions 的字段区间**恰好铺满** fields 表。
+
+        只读 field_start(@32) 与 field_count(@68)，按区间排序后检查首尾相接。
+        这是 O(n log n)，对 2 万条记录是毫秒级。
+        """
+        if stride <= 0 or entry.size % stride:
+            return False
+        n_fields = self.tables["fields"].size // FIELD_SIZE
+        if n_fields <= 0:
+            return False
+        mv = self._mm
+        base = entry.offset
+        count = entry.size // stride
+        spans: list[tuple[int, int]] = []
+        for i in range(count):
+            b = base + i * stride
+            if b + 70 > len(mv):
+                break
+            start = struct.unpack_from("<i", mv, b + 32)[0]
+            n = struct.unpack_from("<H", mv, b + 68)[0]
+            if n == 0:
+                continue                      # field_start 是哨兵值，不是区间
+            if start < 0 or start + n > n_fields:
+                return False                  # 越界 = 布局判定错误
+            spans.append((start, start + n))
+        if not spans:
+            return False
+        spans.sort()
+        cursor = 0
+        for start, end in spans:
+            if start != cursor:
+                return False                  # 有空洞或重叠
+            cursor = end
+        return cursor == n_fields
 
     def _method_size(self) -> int:
         """推断 methods 记录大小（用整除性自检，避免版本判定错误导致整体错位）。"""

@@ -357,13 +357,14 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 40 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 39 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 41 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 40 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
 |---|---|
 | `verify_parser.py` | IL2CPP 元数据表结构与记录布局 |
+| `verify_typedef_stride.py` | **typeDefinitions 记录大小**：按版本号硬编码会错（v29 实测是 88 不是 92，用错会让 Σfield_count 变 6.5 亿、`open_game` 撞 `UNIQUE constraint failed: fields.idx`）。本脚本用**合成元数据**验证「字段区间恰好铺满 fields 表」这条判据本身、自验证改选必须 warn、并复现历史 bug（不依赖本机装了哪款游戏） |
 | `verify_index.py` | 索引层：构建 / 缓存复用 / 各类查询 / 结果句柄 |
 | `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |
 | `verify_handle_scope.py` | 结果句柄的**作用域**：跨游戏/重开索引的旧句柄必须被拒绝，不许读到另一个结果集 |
