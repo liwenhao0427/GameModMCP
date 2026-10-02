@@ -242,6 +242,43 @@ check("`Outer+Inner` 写法行为与 `.` 一致",
       and res_plus.get("decompiled_type") == "BarrierSpellEffect",
       f"ok={res_plus.get('ok')} type={res_plus.get('decompiled_type')}")
 
+# 命名空间限定的**顶层**类型不许被误判成嵌套类型（两者字面上都是 `A.B`）。
+# 修复前的判据只看「名字里有没有点」，会把这类请求也退让掉；
+# 现在靠 `_list_types()` 的权威清单区分，这条是那个区分的回归。
+check("命名空间限定的顶层类型**不**被误判成嵌套类型",
+      res_ns.get("decompiled_type") == NS_TYPE
+      and not res_ns.get("nested_note"),
+      f"decompiled_type={res_ns.get('decompiled_type')!r} "
+      f"nested_note={bool(res_ns.get('nested_note'))}")
+
+# 深层嵌套（3 层以上）：Archon Soul 里没有这种类型（实测 0 个），
+# 所以不能靠样本断言 —— 改用**合成清单**直接验解析逻辑。
+# 现场是 Sephiria 的 `AnimationSet+StateInfo+Event+EPriority`（实测存在）：
+# 退让必须一路到最外层 `AnimationSet`，而不是只砍掉最后一段。
+from gamemod_mcp.engine import decompile as _dc               # noqa: E402
+
+_FAKE_LISTING = {
+    "AnimationSet", "AnimationSet+StateInfo", "AnimationSet+StateInfo+Event",
+    "AnimationSet+StateInfo+Event+EPriority",
+    "FlyingWormConsole3.LiteNetLib.NetManager",
+    "FlyingWormConsole3.LiteNetLib.NetManager+IPEndPointComparer",
+}
+_actual, _is_nested = _dc._real_target(
+    _FAKE_LISTING, "AnimationSet.StateInfo.Event.EPriority")
+check("多层嵌套退让到最外层（不是只砍一段）",
+      _actual == "AnimationSet" and _is_nested,
+      f"actual={_actual!r} is_nested={_is_nested}")
+_actual2, _nested2 = _dc._real_target(
+    _FAKE_LISTING, "FlyingWormConsole3.LiteNetLib.NetManager")
+check("命名空间顶层类型判为**非**嵌套（合成清单）",
+      _actual2 == "FlyingWormConsole3.LiteNetLib.NetManager" and not _nested2,
+      f"actual={_actual2!r} is_nested={_nested2}")
+_actual3, _nested3 = _dc._real_target(
+    _FAKE_LISTING, "FlyingWormConsole3.LiteNetLib.NetManager+IPEndPointComparer")
+check("`命名空间.外层+内层` 也退让到 `命名空间.外层`",
+      _actual3 == "FlyingWormConsole3.LiteNetLib.NetManager" and _nested3,
+      f"actual={_actual3!r} is_nested={_nested3}")
+
 # 关键回归：**不存在的内层类型**也必须被拦下。
 # 实测 ilspycmd 对 `Outer+不存在` 会返回**外层**且退出码 0（假成功），
 # 所以「退让」绝不能一路退让到只要外层存在就算成功。

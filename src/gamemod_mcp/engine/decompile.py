@@ -21,12 +21,18 @@
 
 实测到的三个坑（本模块据此设计，改动前请先复读）
 --------------------------------------------------
-1. **`Outer+Inner` 会静默返回外层类型**。ilspycmd 的 `-t` 并不支持用
-   `+` 精确指定嵌套类型：传 `Outer+Inner`、`Outer+不存在的内层`、
-   甚至 `Outer+` 空串，退出码都是 0，输出**与外层完全一致**。
-   这是典型的「假成功」——不核对就会把外层源码当成内层交出去。
-   → 对策：`_verify_declared()` 强制要求「输出里真的声明了这个简单名」，
-     否则视为未命中。嵌套类型改为「反编译外层 + 明确标注」。
+1. **嵌套类型只能拿到「最外层」那一份产物**（实测 ilspycmd 9.0.0.7889）。
+   `-t Outer+Inner` 与 `-t Outer.Inner` **都能成功解析**到真实存在的嵌套
+   类型（退出码 0），但产物**始终是最外层类型那一份** —— 内层只是其中
+   一段缩进的声明。不存在的内层名两种写法都 `exit 65`，会被拦下。
+   所以这里的「假成功」不是「随便传什么都返回外层」，而是
+   **「产物是外层，却被报成内层」**：调用方拿到
+   `decompiled_type=Outer.Inner` 又没有提示，就会以为这是内层的独立源码。
+   → 对策：`_list_types()` 取程序集的权威类型清单（`-l cisde`，实测与
+     TypeDef 表行数完全一致），据此判定请求名到底是「命名空间限定的
+     顶层类型」还是「嵌套类型」—— 这两种写法在字面上都是 `A.B`，
+     只有清单能区分。是嵌套就**如实报最外层名**并写 `nested_note`。
+     同时保留 `_declared_names()` 护栏（产物里必须真的声明了目标简单名）。
 2. **索引里的 `nested_name` 是点号写法**（`Outer.Inner`），而 ilspycmd
    需要先找到 `Outer` 再在内层里看。直接把 `Outer.Inner` 丢给它
    会得到 `Could not find type definition`。
@@ -207,6 +213,86 @@ def _simple_name(type_name: str) -> str:
     return parts[-1] if parts else ""
 
 
+# ---------------------------------------------------------------- 类型清单
+#
+# `-l` 支持的种类：class / interface / struct / delegate / enum。
+# 紧凑写法 `cisde` 实测与 TypeDef 表行数**完全一致**（Archon Soul：1387 = 1387），
+# 即「程序集里的全部类型定义」，嵌套类型也在内（用 `+` 表示）。
+_LIST_KINDS = "cisde"
+_LIST_KIND_NAMES = frozenset(
+    {"Class", "Interface", "Struct", "Delegate", "Enum"})
+
+
+def _list_types(assembly: str) -> set[str] | None:
+    """取程序集里的全部类型全名（命名空间用 `.`、嵌套用 `+`）。
+
+    为什么需要它：`BarrierSpellEffect.BarrierReference`（嵌套类型）与
+    `FlyingWormConsole3.LiteNetLib.NetManager`（命名空间限定名）在字面上
+    都是 `A.B`，**只有清单能区分** —— 而这两种情况 ilspycmd 的产出不一样：
+    前者只给最外层类型的源码（见模块 docstring 坑 1）。
+
+    取不到返回 `None`。调用方必须按「不知道」处理，不许猜。
+    """
+    result = _run(["-l", _LIST_KINDS, str(assembly)], _TYPE_TIMEOUT)
+    if not result["ok"]:
+        return None
+    names: set[str] = set()
+    for line in result["stdout"].splitlines():
+        kind, _, name = line.strip().partition(" ")
+        if kind in _LIST_KIND_NAMES and name.strip():
+            names.add(name.strip())
+    return names or None
+
+
+def _nested_variants(name: str) -> list[str]:
+    """把 `A.B.C` 展开成所有「点号=命名空间 / 加号=嵌套」的可能写法。
+
+    清单里的写法是命名空间用 `.`、嵌套用 `+`（实测
+    `BarrierSpellEffect+BarrierReference`、`AnimationSet+StateInfo+Event+EPriority`）；
+    而调用方给的名字（索引里的 `nested_name`）一律用 `.`。
+    所以要把「最后几段其实是嵌套」的写法都列出来再比对：
+
+        A.B.C → ['A.B.C', 'A.B+C', 'A+B+C']
+
+    顺序 = 嵌套层级由浅到深，即**优先按命名空间解释**（顶层类型更常见）。
+    """
+    parts = [p for p in (name or "").strip().replace("+", ".").split(".") if p]
+    out: list[str] = []
+    for i in range(len(parts), 0, -1):
+        cand = ".".join(parts[:i])
+        if i < len(parts):
+            cand = cand + "+" + "+".join(parts[i:])
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def _match_listing(listing: set[str], name: str) -> str:
+    """在类型清单里定位 `name`，返回清单中的那个写法；找不到返回空串。"""
+    for variant in _nested_variants(name):
+        if variant in listing:
+            return variant
+    return ""
+
+
+def _real_target(listing: set[str] | None, cand: str) -> tuple[str, bool]:
+    """算出 ilspycmd 对 `cand` **实际会产出的类型名**。
+
+    Returns:
+        `(实际产出的类型全名, 请求的是否为嵌套类型)`。
+        清单不可用（`None`）时退化为 `(cand, False)` —— 与修复前一致。
+    """
+    if not listing:
+        return cand, False
+    hit = _match_listing(listing, cand)
+    if not hit:
+        return cand, False
+    if "+" in hit:
+        # 嵌套类型：ilspycmd 只会输出最外层那一份（见模块 docstring 坑 1）
+        return hit.split("+", 1)[0], True
+    return hit, False
+
+
 # ---------------------------------------------------------------- 对外能力
 
 
@@ -233,6 +319,11 @@ def decompile_type(assembly: str, type_name: str,
     tried: list[str] = []
     last_error = ""
 
+    # 权威类型清单：用来区分「命名空间限定的顶层类型」与「嵌套类型」——
+    # 两者字面上都是 `A.B`，而 ilspycmd 对后者的产物只有最外层那一份。
+    # 取不到（None）时 `_real_target` 退化为修复前的行为，不会更糟。
+    listing = _list_types(str(asm))
+
     for cand in _candidates(type_name):
         tried.append(cand)
         result = _run(["-t", cand, str(asm)], _TYPE_TIMEOUT)
@@ -253,26 +344,34 @@ def decompile_type(assembly: str, type_name: str,
             )
             continue
 
+        # 产物**实际**是哪个类型：请求的是嵌套类型时，ilspycmd 只给最外层。
+        actual, is_nested = _real_target(listing, cand)
+
         out: dict[str, Any] = {
             "ok": True,
             "assembly": str(asm),
             "requested": str(type_name),
-            "decompiled_type": cand,
+            "decompiled_type": actual,
             "declared_types": sorted(declared),
             "line_count": len(source.splitlines()),
             "char_count": len(source),
             "truncated": False,
         }
-        if cand != str(type_name).strip().replace("+", "."):
+        if is_nested or actual != str(type_name).strip().replace("+", "."):
+            # 如实标注退让：`decompiled_type` 已经是**实际产出**的那个类型，
+            # 这里说清楚「你请求的 X 为什么变成了 Y」。
             out["nested_note"] = (
-                f"`{type_name}` 在 ilspycmd 里无法单独定位（嵌套类型），"
-                f"已改为反编译其外层类型 `{cand}`；"
+                f"`{type_name}` 是嵌套类型，ilspycmd 无法单独定位它 —— "
+                f"产物是它所在的最外层类型 `{actual}` 的完整源码，"
+                f"`{wanted}` 的声明就在这份产物里（已核对）。"
+                if is_nested else
+                f"`{type_name}` 未命中，已退让到 `{actual}`；"
                 f"`{wanted}` 的声明就在这份产物里（已核对）。"
             )
         if output_dir:
             target = Path(output_dir)
             target.mkdir(parents=True, exist_ok=True)
-            dest = target / f"{cand}.decompiled.cs"
+            dest = target / f"{actual}.decompiled.cs"
             dest.write_text(source, encoding="utf-8")
             out["output_dir"] = str(target)
             out["files"] = [str(dest)]

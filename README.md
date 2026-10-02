@@ -139,7 +139,7 @@ Agent 会自动：
 | `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
 | `analyze_dependency` | 类型依赖概览（近似，非精确调用图）。`referenced_count` 是真实总数，`referenced_types` 最多 100 条并带 `referenced_has_more` |
 | `list_images` | 列出所有程序集/映像，支持 `offset`/`limit` 翻页并如实给 `has_more` |
-| `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir` 反编译整个程序集（只落盘 + 返回文件清单，不内联源码）。**只支持 Mono**，IL2CPP 会明确报错。依赖可选，见 `get_diagnostics` 的 `decompiler.available` |
+| `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir` 反编译整个程序集（只落盘 + 返回文件清单，不内联源码）。**嵌套类型会退让到最外层**并写 `nested_note`，`decompiled_type` 如实报**实际产出**的类型名。**只支持 Mono**，IL2CPP 会明确报错。依赖可选，见 `get_diagnostics` 的 `decompiler.available` |
 
 ### 结果句柄（大结果集翻页）
 | 工具 | 作用 |

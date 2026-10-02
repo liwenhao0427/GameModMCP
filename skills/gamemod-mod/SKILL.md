@@ -164,7 +164,9 @@ decompile(assembly=r"D:\...\_Data\Managed\Assembly-CSharp.dll", type_name="Spell
 # → source: 67 行真正的 C# 源码；declared_types 是产物里声明的类型
 
 decompile(type_name="FlyingWormConsole3.LiteNetLib.NetManager")   # 留空 assembly 用当前会话的程序集
-# → 嵌套类型可传 "Outer.Inner"，会自动退让到外层并在 nested_note 里说明
+# → 嵌套类型可传 "Outer.Inner"，会自动退让到**最外层**并在 nested_note 里说明
+#   （ilspycmd 无法单独定位嵌套类型，产物始终是最外层那一份；
+#    `decompiled_type` 如实报的是**实际产出的**类型名，不是请求名）
 
 decompile(output_dir=r"D:\out\full")     # 只给 output_dir = 反编译整个程序集
 # → 落盘 800+ 个文件，只返回 file_count / sample_files，**不内联源码**

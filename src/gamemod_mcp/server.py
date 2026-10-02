@@ -1141,9 +1141,11 @@ def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
                     留空则用当前会话识别出的那个（Mono 游戏可直接用）。
         type_name:  类型名，支持 `Namespace.Type`。传空表示反编译整个程序集。
                     嵌套类型可传 `Outer.Inner` 或 `Outer+Inner`：
-                    由于 ilspycmd 无法单独定位嵌套类型，会自动改为反编译其
-                    外层类型，并在 `nested_note` 里说明（`declared_types`
-                    已核对，内层类型的声明确实在这份产物里）。
+                    由于 ilspycmd 无法单独定位嵌套类型（产物始终是最外层那一份），
+                    会自动退让到**最外层**类型，并在 `nested_note` 里说明。
+                    `decompiled_type` 报的是**实际产出的**类型名（即最外层），
+                    不是请求名 —— 这样调用方不会把外层源码误当成内层源码。
+                    `declared_types` 已核对，内层类型的声明确实在这份产物里。
         output_dir: 输出目录。给了就落盘（整程序集模式**必填**）。
         split_files: 整程序集模式下是否一个类型一个文件（默认 True）。
                     True 出 800+ 个小文件（实测 3.5 秒），便于按需读取；
