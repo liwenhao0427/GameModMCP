@@ -232,6 +232,8 @@
     var hookCounts = {};     // hookId -> 已触发次数
     var gcDisabled = false;
     var attached = false;
+    //: 探针线程附着过的 IL2CPP 域指针（卸载前要还回去，见 releaseDomain）
+    var attachedDomain = null;
 
     // 后端（引擎实现）：RPC 层只调 BE.*，两个引擎的差异都收敛在下面两段实现里
     var BE = null;
@@ -609,6 +611,7 @@
             }
             try {
                 funcs.il2cpp_thread_attach(dom);
+                attachedDomain = dom;
             } catch (e) {
                 return fail('无法把探针线程附着到 IL2CPP 域：' + e.message +
                             '。未附着的线程上调用 il2cpp 接口会让游戏崩溃，' +
@@ -638,6 +641,42 @@
     }
 
     // ---------------------------------------------------------------- 域与映像
+
+    /**
+     * 把探针线程从 IL2CPP 域摘出去 —— **卸载前必须调用**。
+     *
+     * 为什么必须做：`ensureReady` 用 `il2cpp_thread_attach(dom)` 把 Frida 的
+     * 线程挂进 IL2CPP 域，IL2CPP 会为此在线程本地存一份该线程的 `Il2CppThread`
+     * 记录。若不摘，`script.unload()` / `session.detach()` 之后：
+     *
+     *   · Frida 的 agent 内存被释放（模块名在事件日志里是
+     *     `frida-agent.dll_unloaded`）；
+     *   · 而 IL2CPP 域里**仍留着那条线程记录**，指向已经失效的内存；
+     *   · 等下一次 GC 走到那条记录时解引用 —— 访问违例 `0xc0000005`。
+     *
+     * 实测症状与此完全吻合：三款不同 IL2CPP 游戏（Ved / Pass The Fear /
+     * PathOfIdle）都在 detach 后 **80~160 秒**崩（等一次 GC 的时间），
+     * 崩溃模块恒为 `frida-agent.dll_unloaded`、偏移恒为 `0x9c7e0`；
+     * 而**非 Unity 进程**（python）detach 后完好存活 —— 因为没有 IL2CPP 域。
+     * Ved 的 `ved.gc.log` 里那行 `Collecting from unknown thread` 也是同一件事。
+     *
+     * 失败不抛：卸载路径上宁可少摘一次，也不要因为摘失败而让 close 报错。
+     *
+     * @returns {{ok: boolean, detached: boolean, error?: string}}
+     */
+    function releaseDomain() {
+        if (!attachedDomain || !funcs.il2cpp_thread_detach) {
+            return { ok: true, detached: false };
+        }
+        try {
+            funcs.il2cpp_thread_detach(attachedDomain);
+            attachedDomain = null;
+            attached = false;
+            return { ok: true, detached: true };
+        } catch (e) {
+            return { ok: false, detached: false, error: e.message };
+        }
+    }
 
     function allImages() {
         var domain = funcs.il2cpp_domain_get();
@@ -2238,9 +2277,23 @@
             return res;
         },
 
+        /**
+         * 卸载前清理：把探针线程从引擎域里摘出去。
+         *
+         * 宿主在 `script.unload()` **之前**调用它。不调用的话，IL2CPP 域里
+         * 会留下指向已释放 agent 内存的线程记录，游戏会在随后的 GC 中崩
+         * （详见 `releaseDomain` 的注释）。
+         */
+        dispose: function () {
+            var out = { ok: true, engine: BE ? BE.kind : null };
+            if (BE && BE.kind === 'il2cpp') {
+                out.il2cpp = releaseDomain();
+            }
+            return out;
+        },
+
         /** 运行时总览：模块、域、映像数量。 */
-        runtimeInfo: function (preferredModule) {
-            var be = selectBackend(preferredModule);
+        runtimeInfo: function (preferredModule) {            var be = selectBackend(preferredModule);
             if (!be) { return backendNotFound(); }
             var ready = be.ensureReady(preferredModule);
             if (!ready.ok) { return ready; }

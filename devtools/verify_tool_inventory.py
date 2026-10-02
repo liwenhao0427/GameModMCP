@@ -96,6 +96,13 @@ NON_TOOL_IDENTIFIERS = {
     "image_count", "rva_hex", "hex_data", "module", "offset",
     # Mono 运行时探针用到的 Mono C API 导出名（不是 MCP 工具，是探针内部调的 C 函数）
     "mono_compile_method", "mono_gc_disable", "mono_gc_enable",
+    # IL2CPP 运行时探针用到的 IL2CPP C API 导出名（同上，不是 MCP 工具）。
+    # `il2cpp_thread_attach/detach` 是「收尾后游戏崩溃」那节的根因说明：
+    # 探针把 Frida 线程挂进域却没摘，卸载后游戏在 GC 时崩。属引擎 API 名。
+    "il2cpp_thread_attach", "il2cpp_thread_detach",
+    # close_session 返回的 steps 字段（表明探针线程已从引擎域摘除），
+    # 是返回字段不是工具
+    "domain_released",
     # 类名没解析出来时返回的「已搜过几个程序集」，是返回字段不是工具
     "searched_images",
     # 非本项目的标识符（引擎/框架 API）

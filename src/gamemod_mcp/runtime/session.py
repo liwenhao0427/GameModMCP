@@ -255,6 +255,8 @@ class RuntimeSession:
         self._dropped = 0
         self._init_result: dict | None = None
         self._created_at = time.time()
+        #: `close()` 里释放引擎域失败时的原因（仅记录，不算关闭失败）
+        self._domain_release_error: str | None = None
 
         script.on("message", self._on_message)
         script.on("destroyed", self._on_destroyed)
@@ -654,6 +656,18 @@ class RuntimeSession:
         except Exception as exc:
             steps["hooks_removed"] = False
             errors.append(f"卸载 Hook 失败：{exc}")
+        # 关键顺序：**必须在 script.unload() 之前**把探针线程从引擎域里摘出去。
+        # 不摘的话，IL2CPP 域里会留下指向即将被释放的 agent 内存的线程记录，
+        # 游戏会在随后的 GC 中崩（实测三款 IL2CPP 游戏 detach 后 80~160s
+        # 崩在 frida-agent.dll_unloaded / 0xc0000005）。详见 agent.js 的 releaseDomain。
+        try:
+            self._script.exports_sync.dispose()
+            steps["domain_released"] = True
+        except Exception as exc:
+            # 探针不支持 dispose（旧版 agent.js）不该让整个关闭失败：
+            # 记下来但不计入 errors，只在返回里如实标注。
+            steps["domain_released"] = False
+            self._domain_release_error = str(exc)
         try:
             self._script.unload()
             steps["script_unloaded"] = True
@@ -676,8 +690,17 @@ class RuntimeSession:
                 if _sessions.get(self.pid) is self:
                     del _sessions[self.pid]
             progress(f"已关闭运行时会话 pid={self.pid}（卸载 Hook {removed} 个）")
-            return {"ok": True, "pid": self.pid, "hooks_removed": removed,
-                    "restored": True, "steps": steps}
+            out = {"ok": True, "pid": self.pid, "hooks_removed": removed,
+                   "restored": True, "steps": steps}
+            if self._domain_release_error is not None:
+                # 摘域失败 = 游戏仍可能在随后 GC 中崩，必须如实说，不能假装没事
+                out["warning"] = (
+                    "探针线程未能从引擎域摘除（"
+                    + self._domain_release_error
+                    + "）；游戏可能在随后的垃圾回收中崩溃，"
+                    "建议观察一两分钟或直接重启游戏。"
+                )
+            return out
 
         warn(f"关闭运行时会话 pid={self.pid} 未完全成功：{'；'.join(errors)}")
         return {

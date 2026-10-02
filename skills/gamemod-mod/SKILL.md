@@ -602,3 +602,42 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 | `open_game` 报「Unreal 游戏没有集中元数据」 | 正常行为（不是错误） | UE 不走索引：直接用 `detect_ue` / `ue_profile` / `ue_list_entries`（会话已按这个游戏选好） |
 | `open_game` 报「没能识别出可支持的引擎」 | 引擎不在支持范围（Godot / GameMaker / Electron 等） | 看返回里 `engine_family.label`；本 MCP 不解析这类容器 |
 | `open_game` 报「这个目录本身不是游戏，它下面的 X 是」 | 游戏外面套了一层目录 | 把 `game_dir` 指到返回里 `game_root` 的路径 |
+| `close_session` 报 `ok:true` 后**游戏在一两分钟内自己崩了** | 探针线程没从 IL2CPP 域摘除（**已在 1.0.0+ 修复**，见下方） | 见下方「收尾后游戏崩溃」 |
+
+### 收尾后游戏崩溃（`frida-agent.dll_unloaded`）——已修复
+
+**症状**（旧版本）：`close_session` 如实返回 `ok:true / restored:true / detached:true`，
+`unhook` 也确实卸掉了 Hook —— 但游戏在 **80~160 秒后**崩掉，
+Windows 事件日志里出错模块是 `frida-agent.dll_unloaded`、异常码 `0xc0000005`、
+偏移恒为 `0x9c7e0`。
+
+**根因**：探针用 `il2cpp_thread_attach(dom)` 把 Frida 的线程挂进 IL2CPP 域，
+IL2CPP 为此在线程本地存了一份该线程的 `Il2CppThread` 记录。
+而卸载路径**从来没有调用 `il2cpp_thread_detach`** —— 于是 `script.unload()`
+释放 agent 内存之后，IL2CPP 域里仍留着指向失效内存的线程记录，
+**下一次 GC 走到它时就访问违例**。这解释了几个看似矛盾的现象：
+
+- 为什么崩溃延迟 80~160 秒：在等一次 GC（Ved 的 `ved.gc.log` 里
+  那行 `Collecting from unknown thread` 就是现场）。
+- 为什么**非 Unity 进程**（python）detach 后完好无损：它们没有 IL2CPP 域。
+- 为什么三款不同游戏的崩溃偏移**完全一致**（`0x9c7e0`）：同一处代码路径。
+- 为什么与 Hook 无关：`attach → detach` 不加载任何 Hook 也照样崩。
+
+**修复**：卸载前先摘域。`agent.js` 新增 `dispose()` RPC 调用
+`il2cpp_thread_detach`，宿主在 `script.unload()` **之前**调用它
+（见 `RuntimeSession.close()`）。`close_session` 的 `steps` 里因此多了
+一项 `domain_released`，可据此确认这一步真的执行了。
+
+**验证**：Ved 与 Pass The Fear 两款原本必崩的游戏，
+修复后 detach 并观察 **360 秒**（超过原崩溃窗口 2 倍以上）均存活。
+另有一款非 Unity 进程作阴性对照。
+
+> **一条方法论教训**（踩过两次）：
+>
+> 1. 「某款游戏存活」这种结论**必须先确认观察窗口足够长**。最初测
+>    `PathOfIdle` 只看 200 秒，得出「它不受影响」，于是误判成
+>    「个别游戏特有」；实际崩溃发生在 80~160s，属于窗口边缘，
+>    换个时机重测就翻了。
+> 2. 进程名匹配要小心：Frida 报的是 `PassTheFear.exe`（带后缀），
+>    按 `PassTheFear` 匹配会全部落空，看起来像「进程不可见」。
+>    用 **PID** 判定最可靠。
