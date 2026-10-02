@@ -27,12 +27,15 @@
    Σfield_count 必须等于 fields 表条数（即 `validate()["fields_ok"]`）。
 4. **回归现场**：同样的合成数据，若强制按 92 解析，`fields_ok` 必须为 False。
    这一节是「这个 bug 确实存在过」的可执行证据，也防止有人把判据改回去。
+5. **版本区间**：超出支持区间的版本必须**快速如实拒绝**（`MetadataError`，
+   点明「版本不支持」并给替代路径），不许硬解几百秒再抛 sqlite 约束错误。
 
 ## 反证（非空转）
 
 - 把 `_tiles_fields` 改成恒 `return True` → 第 1 节必须报红。
 - 把自验证的改选逻辑删掉（直接 return expected）→ 第 2、3 节必须报红。
 - 把铺满判据的 `cursor == n_fields` 去掉 → 第 1 节的「有空洞」用例必须报红。
+- 把 `_validate_layout` 的版本区间判定删掉 → 第 5 节必须报红。
 """
 
 from __future__ import annotations
@@ -266,6 +269,70 @@ finally:
     M.Metadata._tiles_fields = original_tiles
     M.TYPEDEF_SIZE_LEGACY = original_legacy
     M.TYPEDEF_SIZE_V31 = 88
+
+# ================================================================ 5. 版本区间
+print("\n5. 超出支持区间必须**快速如实拒绝**（实测 v39 曾空转 573 秒）")
+
+# 现场：Enter the Chronosphere（Unity 6000.3.14f1，metadata v39）头部布局已变
+# （fields 表 24,998 字节连 12 都除不尽）。修复前 stride 推断失败只 warn 一句，
+# 然后照旧硬解 -> 181,396 个类型 / Σfield_count = 3,156,391,098（真值 2,083），
+# 花 573 秒建索引，最后抛 `UNIQUE constraint failed: fields.idx` ——
+# 把「版本不支持」伪装成「数据库错误」。
+FUTURE = TMP / "future.dat"
+build_metadata(FUTURE, version=M.SUPPORTED_VERSION_MAX + 8, stride=88, n_types=64)
+
+import time as _time                                       # noqa: E402
+
+_t0 = _time.time()
+try:
+    M.load(FUTURE)
+    check(False, "超出区间的版本被拒绝", "竟然解析成功了")
+except M.MetadataError as exc:
+    _dt = _time.time() - _t0
+    check(True, "超出区间的版本被拒绝（MetadataError）", f"{_dt:.3f}s")
+    msg = str(exc)
+    check("不支持" in msg and "v39" in msg,
+          "错误信息点明「版本不支持」并带上实际版本号",
+          msg[:90])
+    check("替代" in msg,
+          "错误信息给了可用替代路径", msg[:90])
+    check("UNIQUE" not in msg and "sqlite" not in msg.lower(),
+          "错误信息**不是**数据库约束错误（旧症状）", msg[:90])
+    check(_dt < 2.0,
+          "是**快速**失败（不是先硬解几百秒）", f"{_dt:.3f}s")
+
+# 反证：把版本区间放开，同一份文件就会走「硬解」老路 ——
+# 说明上面拦下来的确实是版本判定，而不是文件本身读不了。
+_orig_max = M.SUPPORTED_VERSION_MAX
+try:
+    M.SUPPORTED_VERSION_MAX = 999
+    try:
+        m_future = M.load(FUTURE)
+        check(True, "反证：放开版本区间后同一文件能被解析（说明上面拦的是版本）",
+              f"types={len(m_future.types)}")
+    except M.MetadataError as exc:
+        check(True, "反证：放开版本区间后仍被**布局自洽**检验拦下",
+              str(exc)[:80])
+finally:
+    M.SUPPORTED_VERSION_MAX = _orig_max
+
+# 受支持版本必须照旧通过（别把门关太死）
+check(M.load(GOOD).version == 29, "受支持的 v29 仍能正常解析")
+
+# 关键回归：**布局自洽检验不许误伤合法输入**。
+# 曾经的写法把「typeDefinitions 能否铺满 fields」也当成拒绝条件，
+# 结果 `verify_typedef_stride` 第 1 节的 hole/overlap/oor 三个**故意做坏的**
+# 样本全部在建 Metadata 时就抛错，脚本直接崩在断言之前。
+# 那三个样本要验的是 `_tiles_fields` 的返回值，必须能被解析出来。
+for _name in ("hole.dat", "overlap.dat", "oor.dat"):
+    _p = TMP / _name
+    if _p.is_file():
+        try:
+            M.load(_p)
+            check(True, f"合法头部 + 故意做坏的字段区间仍可解析（{_name}）")
+        except M.MetadataError as _exc:
+            check(False, f"合法头部 + 故意做坏的字段区间仍可解析（{_name}）",
+                  f"不该拒绝：{_exc}"[:90])
 
 # ================================================================ 汇总
 print("\n" + "=" * 62)

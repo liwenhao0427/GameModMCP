@@ -39,6 +39,30 @@
 
 支持版本：v24 ~ v31。核心表（string/fields/methods/parameters/images/assemblies/
 typeDefinitions）在所有这些版本中下标一致，故主流程与版本无关。
+
+超出区间必须**快速如实拒绝**，不许硬解
+--------------------------------------------------
+实测（Enter the Chronosphere，Unity 6000.3.14f1，metadata **v39**）：
+表布局已变，头部里 `fields` 表 24,998 字节**不能被 12 整除**、
+`methods` 也不能被 12 整除 —— 即连「记录大小」都推不出来。
+修复前的行为是：stride 推断失败只 `warn` 一句，然后**照旧硬解**，
+得到 181,396 个类型、Σfield_count = 3,156,391,098（真值只有 2,083 个字段），
+接着花 **573 秒**建索引，最后抛出一句
+`构建索引失败：UNIQUE constraint failed: fields.idx` ——
+把「版本不支持」伪装成了「数据库约束错误」。
+
+那 573 秒全是空转，而且错误信息指向 sqlite，会把人往错误方向带。
+所以现在在解析头部时就用**两条硬结构不变量**判定布局是否可用：
+    · 版本号在实测支持区间内（v24 ~ v31）；
+    · 固定记录大小的表必须能被整除（fields/12、parameters/12、
+      images/40、assemblies/64）—— 实测 v39 的 `fields` 表
+      24,998 字节 % 12 == 2，这一条单独就能拦下它。
+任一不成立就 `MetadataError`，并明确告知「版本不支持」与可用替代路径。
+
+注意**不要**把「typeDefinitions 能否铺满 fields」也当成拒绝条件：
+那条判据是 `_typedef_size` 用来**推断** stride 的启发式，
+当拒绝条件会误伤合法输入（fields 表为空、类型不带字段的元数据）。
+它继续以 warn 形式留在 `_typedef_size` 里。
 """
 
 from __future__ import annotations
@@ -52,6 +76,23 @@ from pathlib import Path
 from ..logutil import progress, warn
 
 METADATA_MAGIC = 0xFAB11BAF
+
+#: 解析器**实测支持**的元数据版本区间（闭区间）。
+#:
+#: 实测样本：v29 ×1、v31 ×9 全部通过；v39 布局已变（见模块 docstring）。
+#: 这个区间只用于**快速拒绝**明显超出区间的文件，真正的布局正确性
+#: 仍由下面 `_validate_layout()` 的整除/铺满检验来判 —— 版本号只是先手。
+SUPPORTED_VERSION_MIN = 24
+SUPPORTED_VERSION_MAX = 31
+
+#: 记录大小**固定**的表：(表名, 记录字节数)。
+#: 这些表的 size 必须能被记录大小整除，否则说明头部布局判定已错。
+_FIXED_SIZE_TABLES: tuple[tuple[str, int], ...] = (
+    ("fields", 12),
+    ("parameters", 12),
+    ("images", 40),
+    ("assemblies", 64),
+)
 
 # ---------------------------------------------------------------- 常量
 
@@ -427,6 +468,55 @@ class Metadata:
             f"IL2CPP 元数据 v{self.version} 头部已解析："
             f"{len(self.tables)} 张表，文件 {len(self._mm):,} 字节"
         )
+
+        self._validate_layout()
+
+    def _validate_layout(self) -> None:
+        """头部布局是否可用；不可用就**立刻**抛 `MetadataError`。
+
+        为什么必须在这里拦（而不是等建索引时）：
+        stride 推断失败后硬解会产出天文数字的计数，接着花几百秒建索引，
+        最后以一句 sqlite 约束错误收场 —— 把「版本不支持」伪装成
+        「数据库错误」（实测 v39：573 秒后报 `UNIQUE constraint failed`）。
+
+        两条判据都是**硬结构不变量**，不是启发式：
+
+            ① 版本号在实测支持区间内；
+            ② 记录大小固定的表，其字节数必须能被记录大小整除。
+
+        ② 是纯结构事实：`fields` 记录就是 12 字节，表大小除不尽只可能是
+        「头部布局判定已错」。实测 v39 的 `fields` 表 24,998 字节 % 12 == 2，
+        ② 单独就能拦下它。
+
+        **故意不把「typeDefinitions 能否铺满 fields」也算进来**：那是一条
+        启发式判据（`_typedef_size` 用它**推断** stride），把它当拒绝条件
+        会误伤合法输入 —— 例如 fields 表为空、或类型不带字段的元数据。
+        那条判据继续留在 `_typedef_size` 里以 warn 形式起作用。
+        """
+        if not (SUPPORTED_VERSION_MIN <= self.version <= SUPPORTED_VERSION_MAX):
+            raise MetadataError(
+                f"不支持的 IL2CPP 元数据版本 v{self.version}（本解析器实测支持 "
+                f"v{SUPPORTED_VERSION_MIN} ~ v{SUPPORTED_VERSION_MAX}）。"
+                "该版本的头部布局已经变化，硬解只会得到错误的类型/字段表，"
+                "因此这里直接拒绝，不返回不可信的结果。"
+                "可用替代：换用受支持版本的样本，或为该版本补充布局适配。"
+            )
+
+        broken: list[str] = []
+        for name, rec_size in _FIXED_SIZE_TABLES:
+            entry = self.tables.get(name)
+            if entry is None or not entry.size:
+                continue
+            if entry.size % rec_size:
+                broken.append(f"{name} 表 {entry.size} 字节不是 {rec_size} 的整数倍")
+
+        if broken:
+            raise MetadataError(
+                f"IL2CPP 元数据 v{self.version} 的头部布局与解析器假设不一致："
+                + "；".join(broken)
+                + "。解析结果不可信，已拒绝（不返回错误的类型/字段表）。"
+                "可用替代：换用受支持版本的样本，或为该版本补充布局适配。"
+            )
 
     @property
     def _typedef_size(self) -> int:
