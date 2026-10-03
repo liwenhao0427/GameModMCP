@@ -109,29 +109,55 @@ def part_deterministic(il2cpp: Path) -> None:
     sentinel = os.path.join(os.path.abspath(str(il2cpp)), "本游戏.exe")
 
     orig_pick = discovery.pick_main_exe
-    orig_reset = state.SessionState.reset_target
+    orig_commit = state.commit_selection
 
-    def run_case(reset_noop: bool) -> dict:
-        """跑一次切换，返回 open_game 的返回。reset_noop=True 模拟修复前的写法。"""
+    def run_case(old_style: bool) -> dict:
+        """跑一次切换，返回 open_game 的返回。
+
+        `old_style=True` 模拟**修复前**的写法：那时 IL2CPP 分支只写
+        `metadata_path`、**不写 `exe`**，于是上一个游戏的 exe 会留在会话里。
+        缺陷 #3 的修复把「按引擎分支逐个字段赋值」换成了
+        `commit_selection` 的**整份 plan 赋值**，所以反证也必须跟着
+        换成「旧式增量赋值」——继续拿 `reset_target` 做反证会变成空转：
+        现在所有字段都被无条件覆盖，`reset_target` 清不清已经不影响结果了。
+        """
         st.close_index()                      # 确保每次都走切换路径
         st.exe = stale                        # 注入「上一个游戏」的 exe
         discovery.pick_main_exe = lambda _gd, _s=sentinel: _s
-        state.SessionState.reset_target = (lambda self: None) if reset_noop else orig_reset
+        if old_style:
+            def _old_commit(plan):
+                """旧写法：收拾旧资源后**只写元数据与引擎，漏写 exe**。
+
+                复刻的正是缺陷的机制：IL2CPP 分支不写 `exe`，而它前面那句
+                `if not _state.exe: _state.exe = pick_main_exe(...)` 又只在
+                exe 为空时才兜底 —— 于是注入的陈旧 `exe` 是非空值，
+                兜底不触发，旧值就**原样留了下来**。
+                （这里**故意不调 `reset_target()`**：修复前的切换路径确实
+                清过身份，真正漏的是 exe 的赋值。反证要打在漏点上。）
+                """
+                st.close_index()
+                st.game_dir = plan.get("game_dir", "")
+                st.engine = plan.get("engine", "")
+                st.metadata_path = plan.get("metadata_path", "")
+                # 注意：这里**故意不写 exe**，也不做 pick_main_exe 兜底
+                # （陈旧值非空时旧代码本来也不会兜底）。
+                return {"ok": True, **st.summary()}
+            state.commit_selection = _old_commit
         try:
             return open_with(il2cpp)
         finally:
             discovery.pick_main_exe = orig_pick
-            state.SessionState.reset_target = orig_reset
+            state.commit_selection = orig_commit
 
-    got = run_case(reset_noop=False)
+    got = run_case(old_style=False)
     check("切换后不再带上一款游戏的 exe",
           got.get("exe") == sentinel,
           f"得到 {got.get('exe')!r}")
 
-    # 非空转反证：把 reset_target 换成空操作（= 修复前的行为），
-    # 同一条断言必须**报红**。否则说明这条验收根本没在测东西。
-    old = run_case(reset_noop=True)
-    check("反证：去掉 reset_target 后旧值确实会串过来（说明上面那条不是空转）",
+    # 非空转反证：换回**修复前的增量赋值**（漏写 exe），同一条断言必须报红。
+    # 否则说明这条验收根本没在测东西。
+    old = run_case(old_style=True)
+    check("反证：换回「漏写 exe」的旧写法后旧值确实会串过来（说明上面那条不是空转）",
           old.get("exe") == stale,
           f"旧写法得到 {old.get('exe')!r}")
 

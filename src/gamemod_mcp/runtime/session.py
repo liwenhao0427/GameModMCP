@@ -238,8 +238,33 @@ _sessions: dict[int, "RuntimeSession"] = {}
 _sessions_lock = threading.RLock()
 
 
+#: 单次探针 RPC 的默认超时（秒）。
+#:
+#: **为什么必须有这个数字**：Frida 的同步 RPC（`script.exports_sync.x()`）
+#: **没有超时参数**，一次不返回的调用会把调用方永久挂住。实测踩到的现场：
+#: `launch_game` 通过 DSH 调用后 **11 分钟不返回**，期间连不碰 Frida 的
+#: `get_session` 也一直超时（因为工具是同步的，整个事件循环被占住）；
+#: 被启动的游戏窗口标题停在 `Fatal error in GC`，而 `wait_ready` 的
+#: 60 秒预算**完全失效** —— 它的 deadline 只在每次调用**返回之后**才检查。
+#:
+#: 取 30 秒的依据：实测正常探针调用都在毫秒级（`runtime_class_info` 0.27s、
+#: `hook_method` 0.01s、`list_images` 0.01s），最慢的 `inject_process`
+#: 也不过 2.4 秒（等 Mono 程序集稳定）。30 秒是两个数量级的余量，
+#: 正常操作绝不会误判，而卡死时能在半分钟内如实报错。
+CALL_TIMEOUT = 30.0
+
+
 class RuntimeSession:
     """一条指向目标进程的 Frida 会话。"""
+
+    #: 类级默认值。**必须有**：`wait_ready` / `_check` 会读这几个字段，
+    #: 而验证脚本里的桩对象（`verify_thread_attach.StubSession`）只覆盖
+    #: `init()`、不调 `super().__init__()` —— 只在 `__init__` 里赋值的话，
+    #: 桩对象上会 `AttributeError`，把「桩写得简单」变成「产品代码坏了」。
+    #: 放在类上，两条路径都读得到。
+    _wedged: bool = False
+    _wedged_reason: str = ""
+    _call_timeout: float = CALL_TIMEOUT
 
     def __init__(self, pid: int, session, script, name: str = "",
                  spawned: bool = False):
@@ -250,6 +275,16 @@ class RuntimeSession:
         self._script = script
         self._alive = True
         self._lock = threading.RLock()
+        #: 串行化探针 RPC。**与 `_lock` 分开**是有意的：`_lock` 保护的是
+        #: 本对象的字段，而这个是「同一时刻只允许一次 Frida 调用」。
+        #: 卡死时它会被那个永不返回的线程一直持有 —— 这正是我们检测卡死的
+        #: 手段（下一个调用者 acquire 超时就知道探针已经不响应了）。
+        self._rpc_lock = threading.Lock()
+        #: 探针已判定卡死。一旦置位，后续调用**立刻**失败而不是再等 30 秒
+        #: （卡死通常是不可逆的：Frida 的 agent 线程已经不进事件循环了）。
+        self._wedged = False
+        self._wedged_reason = ""
+        self._call_timeout = CALL_TIMEOUT
         # Hook 事件队列：容量放大，满时丢最旧，绝不阻塞游戏线程
         self._events: queue.Queue = queue.Queue(maxsize=20000)
         self._dropped = 0
@@ -324,20 +359,118 @@ class RuntimeSession:
             raise SessionError(
                 f"会话已失效（pid={self.pid} 可能已退出或被 detach），请重新注入"
             )
+        if self._wedged:
+            raise SessionError(
+                f"探针已判定卡死（pid={self.pid}）：{self._wedged_reason}。"
+                "后续调用会立刻失败而不是再等超时 —— 请 close_session() 后重新注入。"
+            )
+
+    @property
+    def wedged(self) -> bool:
+        """探针是否已被判定卡死（一次 RPC 超过 `CALL_TIMEOUT` 没返回）。"""
+        return self._wedged
 
     def _call(self, method: str, *args) -> Any:
-        """同步调用探针的 rpc.exports。"""
+        """调用探针的 rpc.exports，**带超时**。
+
+        为什么不能直接 `self._script.exports_sync.x(...)`（这是缺陷 #2 的修复）：
+        Frida 的同步 RPC **没有超时参数**。一次不返回的调用会永久挂住调用方，
+        而且因为工具是同步函数（见 `server.py` 的说明），它会连带把整个
+        MCP 事件循环占死 —— 实测 `launch_game` 卡 11 分钟、期间任何工具都不回话。
+
+        做法：把这次调用交给一个**看守线程**执行，主线程只 `join(timeout)`。
+        超时就如实报错并把会话标记为 wedged（后续调用立刻失败，不再各等 30 秒）。
+
+        **不假装调用被取消了**：Frida 侧那个线程仍会卡在那里，所以我们
+        · 不释放 `_rpc_lock`（由超时后的新线程去 acquire 时超时发现），
+        · 把会话标 wedged，让调用方去 `close_session` 重新注入 ——
+        唯一诚实的出路。返回 `ok:false` 而不是伪装成一次成功的空调用。
+        """
         self._check()
         with self._lock:
+            timeout = self._call_timeout
+        # 先抢 RPC 锁：若上一次调用卡住不放，这里就会超时 ——
+        # 于是「探针不响应」在**第二次**调用时只需等 timeout 而不是永久。
+        acquired = self._rpc_lock.acquire(timeout=timeout)
+        if not acquired:
+            self._mark_wedged(f"{method} 等待前一次调用释放锁超时（{timeout:g}s）")
+            raise SessionError(self._wedged_reason)
+
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def _invoke() -> None:
             try:
-                return getattr(self._script.exports_sync, method)(*args)
-            except Exception as exc:
-                # 会话在调用过程中失效时，如实报告而不是伪装成功
-                if not self._alive:
-                    raise SessionError(
-                        f"调用 {method} 时会话失效（进程可能已退出）"
-                    ) from exc
-                raise SessionError(f"调用探针 {method} 失败：{exc}") from exc
+                box["value"] = getattr(self._script.exports_sync, method)(*args)
+            except Exception as exc:  # noqa: BLE001 - 原样带回主线程再判
+                box["error"] = exc
+            finally:
+                done.set()
+
+        th = threading.Thread(target=_invoke, daemon=True,
+                              name=f"gamemod-rpc-{method}")
+        th.start()
+        finished = done.wait(timeout)
+        if not finished:
+            # 超时：**不**释放 _rpc_lock（那个线程还持有它）。
+            self._mark_wedged(f"{method} 超过 {timeout:g}s 没有返回")
+            raise SessionError(
+                f"调用探针 {method} 超时（{timeout:g}s 未返回）。"
+                "探针线程很可能卡在 IL2CPP/Mono 内部（实测现场是游戏进入 "
+                "`Fatal error in GC`）。会话已标记为不可用：请 close_session() "
+                "后重新注入；游戏本身可能需要重启。"
+            )
+        try:
+            self._rpc_lock.release()
+        except RuntimeError:  # pragma: no cover - 不该发生
+            pass
+
+        if "error" in box:
+            exc = box["error"]
+            # 会话在调用过程中失效时，如实报告而不是伪装成功
+            if not self._alive:
+                raise SessionError(
+                    f"调用 {method} 时会话失效（进程可能已退出）"
+                ) from exc
+            raise SessionError(f"调用探针 {method} 失败：{exc}") from exc
+        return box.get("value")
+
+    def _mark_wedged(self, reason: str) -> None:
+        """标记探针卡死，并留痕（这是需要人看见的事件）。"""
+        self._wedged = True
+        self._wedged_reason = reason
+        warn(f"探针卡死 pid={self.pid}：{reason}")
+
+    def _bounded(self, fn: Any, what: str) -> Any:
+        """在有界时间内执行一个**没有超时**的 Frida 同步调用。
+
+        `script.unload()` 与 `session.detach()` 也是同步 Frida 调用，
+        同样可能永不返回 —— 实测探针卡死时它们会把收尾一起挂住
+        （复现脚本因此挂了 18 分钟）。所以收尾步骤也必须走这里。
+
+        超时**不假装成功**：抛出 `SessionError`，由 `close()` 如实记进
+        `steps` 与 `errors`，让调用方知道还剩什么没收拾。
+        """
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                box["value"] = fn()
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done.set()
+
+        th = threading.Thread(target=_run, daemon=True, name=f"gamemod-{what}")
+        th.start()
+        if not done.wait(self._call_timeout):
+            raise SessionError(
+                f"{what} 超过 {self._call_timeout:g}s 没有返回"
+                "（探针卡死时 Frida 的同步调用同样会挂住）")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
 
     # -------------------------------------------------- 初始化
 
@@ -384,6 +517,15 @@ class RuntimeSession:
                 last["attempts"] = attempt
                 last["waited"] = round(max(0.0, timeout - (deadline - time.time())), 2)
                 return last
+            if self._wedged:
+                # 探针已经卡死：再轮询下去每次都会立刻失败，纯属空转。
+                # 立刻返回并**说清是什么**，别让调用方以为是「运行时没起来」。
+                out = dict(last)
+                out["attempts"] = attempt
+                out["timed_out"] = True
+                out["wedged"] = True
+                out["waited"] = round(max(0.0, timeout - (deadline - time.time())), 2)
+                return out
             if time.time() >= deadline:
                 out = dict(last)
                 out["attempts"] = attempt
@@ -677,6 +819,32 @@ class RuntimeSession:
         removed = 0
         errors: list[str] = []
         steps: dict[str, bool] = {}
+        #: 探针卡死时不再逐项尝试 —— 见下方 `wedged` 分支。
+        #: 实测（docs/重启验证与运行时理解报告.md §4.2）：探针 RPC 不返回时，
+        #: `script.unload()` / `session.detach()` **同样**是没有超时的同步
+        #: Frida 调用，于是连收尾都会挂住（我的复现脚本因此挂了 18 分钟）。
+        #: 所以卡死路径必须**跳过**这些同步调用，只做有界的收尾。
+        wedged = self._wedged
+        if wedged:
+            steps["skipped_wedged"] = True
+            self._alive = False
+            with _sessions_lock:
+                if _sessions.get(self.pid) is self:
+                    del _sessions[self.pid]
+            return {
+                "ok": True,
+                "pid": self.pid,
+                "hooks_removed": 0,
+                "restored": False,
+                "wedged": True,
+                "steps": steps,
+                "warning": (
+                    f"探针已卡死（{self._wedged_reason}），无法执行卸载 Hook / "
+                    "摘除引擎域 / 卸载脚本这些同步收尾步骤 —— 它们同样会挂住。"
+                    "已断开本会话的登记，但**游戏进程内可能仍留有探针与 Hook**，"
+                    "请直接结束该游戏进程（taskkill / 重启游戏）后再重新注入。"
+                ),
+            }
         try:
             st = self.hook_status()
             removed = st.get("count", 0)
@@ -690,7 +858,10 @@ class RuntimeSession:
         # 游戏会在随后的 GC 中崩（实测三款 IL2CPP 游戏 detach 后 80~160s
         # 崩在 frida-agent.dll_unloaded / 0xc0000005）。详见 agent.js 的 releaseDomain。
         try:
-            self._script.exports_sync.dispose()
+            # 走 `_call` 而不是直接 `exports_sync.dispose()`：同样是 Frida 同步
+            # RPC，同样可能不返回（探针卡死时最需要收尾，恰恰最可能挂住）。
+            # 经 `_call` 至少有超时，失败也如实记进 `steps`。
+            self._call("dispose")
             steps["domain_released"] = True
         except Exception as exc:
             # 探针不支持 dispose（旧版 agent.js）不该让整个关闭失败：
@@ -698,13 +869,13 @@ class RuntimeSession:
             steps["domain_released"] = False
             self._domain_release_error = str(exc)
         try:
-            self._script.unload()
+            self._bounded(lambda: self._script.unload(), "卸载脚本")
             steps["script_unloaded"] = True
         except Exception as exc:
             steps["script_unloaded"] = False
             errors.append(f"卸载脚本失败：{exc}")
         try:
-            self._session.detach()
+            self._bounded(lambda: self._session.detach(), "断开会话")
             steps["detached"] = True
         except Exception as exc:
             steps["detached"] = False

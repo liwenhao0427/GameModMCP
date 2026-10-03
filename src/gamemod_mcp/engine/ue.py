@@ -903,6 +903,35 @@ def find_manifests(root: str | Path) -> list[str]:
     return sorted(str(p) for p in root.glob("Manifest_*.txt"))
 
 
+def pick_manifest(paths: list[str]) -> tuple[str, bool]:
+    """从一组清单里挑出**该用的那一份**，返回 (路径, 是否是首选)。
+
+    为什么需要单独一个函数：`find_manifests` 是**字母序**的，而字母序第一的
+    是 `Manifest_DebugFiles_Win64.txt`（实测 CatapultHero 只有 3 条），
+    **不是** `Manifest_UFSFiles_Win64.txt`（18,419 条）。直接取 `[0]` 会拿到
+    一份几乎为空的清单，然后给出「过滤条件没有命中任何条目」这种**误导性**结论
+    —— 调用方会以为「包里没有本地化文本」，实际是问错了清单。
+    实测：`ue_manifest(game_dir=CatapultHero, pattern=".locres")` 返回
+    `total=3, matched=0`，而显式指定 UFS 清单则是 `total=18419, matched=51`。
+
+    首选用**已有的** `_is_ufs_manifest` 判定（精确锚定 `Manifest_UFSFiles_Win64.txt`，
+    不能用 `"UFSFiles" in name` —— `Manifest_NonUFSFiles_Win64.txt` 也含这个子串）。
+    挑不到 UFS 清单时退回字母序第一份，并如实把「不是首选」告诉调用方。
+
+    Args:
+        paths: 候选清单路径（通常是 `find_manifests` 的返回）。
+
+    Returns:
+        (选中的路径, 是否命中首选)。`paths` 为空时返回 `("", False)`。
+    """
+    if not paths:
+        return "", False
+    for p in paths:
+        if _is_ufs_manifest(p):
+            return p, True
+    return paths[0], False
+
+
 def _is_ufs_manifest(path: str | Path) -> bool:
     """判断是否为 Manifest_UFSFiles_*.txt（打包进 pak/utoc 的清单）。
 

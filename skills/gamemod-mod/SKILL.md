@@ -630,6 +630,9 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 | `open_game` 报「没能识别出可支持的引擎」 | 引擎不在支持范围（Godot / GameMaker / Electron 等） | 看返回里 `engine_family.label`；本 MCP 不解析这类容器 |
 | `open_game` 报「这个目录本身不是游戏，它下面的 X 是」 | 游戏外面套了一层目录 | 把 `game_dir` 指到返回里 `game_root` 的路径 |
 | `close_session` 报 `ok:true` 后**游戏在一两分钟内自己崩了** | 探针线程没从 IL2CPP 域摘除（**已在 1.0.0+ 修复**，见下方） | 见下方「收尾后游戏崩溃」 |
+| 工具调用**长时间不返回**，且期间**任何**工具都不回话 | 探针卡在 IL2CPP/Mono 内部（旧版本会永久挂住；**1.0.0+ 有 30 秒超时**） | 等它超时后看 `wedged`；游戏通常已 `Fatal error in GC`，`taskkill` 后重新注入。见下方「工具调用卡住」 |
+| `close_session` 返回 `restored:false` + `wedged:true` | 探针已卡死，卸载/摘域这些同步收尾步骤**同样会挂住**，所以被跳过 | 这不是「收尾失败要重试」：先结束游戏进程，再重新注入 |
+| 某个慢查询在跑时，另一个工具也超时 | 旧版本会把事件循环占死（**1.0.0+ 已修**：同步工具 offload 到线程） | 升级到 1.0.0+；仍出现请报告 |
 
 ### 收尾后游戏崩溃（`frida-agent.dll_unloaded`）——已修复
 
@@ -668,3 +671,34 @@ IL2CPP 为此在线程本地存了一份该线程的 `Il2CppThread` 记录。
 > 2. 进程名匹配要小心：Frida 报的是 `PassTheFear.exe`（带后缀），
 >    按 `PassTheFear` 匹配会全部落空，看起来像「进程不可见」。
 >    用 **PID** 判定最可靠。
+
+### 工具调用「卡住不返回」——已修复（1.0.0+）
+
+**症状**（旧版本）：`launch_game` 调用**十几分钟不返回**，而且期间
+**任何**工具都不回话（连不碰 Frida 的 `get_session` 也超时）；
+被启动的游戏窗口标题停在 `Fatal error in GC`。
+
+**两个根因**（同一次现场的两半）：
+
+1. **探针的 Frida 同步 RPC 没有超时**。`script.exports_sync.x()` 没有超时参数，
+   而 `wait_ready` 的 deadline **只在每次调用返回之后**才检查 ——
+   一次不返回，60 秒预算整体失效，`launch_game` 永不返回。
+2. **同步工具占住事件循环**。本 MCP 的工具都是 `def`（不是 `async def`），
+   而 mcp 1.26.0 对同步函数是**直接调用、没有 `to_thread`** ——
+   于是任何慢工具都会让服务器停止响应所有请求。
+
+**修复后的行为**（你可以依赖这些）：
+
+- 单次探针 RPC 超过 **30 秒**没返回 → 如实报错，并把会话标记为**卡死**；
+  后续调用**立刻**失败（不再各等 30 秒）。`wait_ready` 也会提前退出，
+  不吃满预算。
+- 卡死时 `close_session` **有界返回**：它跳过「卸载 Hook / 摘域 / 卸载脚本」
+  这些**同样会挂住**的同步收尾步骤，如实返回 `restored: false` +
+  `wedged: true` + `warning`，并告诉你出路是**结束游戏进程后重新注入**。
+  **不要**把 `restored:false` 当成「收尾失败要重试」——
+  卡死时重试同样会挂住，先 `taskkill` 掉游戏。
+- 慢工具不再阻塞其它工具：一个工具在跑时，`get_session` 之类的调用照常秒回。
+
+**看到 `wedged: true` 时怎么办**：结束游戏进程 → 重新 `inject_process` /
+`launch_game`。这通常意味着游戏自身已经进入了不可恢复的状态
+（实测现场是 IL2CPP 的 GC 报 `Fatal error in GC`），不是探针的问题。

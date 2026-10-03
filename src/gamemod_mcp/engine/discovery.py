@@ -435,6 +435,28 @@ MARKER_SEARCH_MAX_DEPTH = 3
 #: 候选清单最多回传多少个（容器目录可能有几十个游戏，回传全部没有意义）
 MAX_CANDIDATES = 20
 
+
+def page_candidates(roots: list[str]) -> tuple[list[str], bool]:
+    """把候选清单截到 `MAX_CANDIDATES`，并**如实报告是否被截断**。
+
+    为什么要单独一个函数：候选清单有三处出口（`container_candidates` 的
+    `candidates`、`il2cpp_paths` / `mono_paths` 的 `ambiguous_roots`），
+    原先三处都写 `roots[:MAX_CANDIDATES]` 而**没有任何截断标志** ——
+    实测 `E:\\project` 有 25 个游戏，只回了 20 个，调用方看不出少了 5 个。
+
+    AGENTS.md 契约第 5 条要求「被 limit 截断时在 `has_more` 里如实标注」。
+    截断本身是合理的（几十个候选回传没有意义），**不标注**才是缺陷：
+    调用方会以为候选就这么多。
+
+    Args:
+        roots: 完整候选清单。
+
+    Returns:
+        (本页候选, 是否被截断)。字段名沿用 `cap.py` 的约定
+        （`{列表名}_has_more` / `{列表名}_returned`）。
+    """
+    return roots[:MAX_CANDIDATES], len(roots) > MAX_CANDIDATES
+
 #: Mono 程序集目录名（`<游戏>_Data/Managed`）
 _MONO_MANAGED = "Managed"
 
@@ -581,13 +603,22 @@ def container_candidates(game_dir: str | Path,
     roots = nested_game_roots(gd, data_dirs)
     if len(roots) < 2:
         return {}
-    return {
+    page, truncated = page_candidates(roots)
+    out = {
         "container": True,
         "count": len(roots),
-        "candidates": roots[:MAX_CANDIDATES],
+        "candidates": page,
+        "candidates_returned": len(page),
+        "candidates_has_more": truncated,
         "note": (f"这个目录下有 {len(roots)} 个可识别的游戏，它本身不是某一个游戏的"
                  "安装目录。请把 game_dir 指向其中某一个（见 candidates）。"),
     }
+    if truncated:
+        # 不许只说「有 25 个」却只给 20 个 —— 那 5 个调用方看不见。
+        out["note"] += (f"（candidates 只列了前 {len(page)} 个，"
+                        f"还有 {len(roots) - len(page)} 个未列出；"
+                        f"总数见 count）")
+    return out
 
 
 #: 不支持的引擎的特征文件 → 家族名。判定只依赖「某个文件/目录存在」，
@@ -658,7 +689,10 @@ def il2cpp_paths(game_dir: str | Path, data_dirs: list[Path] | None = None) -> d
     # 先判「是不是容器」：≥2 个候选游戏根时一律不挑（见 nested_game_roots）
     nested = nested_game_roots(game_dir, data_dirs)
     if len(nested) > 1:
-        result["ambiguous_roots"] = nested[:MAX_CANDIDATES]
+        page, truncated = page_candidates(nested)
+        result["ambiguous_roots"] = page
+        result["ambiguous_roots_returned"] = len(page)
+        result["ambiguous_roots_has_more"] = truncated
         return result
 
     hits, _roots = _marked_roots(game_dir, "il2cpp", data_dirs)
@@ -693,7 +727,10 @@ def mono_paths(game_dir: str | Path, data_dirs: list[Path] | None = None) -> dic
     # 与 il2cpp_paths 同一套容器判据
     nested = nested_game_roots(game_dir, data_dirs)
     if len(nested) > 1:
-        result["ambiguous_roots"] = nested[:MAX_CANDIDATES]
+        page, truncated = page_candidates(nested)
+        result["ambiguous_roots"] = page
+        result["ambiguous_roots_returned"] = len(page)
+        result["ambiguous_roots_has_more"] = truncated
         return result
 
     hits, _roots = _marked_roots(game_dir, "mono", data_dirs)

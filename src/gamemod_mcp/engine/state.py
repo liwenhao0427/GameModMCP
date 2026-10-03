@@ -203,22 +203,31 @@ def _same_path(a: str, b: str) -> bool:
         return False
 
 
-def select_game(
+def plan_selection(
     game_dir: str = "",
     engine: str = "",
     metadata_path: str = "",
 ) -> dict:
-    """选定一个游戏作为后续操作的上下文。
+    """**只读地**算出「选中这个游戏之后会话会变成什么样」，不改动任何会话状态。
 
-    允许只给 game_dir（自动识别引擎），也允许直接给 metadata_path
-    （适合只做离线分析、不装游戏的场景）。
+    为什么需要它（缺陷 #3 的结构性修复）
+    --------------------------------------------------
+    `select_game` 过去是「先收拾旧会话、再逐个校验」，于是**任何**后续失败
+    （包括调用方在它返回之后才做的判定）都会留下一个被改坏的会话。
+    实测现场：`open_game(game_dir="E:\\project")` 返回 `ok:false`（正确拒绝了
+    容器目录），但 `get_session()` 显示 `game_dir` 已经变成 `E:\\project`、
+    `exe` 被填成了子目录里某个游戏的主程序 —— 而 `launch_game()` 不传参时
+    默认就用会话里的 `exe`，等于会去启动容器下的某一款游戏。
 
-    **重复选中同一个游戏不会重建会话** —— 否则每次 open_game
-    都会把已经建好的索引和已注入的探针扔掉，Agent 反复调用就会反复重建。
+    所以把「算」与「提交」拆开：本函数**只读**，`commit_selection` 才写。
+    调用方（`server.open_game`）因此可以先把「引擎受不受支持」这类判定做完，
+    确认没问题再提交 —— 失败路径在结构上就不可能带副作用，
+    而不是靠每个失败分支自己记得回滚。
 
-    主程序 exe 一律自动挑（`discovery.pick_main_exe`），本函数不接受指定：
-    需要换一个 exe 启动时用 `launch_game(exe=...)`，那才是启动参数该待的地方。
-    （原先这里有个 `exe` 形参，但没有任何调用方传过它 —— 见扫描报告 §3.7。）
+    Returns:
+        {ok: True, reused: True}                      —— 同一个游戏，无需改动
+        {ok: True, plan: {...}}                       —— 可以提交，plan 是目标身份
+        {ok: False, error: ..., ...}                  —— 探测/校验失败，会话未被触碰
     """
     with _state.lock:
         # 先判断这次是不是在选同一个游戏；是的话直接复用，什么都不动
@@ -251,35 +260,27 @@ def select_game(
                        or want_engine in ("auto", "unknown"))
         if want_meta and _same_path(want_meta, _state.metadata_path) \
                 and _state.has_index() and same_engine:
-            _state.note("重复选中同一个游戏，复用现有会话")
-            out = {"ok": True, "reused": True, **_state.summary()}
-            return out
+            return {"ok": True, "reused": True}
 
-        # 切换游戏时，先收拾掉上一个会话的资源，避免泄漏与串数据
-        _state.close_runtime()
-        _state.close_index()
-        _state.notes.clear()
-        # 身份信息也必须清 —— 否则「上一个游戏的 exe」会被当成这个游戏的
-        # （IL2CPP 分支不写 exe），详见 reset_target 的注释。
-        _state.reset_target()
-
+        # ---- 以下全部是**只读**探测与校验，一个字节都不写进 _state ----
         if metadata_path:
             mp = Path(metadata_path)
             if not mp.is_file():
                 return {"ok": False,
                         "error": f"元数据文件不存在：{metadata_path}"}
-            _state.metadata_path = str(mp)
-            _state.game_dir = str(mp.parent)
-            # 显式指定引擎就用它；否则按文件内容嗅探（global-metadata.dat 的
-            # magic vs .NET 程序集的 MZ 头），不要一律当成 il2cpp。
-            _state.engine = engine or _sniff_engine_for(mp)
-            # 只知道元数据文件、不知道游戏目录时不去猜主程序：
-            # 猜错会让 launch_game 拿着一个跑不起来的 exe 去启动。
-            # 需要启动就用 launch_game(exe=...)。
-            _state.exe = ""
-            _state.opened_at = time.time()
-            _state.note(f"选定元数据文件 {mp.name}（引擎 {_state.engine}）")
-            return {"ok": True, **_state.summary()}
+            sniffed = engine or _sniff_engine_for(mp)
+            return {"ok": True, "plan": {
+                "game_dir": str(mp.parent),
+                # 显式指定引擎就用它；否则按文件内容嗅探（global-metadata.dat 的
+                # magic vs .NET 程序集的 MZ 头），不要一律当成 il2cpp。
+                "engine": sniffed,
+                "metadata_path": str(mp),
+                # 只知道元数据文件、不知道游戏目录时不去猜主程序：
+                # 猜错会让 launch_game 拿着一个跑不起来的 exe 去启动。
+                # 需要启动就用 launch_game(exe=...)。
+                "exe": "",
+                "note": f"选定元数据文件 {mp.name}（引擎 {sniffed}）",
+            }}
 
         if not game_dir:
             return {"ok": False, "error": "必须提供 game_dir 或 metadata_path"}
@@ -289,15 +290,14 @@ def select_game(
             return {"ok": False, "error": f"游戏目录不存在：{game_dir}"}
 
         detected = engine or discovery.detect_engine(gd, want_data_dirs)
-        _state.game_dir = str(gd)
-        _state.engine = detected
-        _state.opened_at = time.time()
+        meta = ""
+        exe = ""
 
-        # 按引擎类型定位关键文件
+        # 按引擎类型定位关键文件（全部是只读探测）
         if detected == "il2cpp":
             paths = discovery.il2cpp_paths(gd, want_data_dirs)
-            _state.metadata_path = paths.get("metadata", "")
-            if not _state.metadata_path:
+            meta = paths.get("metadata", "")
+            if not meta:
                 # 允许用户手工指定（有些游戏目录结构不标准）
                 out = {
                     "ok": False,
@@ -319,16 +319,11 @@ def select_game(
         elif detected == "mono":
             mono = discovery.mono_paths(gd, want_data_dirs)
             managed = mono.get("managed_dir", "")
-            # 这里**不**把 Managed 目录塞进 `_state.exe`：Mono 游戏的主程序
-            # 仍然是游戏 exe。旧写法把目录当 exe，导致 inject_process
-            # 按主程序名找进程时拿 "Managed" 去比对，永远匹配不上。
-            # 留空后由下面统一的 `pick_main_exe` 兜底。
-            _state.exe = ""
             # Mono 的元数据单位是**单个程序集**而不是目录，
             # 所以这里挑出「游戏自己的代码」那个 dll 作为索引对象。
             # 通常就是 Assembly-CSharp.dll；找不到则退到最大的非框架程序集。
-            _state.metadata_path = _pick_mono_assembly(mono.get("assemblies") or [])
-            if not _state.metadata_path:
+            meta = _pick_mono_assembly(mono.get("assemblies") or [])
+            if not meta:
                 out = {
                     "ok": False,
                     "engine": detected,
@@ -344,16 +339,84 @@ def select_game(
                     )
                     out["container"] = container
                 return out
+            # 这里**不**把 Managed 目录当成 exe：Mono 游戏的主程序仍然是游戏 exe。
+            # 旧写法把目录当 exe，导致 inject_process 按主程序名找进程时拿
+            # "Managed" 去比对，永远匹配不上。留空由下面统一兜底。
+            exe = ""
         elif detected == "ue":
             ue = discovery.ue_paths(gd)
-            _state.exe = ue.get("exe", "")
+            exe = ue.get("exe", "")
 
-        if not _state.exe:
-            _state.exe = discovery.pick_main_exe(gd)
+        if not exe:
+            exe = discovery.pick_main_exe(gd)
 
-        _state.note(f"选定游戏 {gd.name}（引擎 {detected}）")
+        return {"ok": True, "plan": {
+            "game_dir": str(gd),
+            "engine": detected,
+            "metadata_path": meta,
+            "exe": exe,
+            "note": f"选定游戏 {gd.name}（引擎 {detected}）",
+            "detected_engine": detected,
+        }}
+
+
+def select_game(
+    game_dir: str = "",
+    engine: str = "",
+    metadata_path: str = "",
+) -> dict:
+    """选定一个游戏作为后续操作的上下文（= 规划 + 提交）。
+
+    允许只给 game_dir（自动识别引擎），也允许直接给 metadata_path
+    （适合只做离线分析、不装游戏的场景）。
+
+    **重复选中同一个游戏不会重建会话** —— 否则每次 open_game
+    都会把已经建好的索引和已注入的探针扔掉，Agent 反复调用就会反复重建。
+
+    主程序 exe 一律自动挑（`discovery.pick_main_exe`），本函数不接受指定：
+    需要换一个 exe 启动时用 `launch_game(exe=...)`，那才是启动参数该待的地方。
+    （原先这里有个 `exe` 形参，但没有任何调用方传过它 —— 见扫描报告 §3.7。）
+
+    **需要「先判定、再提交」的调用方请用 `plan_selection` + `commit_selection`**：
+    `server.open_game` 就是那样做的，因为「引擎受不受支持」这个判定发生在
+    本函数之外，若先提交再判定，失败就会留下被改坏的会话（缺陷 #3）。
+    """
+    res = plan_selection(game_dir=game_dir, engine=engine,
+                         metadata_path=metadata_path)
+    if not res.get("ok"):
+        return res
+    if res.get("reused"):
+        with _state.lock:
+            _state.note("重复选中同一个游戏，复用现有会话")
+            return {"ok": True, "reused": True, **_state.summary()}
+    return commit_selection(res["plan"])
+
+
+def commit_selection(plan: dict[str, Any]) -> dict:
+    """提交一次**已通过校验**的选游戏：收拾旧资源 → 写入新身份 → 返回摘要。
+
+    **只允许在 `plan_selection` 之后、且调用方自己的判定也通过之后调用**。
+    这样「失败的 open_game 污染会话」在结构上就不可能发生 ——
+    而不是靠每个失败分支自己记得回滚（缺陷 #3 的根因就是后者）。
+    """
+    with _state.lock:
+        _state.close_runtime()
+        _state.close_index()
+        _state.notes.clear()
+        # 身份信息也必须清 —— 否则「上一个游戏的 exe」会被当成这个游戏的
+        # （IL2CPP 分支不写 exe），详见 reset_target 的注释。
+        _state.reset_target()
+        _state.game_dir = plan.get("game_dir", "")
+        _state.engine = plan.get("engine", "")
+        _state.metadata_path = plan.get("metadata_path", "")
+        _state.exe = plan.get("exe", "")
+        _state.opened_at = time.time()
+        note = plan.get("note")
+        if note:
+            _state.note(note)
         out = {"ok": True, **_state.summary()}
-        out["detected_engine"] = detected
+        if plan.get("detected_engine"):
+            out["detected_engine"] = plan["detected_engine"]
         return out
 
 

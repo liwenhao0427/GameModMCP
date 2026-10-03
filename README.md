@@ -357,13 +357,14 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 43 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 42 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 44 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
 |---|---|
 | `verify_parser.py` | IL2CPP 元数据表结构与记录布局 |
+| `verify_report_fixes.py` | **《重启验证与运行时理解报告》§4 那 5 个缺陷的修复**：同步工具不许占住事件循环（分发路径必须换线程）、探针 RPC 必须有超时且卡死时不假成功、失败的 `open_game` 不许污染会话身份、`ue_manifest` 必须优先挑 UFS 清单、候选截断必须标 `has_more`。**每条都带非空转反证**（把实现改回旧写法必须报红） |
 | `verify_typedef_stride.py` | **typeDefinitions 记录大小**：按版本号硬编码会错（v29 实测是 88 不是 92，用错会让 Σfield_count 变 6.5 亿、`open_game` 撞 `UNIQUE constraint failed: fields.idx`）。本脚本用**合成元数据**验证「字段区间恰好铺满 fields 表」这条判据本身、自验证改选必须 warn、并复现历史 bug（不依赖本机装了哪款游戏） |
 | `verify_index.py` | 索引层：构建 / 缓存复用 / 各类查询 / 结果句柄 |
 | `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |

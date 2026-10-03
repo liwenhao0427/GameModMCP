@@ -75,6 +75,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import os
@@ -83,6 +84,8 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.tools.base import Tool
 
 # 两种启动方式都必须能用（文档与客户端配置里两种都出现过）：
 #   1. `python -m gamemod_mcp.server`（配 PYTHONPATH=<repo>/src）
@@ -98,14 +101,14 @@ if __package__ in (None, ""):  # 直接当脚本跑
     from gamemod_mcp.engine import decompile as dc
     from gamemod_mcp.engine import discovery, state
     from gamemod_mcp.engine import ue as ue_mod
-    from gamemod_mcp.engine.state import ensure_index, ensure_runtime, select_game
+    from gamemod_mcp.engine.state import ensure_index, ensure_runtime
     from gamemod_mcp.logutil import progress, warn
 else:  # 正常作为包被导入
     from . import __version__, cap
     from .engine import decompile as dc
     from .engine import discovery, state
     from .engine import ue as ue_mod
-    from .engine.state import ensure_index, ensure_runtime, select_game
+    from .engine.state import ensure_index, ensure_runtime
     from .logutil import progress, warn
 
 # 注意：上面这些导入原本有一部分写在**函数体里**（`from .engine import ue`、
@@ -646,43 +649,67 @@ def open_game(
         {ok, engine, engine_label, metadata_path, index: {type_count,
          method_count, field_count, capabilities...}, elapsed, reused}
     """
-    sel = select_game(game_dir=game_dir, metadata_path=metadata_path,
-                      engine=engine)
-    if not sel.get("ok"):
-        return sel
+    # **两阶段（缺陷 #3 的修复）**：先把目标算清楚（只读），把「引擎受不受支持」
+    # 这类判定做完，确认没问题才提交会话身份。
+    #
+    # 为什么不能沿用「先 select_game 再判断」：`select_game` 会先收拾旧会话并
+    # 写入新身份，而下面这段引擎判定是在它**之后**做的 —— 于是
+    # `open_game("E:\\project")`（容器目录）虽然如实返回 ok:false，
+    # 会话却已经被改成了 `E:\project`，`exe` 还被填成子目录里某个游戏的主程序。
+    # 而 `launch_game()` 不传 exe 时默认用会话里的 exe ——
+    # 等于会去启动容器下的某一款游戏（扫描报告 §3.1 的最坏情况）。
+    planned = state.plan_selection(game_dir=game_dir,
+                                   metadata_path=metadata_path, engine=engine)
+    if not planned.get("ok"):
+        return planned
 
-    # 走到这里说明游戏已选中。但除了 IL2CPP / Mono，其余引擎**没有集中元数据**，
-    # 「建索引」这一步本来就不适用 —— 必须在这里给出出口，不能让它落到
-    # ensure_index 去报「当前会话没有元数据文件」（实测报告 §3.3：
-    # 那句话会让调用方去翻 metadata_path，而游戏其实已经选好了）。
-    eng = str(sel.get("engine") or "").lower()
-    if not metadata_path and eng not in ("il2cpp", "mono"):
-        gd = sel.get("game_dir") or game_dir
+    if planned.get("reused"):
+        # 同一个游戏、索引已在：身份不动，直接复用。
+        # `force_rebuild` 交给 ensure_index 自己判（它会重建而不是复用）。
+        res = ensure_index(cache_dir=cache_dir, force_rebuild=force_rebuild)
+        if not res.get("ok"):
+            return res
+        st = state.state()
+        res["engine"] = st.engine
+        res["engine_label"] = state._engine_label(st.engine)
+        return res
+
+    plan = planned["plan"]
+    eng = str(plan.get("engine") or "").lower()
+    gd = plan.get("game_dir") or game_dir
+
+    # 「会话该不该切过去」与「能不能建索引」是**两件事**，必须分开判：
+    #
+    #   · 引擎受支持（il2cpp / mono / ue）→ 会话**应该**切过去。
+    #     对 UE 来说这一点尤其重要：`open_game` 会因为「没有集中元数据」而返回
+    #     ok:false，但会话身份必须已经指向这个 UE 游戏 —— 否则随后的
+    #     `detect_ue()` / `ue_profile()` 不传 exe 时找不到目标
+    #     （它们从会话里取 exe，见 `_ue_exe`）。文档里那句「会话已按这个游戏
+    #     选好」说的就是这件事。
+    #   · 引擎**不受支持**（unknown / unity / Godot 等）→ 会话**不许**动。
+    #     这正是缺陷 #3：以前先提交再判定，于是 `open_game("E:\project")`
+    #     虽然如实返回 ok:false，会话却已经被改成容器目录、
+    #     exe 还被填成子目录里某个游戏的主程序 —— 而 `launch_game()` 不传参时
+    #     默认就用会话里的 exe（扫描报告 §3.1 的最坏情况）。
+    supported = eng in ("il2cpp", "mono", "ue")
+
+    if not supported:
+        # ---- 不受支持：**一个字节都不写进会话**，只如实报错 ----
         info: dict[str, Any] = {}
         try:
             info = discovery.describe_game(gd)
         except Exception as exc:  # noqa: BLE001 - 提示信息拿不到也不能再抛
             warn(f"补充探测失败: {exc}")
-        if eng == "ue":
-            return _err(
-                "Unreal 游戏没有集中元数据，不需要（也无法）建索引 —— "
-                "请直接使用 ue_* 工具：detect_ue / ue_profile / ue_list_entries / "
-                "ue_script_objects / ue_manifest（会话已按这个游戏选好）。",
-                engine="ue",
-                engine_label=sel.get("engine_label", ""),
-                game_dir=gd,
-                ue=info.get("ue", {}),
-                next_tools=["detect_ue", "ue_profile", "ue_list_entries",
-                            "ue_script_objects", "ue_manifest"],
-                session=sel,
-            )
         hint = info.get("hint", "")
+        # 把「会话未被触碰」显式带出去，Agent 才不会以为「失败了但游戏换过去了」
+        untouched = {"session_unchanged": True,
+                     "session": state.state().summary()}
         if eng == "unity":
             return _err(
                 "识别为 Unity，但既没有 IL2CPP 的 global-metadata.dat、也没有 "
                 "Mono 的 Managed 程序集（可能是被裁剪的构建或被删过文件）；"
                 "若元数据在别处，请用 metadata_path 直接指定。",
-                engine=eng, game_dir=gd, hint=hint, session=sel,
+                engine=eng, game_dir=gd, hint=hint, **untouched,
             )
         return _err(
             "没能识别出可支持的引擎（本 MCP 只支持 IL2CPP / Mono / UE）。"
@@ -694,6 +721,30 @@ def open_game(
             engine_family=info.get("engine_family"),
             # 「外面套了一层」的情况：直接给出该指向哪里，省掉一轮试错
             game_root=info.get("game_root"),
+            **untouched,
+        )
+
+    # ---- 引擎受支持：现在提交会话身份 ----
+    sel = state.commit_selection(plan)
+
+    # UE 没有集中元数据，「建索引」这一步不适用 —— 但**会话已经切好了**，
+    # 所以这里要给出 ue_* 的出口，而不是让调用方去翻 metadata_path。
+    if not metadata_path and eng == "ue":
+        info = {}
+        try:
+            info = discovery.describe_game(gd)
+        except Exception as exc:  # noqa: BLE001
+            warn(f"补充探测失败: {exc}")
+        return _err(
+            "Unreal 游戏没有集中元数据，不需要（也无法）建索引 —— "
+            "请直接使用 ue_* 工具：detect_ue / ue_profile / ue_list_entries / "
+            "ue_script_objects / ue_manifest（会话已按这个游戏选好）。",
+            engine="ue",
+            engine_label=sel.get("engine_label", ""),
+            game_dir=gd,
+            ue=info.get("ue", {}),
+            next_tools=["detect_ue", "ue_profile", "ue_list_entries",
+                        "ue_script_objects", "ue_manifest"],
             session=sel,
         )
 
@@ -2246,6 +2297,9 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
     """
 
     target = path
+    #: 自动挑清单时是否命中了首选（UFS 清单）。显式给 path 时恒为 True
+    #: —— 调用方自己指定了，就没有「挑错」这回事。
+    picked_preferred = True
     if not target:
         root = game_dir
         if not root:
@@ -2256,7 +2310,10 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
         if not found:
             return _err(f"在 {root} 下没找到打包清单"
                         f"（Manifest_*Files*.txt）", game_dir=root)
-        target = found[0]
+        # 不能直接取 found[0]：`find_manifests` 是字母序的，第一个是
+        # Manifest_DebugFiles（实测只有 3 条），于是任何 pattern 都会「零命中」，
+        # 而 note 会让调用方以为「包里没有」。优先挑 UFS 清单，见 pick_manifest。
+        target, picked_preferred = ue_mod.pick_manifest(found)
 
     if not Path(target).is_file():
         return _err(f"文件不存在：{target}")
@@ -2287,9 +2344,21 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
     res["has_more"] = offset + len(page) < len(entries)
     res[key] = page
     if pattern and not entries:
-        # 过滤零命中必须给说明，不能只给一个空列表
-        res["note"] = (f"清单解析成功（共 {total} 条），但过滤条件 {pattern!r} "
-                       f"没有命中任何条目；去掉 pattern 可看全部。")
+        # 过滤零命中必须给说明，不能只给一个空列表。
+        # 而且必须**说清用的是哪一份清单** —— 否则「零命中」会被读成
+        # 「包里没有」，而实际可能只是清单挑错了（见 pick_manifest）。
+        res["note"] = (f"清单 {Path(target).name} 解析成功（共 {total} 条），"
+                       f"但过滤条件 {pattern!r} 没有命中任何条目；"
+                       f"去掉 pattern 可看全部。")
+    if not picked_preferred:
+        # 没挑到 UFS 清单 = 这份清单大概率不是「打进 pak 的内容」。
+        # 如实说出来，别让调用方把它的「零命中」当成结论。
+        warn(f"{target} 不是 Manifest_UFSFiles_*，可能是旁挂文件清单")
+        extra = (f"注意：自动挑选时**没找到** Manifest_UFSFiles_* 清单，"
+                 f"退回用了 {Path(target).name} —— 它记录的是不进 pak 的旁挂文件，"
+                 f"与资源包内容无关。要查打包内容请显式指定 path=")
+        res["note"] = f"{res.get('note')}；{extra}" if res.get("note") else extra
+        res["picked_preferred"] = False
     return _ok(**res)
 
 
@@ -2380,6 +2449,114 @@ def guide_text() -> str:
 def guide_resource() -> str:
     """完整使用指南：七步工作流、配方、引擎差异、常见坑。"""
     return guide_text()
+
+
+# ================================================================
+# 事件循环保护：把同步工具 offload 到线程
+# ================================================================
+#
+# **这是缺陷 #1 的修复。**
+#
+# 问题（实测，不是推测）：本文件的 38 个工具**全部**是同步 `def`
+# （`async def` 计数为 0）。而 mcp 1.26.0 的
+# `fastmcp/utilities/func_metadata.py:92-95` 对同步函数是
+#
+#     if fn_is_async: return await fn(**kwargs)
+#     else:           return fn(**kwargs)          # ← 直接在事件循环线程里跑
+#
+# —— 没有 `to_thread`、没有 `run_in_threadpool`。于是任何慢工具都会**占住
+# 整个 asyncio 事件循环**，期间服务器不再读任何请求。实测
+# （`devtools/archive/probes/blocking_check.py`）：一个真建索引的调用
+# （2.57s）在飞时，连**完全不碰 Frida**、只读内存状态的 `get_session`
+# 都拿不到响应（1.5s 超时）。
+#
+# 为什么不在每个工具上写 `async def` + `await asyncio.to_thread(...)`：
+# 那要改 38 个函数，且会让 **64 处**「脚本内直接 `S.open_game(...)`」的
+# 现有验收全部变成「忘了 await 的协程」—— 测试会静默拿到协程对象而不是
+# 结果。改 SDK 注册层的这一处，`server.<工具>` 仍然是可同步调用的普通函数，
+# 只有**经 MCP 协议分发**的那条路被 offload，两条路的语义都正确。
+#
+# 做法：包住 `ToolManager.call_tool`（FastMCP 分发工具的唯一入口），
+# 把其中的同步 `tool.run(...)` 丢进线程执行。
+# `asyncio.to_thread` 是**标准库**（AGENTS.md §2.4：新增第三方依赖要先说明），
+# 不引入任何新依赖。
+
+
+def _install_event_loop_guard() -> bool:
+    """让经 MCP 分发的同步工具在线程里跑，不阻塞事件循环。
+
+    Returns:
+        True = 装上了；False = 当前 mcp 版本的结构与预期不符，
+        **没有**装上（会打警告，不抛异常 —— 旧版本 mcp 下服务器仍应能工作，
+        只是退回到「慢工具会阻塞」的旧行为）。
+    """
+    try:
+        from mcp.server.fastmcp.tools.tool_manager import ToolManager
+    except Exception as exc:  # noqa: BLE001 - mcp 结构变了
+        warn(f"无法安装事件循环保护（import ToolManager 失败）：{exc}")
+        return False
+
+    original = getattr(ToolManager, "call_tool", None)
+    if original is None or getattr(original, "_gamemod_offload", False):
+        return False
+
+    async def call_tool_offloaded(self: Any, name: str, arguments: dict,
+                                  context: Any = None,
+                                  convert_result: bool = False) -> Any:
+        """与上游 `ToolManager.call_tool` 等价，只把同步执行挪到线程。
+
+        **只对同步工具 offload**：异步工具本来就是 await 的，
+        再套一层线程反而会破坏它们对事件循环的假设。
+        """
+        tool = self.get_tool(name)
+        if tool is None:
+            raise ToolError(f"Unknown tool: {name}")
+        if getattr(tool, "is_async", False):
+            return await tool.run(arguments, context=context,
+                                  convert_result=convert_result)
+        return await asyncio.to_thread(
+            tool.run_sync_for_offload, arguments, context, convert_result)
+
+    #: 给 `Tool` 补一个**同步**执行入口。
+    #:
+    #: 为什么不直接 `await tool.run(...)`（在上游那条路上）或
+    #: `asyncio.run(tool.run(...))`：`tool.run` 内部除了调用工具函数，
+    #: 还要做参数校验与结果转换。这里显式复刻它对**同步函数**的那条分支
+    #: （`fn_is_async=False`），语义与上游逐字一致，只是换了个线程执行。
+    #:
+    #: `call_fn_with_arg_validation` 本身是 `async def`，所以即便走同步分支
+    #: 也要 await 一次才能拿到值 —— 在 worker 线程里用 `asyncio.run` 收口。
+    #: 那条分支内部**只**执行 `fn(**kwargs)`，不会碰 `context` 绑定的原循环
+    #: （工具函数本身也不接受 context，见 `_ann` 之外的签名）。
+    def run_sync_for_offload(self: Any, arguments: dict, context: Any,
+                             convert_result: bool) -> Any:
+        async def _once() -> Any:
+            return await self.fn_metadata.call_fn_with_arg_validation(
+                self.fn, False, arguments,
+                {self.context_kwarg: context} if self.context_kwarg is not None
+                else None,
+            )
+        try:
+            result = asyncio.run(_once())
+            if convert_result:
+                result = self.fn_metadata.convert_result(result)
+            return result
+        except Exception as e:      # noqa: BLE001 - 与上游一致：包成 ToolError
+            raise ToolError(f"Error executing tool {self.name}: {e}") from e
+
+    Tool.run_sync_for_offload = run_sync_for_offload       # type: ignore[attr-defined]
+    call_tool_offloaded._gamemod_offload = True            # type: ignore[attr-defined]
+    ToolManager.call_tool = call_tool_offloaded            # type: ignore[method-assign]
+    return True
+
+
+#: 模块导入时就装上。放在这里而不是 `main()` 里：以 `-m` 或脚本方式启动都会
+#: 执行到这里，而 `main()` 只在 `__main__` 分支跑（验证脚本 import 本模块时
+#: 不会走 main，但它们的 stdio 子进程会 —— 两边都要保护到）。
+#:
+#: 注意：**不改** `server.<工具>` 这些模块属性，所以
+#: `devtools/verify_*.py` 里 `S.open_game(...)` 那 64 处同步调用照旧工作。
+_EVENT_LOOP_GUARD = _install_event_loop_guard()
 
 
 # ================================================================

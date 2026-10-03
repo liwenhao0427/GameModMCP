@@ -119,6 +119,11 @@ NON_TOOL_IDENTIFIERS = {
     # `probe_ready` 是探针就绪通知；`script_error` 是探针脚本抛错时的事件类型。
     # 两者都是 `drain_events(kind=...)` 的取值，不是 MCP 工具。
     "probe_ready", "script_error",
+    # 「工具调用卡住」那节讲的是**实现机制**，提到的两个名字是内部函数/API，
+    # 不是 MCP 工具：`wait_ready` 是 RuntimeSession 的轮询入口、
+    # `to_thread` 是 asyncio 的标准库函数。写出来是为了让读文档的人
+    # 能对上代码，Agent 并不会去调它们。
+    "wait_ready", "to_thread",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
 }

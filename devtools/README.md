@@ -32,6 +32,7 @@ python devtools\verify_cache.py            # P3-2 索引缓存生命周期：只
 python devtools\verify_lazy_meta.py        # 解析何时发生：P1-3b 的决策门禁 + 「载入失败不许被降级成没有基类」（只需 IL2CPP 样本）
 python devtools\verify_stdio_entry.py      # 进程级入口：脚本形式（不带 PYTHONPATH）与模块形式都要能用，含惰性导入工具的真调用（无需游戏）
 python devtools\verify_session_switch.py   # 切换游戏时上一个游戏的 exe 不许留下来（纯函数 + 真实切换 + 进程级，需 Mono/IL2CPP/UE 样本）
+python devtools\verify_report_fixes.py     # 重启验证报告 §4 的 5 个缺陷修复：事件循环不许被同步工具占住 / 探针 RPC 必须有超时 / 失败 open_game 不许污染会话 / ue_manifest 挑 UFS 清单 / 候选截断标 has_more（含非空转反证；§1§3 需样本）
 python devtools\verify_mcp_discovery.py    # 目录布局：容器目录不许被当成游戏 + UE/不支持引擎要给出口（真实样本 + 合成布局 + 进程级，需 IL2CPP/Mono/UE 样本）
 python devtools\verify_parser.py       # IL2CPP 元数据布局
 python devtools\verify_index.py        # 索引层

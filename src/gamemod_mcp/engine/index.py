@@ -49,6 +49,7 @@ import itertools
 import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -465,8 +466,17 @@ class Index:
             self.engine = ""
         self._closed = False
         self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
+        # 建库用的那条连接（只在**创建它的线程**里用，见 `conn` 属性）。
+        self._primary_conn = sqlite3.connect(str(db_path))
+        self._primary_conn.row_factory = sqlite3.Row
+        #: 本索引创建时所在的线程 id —— `conn` 靠它判断能不能复用主连接。
+        self._owner_tid = threading.get_ident()
+        #: 每条线程各自的连接（`threading.local`），以及一份全量清单用于 close。
+        self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = [self._primary_conn]
+        self._conn_lock = threading.Lock()
+        #: 惰性解析元数据时的锁（见 `meta` 属性）。
+        self._meta_lock = threading.Lock()
         self.results = ResultStore(owner=self.engine)
         # 「父类名 -> 直接子类」映射的惰性缓存（见 _direct_children）。
         # 构建一次约 6 ms（IL2CPP 20,072 类型），元数据本身是只读的，
@@ -488,16 +498,54 @@ class Index:
 
         需要全量类型的路径（`_direct_children`）照旧通过本属性取，
         即「用到才付钱」，行为不变。
+
+        **加锁**：工具现在会被 offload 到线程池执行（见 `server.py` 的
+        `_offload_sync_tools`），并发访问时两个线程可能同时走到
+        `if self._meta is None`，各自解析一遍 —— 480 ms 的解析做两遍是浪费，
+        更糟的是 `_meta` 会被后写的覆盖、先解析那份泄漏。锁只保护
+        「解析 + 赋值」这一小段，解析本身在锁内（本来也只能解析一次）。
         """
         if self._meta is None:
-            if self._closed:
-                raise MetadataError(
-                    "索引已关闭，元数据不再可用（不能再惰性解析）"
-                )
-            if self._meta_path is None:
-                raise MetadataError("索引未记录元数据路径，无法惰性解析")
-            self._meta = self._load_meta(self._meta_path, self.engine)
+            with self._meta_lock:
+                # 双重检查：等锁期间别的线程可能已经解析好了
+                if self._meta is None:
+                    if self._closed:
+                        raise MetadataError(
+                            "索引已关闭，元数据不再可用（不能再惰性解析）"
+                        )
+                    if self._meta_path is None:
+                        raise MetadataError("索引未记录元数据路径，无法惰性解析")
+                    self._meta = self._load_meta(self._meta_path, self.engine)
         return self._meta
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """当前线程可用的数据库连接。
+
+        **为什么不是一条共享连接**（这是缺陷 #1 的配套修复）：
+        本机 `sqlite3.threadsafety == 1`，实测同一条连接对象跨线程使用会直接抛
+
+            ProgrammingError: SQLite objects created in a thread can only be
+            used in that same thread.
+
+        而修复 #1 把工具 offload 到线程池之后，同一个 `Index` 必然会被
+        **不同线程**访问（线程池的 worker 是复用的，但绝不保证与创建者同一条）。
+        所以这里按线程各持一条连接：创建者用主连接，其它线程第一次用时新建。
+
+        连接是**只读**查询用的（建库只在 `_build()` 里、且在创建线程内完成），
+        所以多开几条没有写冲突问题；每条都用 `check_same_thread=False` 只是为了
+        让 `close()` 能在任意线程统一关掉它们。
+        """
+        if threading.get_ident() == self._owner_tid:
+            return self._primary_conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+            with self._conn_lock:
+                self._conns.append(conn)
+        return conn
 
     # ------------------------------------------------------ 生命周期
 
@@ -625,18 +673,27 @@ class Index:
             return False
 
     def close(self) -> None:
-        """关闭连接与元数据。
+        """关闭**所有**连接与元数据。
+
+        为什么是所有：`conn` 属性会为每条用过的线程各开一条连接
+        （见那里的说明）。只关主连接的话，线程池 worker 上那些连接会一直
+        占着 sqlite 文件 —— 在 Windows 上表现为「删不掉被占用的缓存文件」
+        （`force_rebuild` 正需要先删掉它）。
 
         元数据可能是**从未解析**的（缓存命中且没用到）—— 这正是我们想要的：
         关闭时也不该为了「关掉它」而先花 480 ms 把它解析起来。
         """
-        try:
-            self.conn.close()
-        finally:
-            self._closed = True
-            meta, self._meta = self._meta, None
-            if meta is not None:
-                meta.close()
+        with self._conn_lock:
+            conns, self._conns = self._conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception as exc:      # noqa: BLE001 - 关不掉不该挡住其余清理
+                warn(f"关闭索引连接失败：{exc}")
+        self._closed = True
+        meta, self._meta = self._meta, None
+        if meta is not None:
+            meta.close()
 
     def __enter__(self) -> Index:
         return self
