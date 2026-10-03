@@ -254,6 +254,29 @@ _sessions_lock = threading.RLock()
 CALL_TIMEOUT = 30.0
 
 
+#: spawn 之后**第一次**探测前先静默多久（秒）。
+#:
+#: 依据（`devtools/archive/probes/wedge_ab.py` 的对照实验，Ved 上各 8 轮）：
+#:
+#: | 第一次探测前的静默 | 探测间隔 | 卡死率 |
+#: |---|---|---|
+#: | 0 秒 | 0（紧循环） | **8/8** |
+#: | 0 秒 | 0.1 秒 | 1/8 |
+#: | 0 秒 | 0.5 秒 | 0/8 |
+#: | **3 秒** | **0（紧循环）** | **0/8** |
+#:
+#: 最后一行是这条常量的由来：即使把探测频率拉到最激进，
+#: 只要**第一次探测**推迟到游戏启动 3 秒之后，就不再出现卡死。
+#: 也就是说危险窗口在「游戏启动后的头几秒」，而不是「探测次数多」本身。
+#:
+#: **这是一条缓解措施，不是根因修复**（务必分清）：
+#: 根因（为什么在早期探测会让游戏进 `Fatal error in GC`）仍未定位，
+#: 且产品路径在 0.5 秒间隔下**仍然卡死过两次**，说明本常量之外还有别的因素。
+#: 详见 `docs/重启验证与运行时理解报告.md` §7.2 / §7.3。
+#: 真正兜底的是 `CALL_TIMEOUT`：无论卡不卡，都不会再无限挂住。
+READY_SETTLE_DELAY = 3.0
+
+
 class RuntimeSession:
     """一条指向目标进程的 Frida 会话。"""
 
@@ -492,7 +515,8 @@ class RuntimeSession:
 
     def wait_ready(self, timeout: float = 30.0,
                    preferred_module: str = "",
-                   interval: float = 0.5) -> dict:
+                   interval: float = 0.5,
+                   settle: float | None = None) -> dict:
         """轮询直到 IL2CPP 运行时可用（或超时）。
 
         spawn 之后必须用它而不是一次性 init：
@@ -502,7 +526,21 @@ class RuntimeSession:
         就是模块未找到）。等待预算该给多少由调用方按引擎决定：
         IL2CPP 给 60 秒，Mono/UE 游戏永远不会有这个模块，给 2 秒就够
         （见 `engine/state.py` 的 `ready_timeout_for`）。
+
+        `settle` 是**第一次探测前**的静默秒数（默认 `READY_SETTLE_DELAY`）。
+        为什么要它：对照实验显示「游戏启动头几秒就去探测」会显著提高
+        游戏进 `Fatal error in GC` 的概率（0 秒静默 + 紧循环 = 8/8 卡死，
+        3 秒静默 + 紧循环 = 0/8）。这是一条**缓解**，不是根因修复 ——
+        依据与边界见 `READY_SETTLE_DELAY` 的注释。
+
+        这个静默**不占用** `timeout` 预算：预算管的是「运行时要多久才就绪」，
+        而静默是「先别去碰它」。两者混在一起会让「等了 3 秒才第一次探测」
+        被记成「运行时 3 秒才就绪」，把观测值搞脏。
         """
+        if settle is None:
+            settle = READY_SETTLE_DELAY
+        if settle > 0:
+            time.sleep(settle)
         deadline = time.time() + max(0.0, timeout)
         last: dict = {"ok": False, "error": "尚未尝试初始化"}
         attempt = 0

@@ -80,8 +80,15 @@ class FakeRuntime:
         return {"ok": True, "pid": self.pid}
 
     def wait_ready(self, timeout: float = 30.0,
-                   preferred_module: str = "") -> dict:
-        """ensure_runtime 会在 attach 之后等 IL2CPP 就绪。假的直接报就绪。"""
+                   preferred_module: str = "",
+                   settle: float | None = None) -> dict:
+        """ensure_runtime 会在 attach 之后等 IL2CPP 就绪。假的直接报就绪。
+
+        `settle` 必须收下：真实现的签名里有它（spawn 路径第一次探测前的静默，
+        见 `runtime/session.py` 的 `READY_SETTLE_DELAY`）。
+        桩要跟着真签名走 —— 否则产品一加参数，测试就报 TypeError，
+        把「桩落后了」伪装成「产品坏了」。
+        """
         return {"ok": True, "pid": self.pid, "module": "FakeAssembly.dll",
                 "base": "0x10000000", "api_available": [], "api_missing": []}
 
@@ -249,11 +256,16 @@ def main() -> int:
 
     # 端到端层：确认 ensure_runtime 真的把预算传下去了（不是写死 60 秒）
     seen: list[float] = []
+    settles: list[float | None] = []
 
     class TimeoutSpy(FakeRuntime):
         def wait_ready(self, timeout: float = 30.0,
-                       preferred_module: str = "") -> dict:
+                       preferred_module: str = "",
+                       settle: float | None = None) -> dict:
             seen.append(timeout)
+            # 顺便钉住：attach 路径必须显式关掉 settle（已启动的进程
+            # 没有「启动头几秒」那个危险窗口，白等 3 秒纯属浪费）。
+            settles.append(settle)
             return {"ok": True, "pid": self.pid, "module": "FakeAssembly.dll"}
 
     rt_mod.spawn_and_attach = lambda exe, **kw: TimeoutSpy(8888, spawned=True)
@@ -272,6 +284,27 @@ def main() -> int:
     finally:
         rt_mod.spawn_and_attach = real_spawn
     st.engine = ""
+    reset()
+
+    # spawn 路径必须**用默认 settle**（第一次探测前先静默），
+    # 因为「游戏启动头几秒」正是卡死窗口（对照实验见报告 §7.3）。
+    check("spawn 路径没有把 settle 显式关掉（危险窗口要避开）",
+          all(s is None for s in settles),
+          f"settles={settles}")
+
+    # attach 路径必须显式 settle=0：注入的是**已经启动好**的进程，
+    # 没有那个窗口，白等 3 秒纯属浪费。
+    seen.clear()
+    settles.clear()
+    rt_mod.attach = lambda pid, **kw: TimeoutSpy(pid)
+    try:
+        reset()
+        st.engine = "il2cpp"
+        S.ensure_runtime(pid=7777)
+    finally:
+        rt_mod.attach = real_attach      # 复原，别污染后面的收尾
+    check("attach 路径显式传 settle=0（不白等）",
+          settles and settles[-1] == 0.0, f"settles={settles}")
     reset()
 
     print()

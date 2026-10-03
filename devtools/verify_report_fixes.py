@@ -261,6 +261,40 @@ def part_rpc_timeout() -> None:
     check("卡死收尾之后会话引用已释放（可以重新注入）",
           _st.runtime is None)
 
+    # ---- 缓解措施：wait_ready 第一次探测前会先静默 ----
+    # 依据：对照实验（devtools/archive/probes/wedge_ab.py）里
+    # 「0 秒静默 + 紧循环 = 8/8 卡死」而「3 秒静默 + 紧循环 = 0/8」。
+    # 这里只钉住**契约**（默认值存在、attach 路径要显式关掉），
+    # 卡死率的实测证据在报告 §7.2，不放进门禁（要跑几十轮，太慢）。
+    check("READY_SETTLE_DELAY 是正数（缓解措施存在）",
+          sess_mod.READY_SETTLE_DELAY > 0,
+          f"{sess_mod.READY_SETTLE_DELAY}s")
+
+    rs4 = sess_mod.RuntimeSession(999996, FakeSession(), FakeScript(),
+                                  name="settle-probe")
+    rs4._call_timeout = 1.0
+    t_settle = time.time()
+    # init 会卡死（FakeScript 永不返回），所以这里只量**静默**那一段：
+    # 用一个必然 ok 的桩替换 init，才能干净地量出 settle。
+    rs4.init = lambda preferred_module="": {"ok": True, "module": "stub"}
+    rs4.wait_ready(timeout=5.0, interval=0.01)          # 用默认 settle
+    dt_settle = time.time() - t_settle
+    check("wait_ready 默认会先静默（耗时 >= settle）",
+          dt_settle >= sess_mod.READY_SETTLE_DELAY,
+          f"耗时 {dt_settle:.2f}s vs settle={sess_mod.READY_SETTLE_DELAY}s")
+
+    rs5 = sess_mod.RuntimeSession(999995, FakeSession(), FakeScript(),
+                                  name="settle-probe2")
+    rs5.init = lambda preferred_module="": {"ok": True, "module": "stub"}
+    t_nosettle = time.time()
+    rs5.wait_ready(timeout=5.0, interval=0.01, settle=0.0)
+    dt_nosettle = time.time() - t_nosettle
+    check("settle=0 时立刻探测（attach 路径靠它免掉无谓等待）",
+          dt_nosettle < 1.0, f"耗时 {dt_nosettle:.2f}s")
+    check("反证：settle 确实造成了可观测的差异（说明上面那条不是空转）",
+          dt_settle - dt_nosettle >= sess_mod.READY_SETTLE_DELAY * 0.8,
+          f"带 settle {dt_settle:.2f}s vs 不带 {dt_nosettle:.2f}s")
+
     # ---- 非空转反证：把超时去掉（改回旧的直接调用），必须挂住 ----
     rs3 = sess_mod.RuntimeSession(999997, FakeSession(), FakeScript(),
                                   name="hang-probe3")

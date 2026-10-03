@@ -898,6 +898,10 @@ def ensure_runtime(
                 # 切换失败：进程已经起来了，如实报告并把会话状态一并带出。
                 return {"ok": False, "error": align.get("error", "会话上下文切换失败"),
                         "align": align, **_state.summary()}
+            # spawn 路径：**第一次探测前先静默**（`wait_ready` 的默认 settle）。
+            # 依据：对照实验里「游戏启动头几秒就去探测」会把卡死率从 0/8
+            # 抬到 8/8（紧循环）；这是缓解措施，根因未定位，
+            # 详见 `runtime/session.py` 的 `READY_SETTLE_DELAY`。
             init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                    preferred_module=preferred_module)
             if not init.get("ok"):
@@ -997,9 +1001,12 @@ def ensure_runtime(
             return {"ok": False, "pid": target_pid,
                     "error": align.get("error", "会话上下文切换失败"),
                     "align": align, **_state.summary()}
-        # 进程已经在跑，模块本该就在；预算仍按引擎给
+        # 进程已经在跑，模块本该就在；预算仍按引擎给。
+        # `settle=0`：这条路径注入的是**已经启动好**的进程，
+        # 没有「游戏启动头几秒」那个危险窗口 —— 白等 3 秒纯属浪费
+        # （对照实验里的危险窗口只存在于 spawn 之后的那几秒）。
         init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
-                               preferred_module=preferred_module)
+                               preferred_module=preferred_module, settle=0.0)
         if not init.get("ok"):
             label = runtime_label(_state.engine)
             _state.note(f"{label} 运行时未就绪：{init.get('error')}")
