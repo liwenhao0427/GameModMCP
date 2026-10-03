@@ -108,6 +108,17 @@ NON_TOOL_IDENTIFIERS = {
     # decompile 返回的「实际反编译出来的类型名」（嵌套类型会退让到最外层，
     # 所以它与 requested 不一定相同），是返回字段不是工具
     "decompiled_type",
+    # launch_game / inject_process 跟随目标换了游戏时返回的说明字段，
+    # 以及反推不出游戏目录时的提示字段 —— 都是返回字段不是工具
+    "context_switched", "context_warning",
+    # drain_events 返回的「队列里还剩多少条」（近似值），是返回字段不是工具。
+    # 它不是可有可无的装饰：`kind` 过滤返回空时，调用方要靠它区分
+    # 「真的没有该类型事件」与「队列里还有东西」。
+    "pending_approx",
+    # 探针主动上报的事件类型（`send()` 的非 Hook 消息）。
+    # `probe_ready` 是探针就绪通知；`script_error` 是探针脚本抛错时的事件类型。
+    # 两者都是 `drain_events(kind=...)` 的取值，不是 MCP 工具。
+    "probe_ready", "script_error",
     # 非本项目的标识符（引擎/框架 API）
     "get_frameCount", "MonoBehaviour", "Il2CppClass", "GameAssembly",
 }

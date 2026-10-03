@@ -1293,6 +1293,12 @@ def inject_process(pid: int = 0, auto_find: bool = True,
     注入后才能使用 runtime_* / hook_* / drain_events 等在线工具。
     同一个进程只会注入一次（重复调用会复用，不会重复 Hook）。
 
+    **会话上下文会自动跟随目标**：注入的进程若属于另一个游戏，会话身份
+    （game_dir / engine / metadata_path）与静态索引会一起切过去，返回里给
+    `context_switched` 说明换了哪个游戏。为什么必须切：否则 `search_*`（旧游戏）
+    与 `runtime_*`（新游戏）属于两个游戏，token 对账这把「尺子」本身就是错的。
+    反推不出目标属于哪个游戏时**不猜**，改用 `context_warning` 如实提示。
+
     需要权限：Windows 上一般要管理员身份；游戏有反调试/反注入时会失败。
 
     Args:
@@ -1302,7 +1308,8 @@ def inject_process(pid: int = 0, auto_find: bool = True,
                           （GameAssembly.dll / libil2cpp.so）。
 
     Returns:
-        {ok, pid, init: {module, base, api_available, api_missing, fallbacks}}
+        {ok, pid, init: {module, base, api_available, api_missing, fallbacks},
+         context_switched?, context_warning?}
     """
     res = ensure_runtime(pid=pid, auto_find=auto_find,
                          preferred_module=preferred_module)
@@ -1316,7 +1323,22 @@ def inject_process(pid: int = 0, auto_find: bool = True,
     # 所以先把它摘掉再合并。
     rt = res.get("runtime") or {}
     body = {k: v for k, v in res.items() if k not in ("ok", "pid")}
-    return _ok(pid=rt.get("pid") or pid, **body)
+    out = _ok(pid=rt.get("pid") or pid, **body)
+    # 上下文不对劲时必须说出来：注入的目标与「当前选中的游戏」可能不是同一个，
+    # 此时 search_* 与 runtime_* 的结果互相不能印证（详见 align_context_with_exe）。
+    # 两块提示都由 state 侧算好（它才知道 exe 与反推结果），这里只负责带出来 ——
+    # 与 launch_game 保持同一套字段名，免得两个工具说法不一致。
+    align = res.get("align") or {}
+    if align.get("switched") and "context_switched" not in out:
+        out["context_switched"] = (
+            f"会话上下文已从 {align.get('previous_game_dir') or '(空)'} "
+            f"切换到 {align.get('game_dir')}"
+            f"（引擎 {align.get('engine')}）—— 后续 search_* / class_detail "
+            "查的是这个新游戏。")
+    text = align.get("context_warning")
+    if text and "context_warning" not in out:
+        out["context_warning"] = text
+    return out
 
 
 @mcp.tool(annotations=_ann("启动并注入游戏", read_only=False, destroy=False, open_world=True))
@@ -1326,6 +1348,12 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
 
     比先手动开游戏再 inject_process 更强：能在对象被创建之前就装好 Hook，
     适合拦截只执行一次的初始化逻辑。
+
+    **会话上下文会自动跟随 `exe`**：若它属于另一个游戏，会话身份与静态索引
+    会一起切过去（并建索引），返回里给 `context_switched` 说明。
+    否则 `search_*` 与 `runtime_*` 会分属两个游戏（实测过：index 140 个 image
+    对上运行时 143 个，`image_count_matches=false`，而工具全程 ok:true）。
+    反推不出 exe 所属游戏时**不猜**，用 `context_warning` 如实提示。
 
     Args:
         exe:  游戏可执行文件路径。留空则用当前会话识别出的主程序。
@@ -1374,6 +1402,20 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
     # 同 inject_process：res 里可能已有 pid/target/argv 键，先摘掉避免重复关键字
     body = {k: v for k, v in res.items()
             if k not in ("ok", "pid", "target", "argv")}
+    # 会话上下文跟随目标切换过，就必须说出来 —— 悄悄换掉「当前游戏是谁」
+    # 会让后续 search_* 的结果看起来突然变了，而调用方不知道为什么。
+    # （对齐由 ensure_runtime 在 spawn 成功后、wait_ready 之前完成：
+    #  放在这里做会在「已有会话 → 拒绝 spawn」这条路上留下副作用。）
+    align = res.get("align") or {}
+    if align.get("switched"):
+        body["context_switched"] = (
+            f"会话上下文已从 {align.get('previous_game_dir') or '(空)'} "
+            f"切换到 {align.get('game_dir')}"
+            f"（引擎 {align.get('engine')}）—— 后续 search_* / class_detail "
+            "查的是这个新游戏。")
+    elif align.get("index_error"):
+        body["context_warning"] = (
+            "会话上下文已对齐，但索引未建成：" + str(align.get("index_error")))
     return _ok(target=target, argv=argv, pid=rt.get("pid"), **body)
 
 
@@ -1679,9 +1721,14 @@ def drain_events(limit: int = 200, kind: str = "") -> dict:
     语义与 AiMod 的 /v1/events?after= 一致：**取走即消费**。
     想持续观察就每隔一会儿调用一次，累加统计即可。
 
+    `kind` 过滤的是**整条队列**，不是只看队首那一条 —— 注入后队首恒有一条
+    `notice`(probe_ready)，若只在队首判断，`kind="hook"` 会一条都取不到
+    （返回 `ok:true` + 空列表，调用方会误判成「Hook 没触发」而去排查落点）。
+    不匹配的事件按原序留在队列里，不会被吞；超出 `limit` 的匹配事件同样留下。
+
     Args:
         limit: 本次最多取多少条。
-        kind:  只取某类事件（如 "hook"）。
+        kind:  只取某类事件（如 "hook" / "notice" / "log"）。
 
     Returns:
         {ok, returned, pending_approx, dropped, events: [...]}

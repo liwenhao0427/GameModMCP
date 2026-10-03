@@ -813,6 +813,104 @@ def detect_engine(game_dir: str | Path, data_dirs: list[Path] | None = None) -> 
     return "unknown"
 
 
+#: `game_root_for_exe` 向上回溯的最大层数。
+#:
+#: UE 的 Shipping 程序在 `<根>/<项目>/Binaries/Win64/` 下 —— 从它所在目录
+#: 回到游戏根需要 4 层；Unity 的主程序通常就躺在游戏根那一层。再往上没有
+#: 意义：越往上越可能撞到一个**装着多款游戏**的父目录。
+GAME_ROOT_MAX_UP = 4
+
+
+def _direct_data_dirs(game_dir: Path) -> list[Path]:
+    """只列**直接**躺在 `game_dir` 下的 `*_Data`（绝不下钻）。
+
+    与 `list_data_dirs` 的区别是这里**不搜子目录** —— 判「这个目录本身
+    是不是游戏根」时不能下钻，理由见 `is_game_root`。
+    """
+    skip = {"il2cpp_data", "mono_data"}
+    try:
+        return [p for p in game_dir.glob("*_Data")
+                if p.is_dir() and p.name.lower() not in skip]
+    except OSError:
+        return []
+
+
+def is_game_root(game_dir: str | Path) -> bool:
+    """这个目录**本身**是不是一个受支持游戏的安装根？（严格判据）
+
+    为什么不能用 `detect_engine` 代替：它按设计会**下钻到 3 层**去找标记
+    （兼容「元数据埋得比较深」的非标准布局），于是「装着游戏的父目录」
+    也会被认成游戏。实测 `detect_engine("C:\\\\")` 返回 `mono` ——
+    因为 `C:\\Hearthstone\\Hearthstone_Data\\Managed` 在第 3 层被搜到了。
+
+    这个差别在本函数的使用场景里是致命的：`game_root_for_exe` 要**逐层向上**
+    找第一个像游戏根的目录，若用 `detect_engine`，从 `notepad.exe` 往上会
+    一路匹配到 `C:\\` 并把会话上下文切到盘符根 —— 实测就是这么错的。
+
+    所以这里的判据是「标记必须**直接**位于本目录之下」（`*_Data` 深度 0，
+    UE 的 `Engine` / `*/Content/Paks` 同样只认直接子级）。
+    """
+    gd = Path(game_dir)
+    if not gd.is_dir():
+        return False
+
+    # Unity：本目录下直接有 <X>_Data，且带 IL2CPP 元数据或 Managed 程序集
+    for data_dir in _direct_data_dirs(gd):
+        try:
+            if (data_dir / _IL2CPP_META_REL).is_file():
+                return True
+            if (data_dir / _MONO_MANAGED).is_dir():
+                return True
+        except OSError:
+            continue
+
+    # UE：本目录下直接有 Engine/，或有 <项目>/Content/Paks/*.pak /
+    #     <项目>/Binaries/Win64/*-Win64-Shipping.exe
+    try:
+        if (gd / "Engine").is_dir():
+            return True
+        for pattern in ("*/Content/Paks/*.pak",
+                        "*/Binaries/Win64/*-Win64-Shipping.exe"):
+            if next(iter(gd.glob(pattern)), None) is not None:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def game_root_for_exe(exe: str | Path) -> str:
+    """从一个可执行文件**反推**它所属的游戏安装目录；推不出来返回空串。
+
+    为什么需要它：`launch_game(exe=...)` 允许指定任意 exe，而会话里还带着
+    「当前游戏是谁」这份身份（`game_dir` / `engine` / `metadata_path`）以及
+    由它建立的索引。两者若指向**不同游戏**，索引与运行时就会错配 ——
+    实测表现是 `runtime_info` 的 `image_count` 与 `static_image_count`
+    对不上（143 vs 140），而工具本身当时不会报任何错。
+
+    判据：从 exe 所在目录逐层向上，取**第一个** `is_game_root` 为真的祖先目录。
+    取「第一个」而不是「最外层」—— 越靠近 exe 的边界越具体，越往上越可能
+    撞上装着多款游戏的父目录。
+
+    推不出来时返回空串，**不猜**：调用方据此如实说明，而不是硬指一个目录。
+    """
+    p = Path(exe)
+    if not p.is_file():
+        return ""
+    cur = p.parent
+    for _ in range(GAME_ROOT_MAX_UP):
+        try:
+            if is_game_root(cur):
+                return str(cur)
+        except OSError:
+            return ""
+        parent = cur.parent
+        # 到盘符根 / 文件系统根就停：再往上没有「游戏目录」这回事了
+        if parent == cur:
+            break
+        cur = parent
+    return ""
+
+
 def describe_game(game_dir: str | Path) -> dict:
     """给出游戏目录的完整探测报告。"""
     game_dir = Path(game_dir)

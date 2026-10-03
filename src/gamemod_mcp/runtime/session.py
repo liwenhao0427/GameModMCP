@@ -587,18 +587,47 @@ class RuntimeSession:
 
         模仿 AiMod 的 /v1/events?after= 增量语义：取走即消费，
         调用方保存 last_seq 就能做增量拉取。
+
+        `kind` 过滤的是**整条队列**，不是只看队首 —— 理由见下面的注释。
         """
         out: list[dict] = []
-        while len(out) < limit:
-            try:
-                ev = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if kind and ev.get("type") != kind:
-                # 不匹配的放回去（保持顺序）
+        if not kind:
+            while len(out) < limit:
+                try:
+                    out.append(self._events.get_nowait())
+                except queue.Empty:
+                    break
+        else:
+            # 必须把当前队列**整个取空**再筛，不能「看到队首不匹配就停」。
+            #
+            # 修复前的写法是：
+            #     if kind and ev.get("type") != kind:
+            #         self._push_event(ev)
+            #         break
+            # 于是过滤**只看队首那一条**：队首类型不是要的那种时，
+            # 后面即使排着一堆匹配事件也一条都取不到。实测在真实游戏上
+            # `drain_events(kind="hook")` 返回 0 条而 `pending_approx` 有 196，
+            # 去掉过滤立刻能取到 `type:"hook"` 的事件 —— 诱因是注入后队首
+            # 恒有一条 `notice`(probe_ready)，正好把整条队列挡住。
+            # 这是「静默返回空」，比报错更糟：调用方会以为期间没有任何
+            # Hook 触发，从而去排查 Hook 落点（而落点是对的）。
+            pending: list[dict] = []
+            while True:
+                try:
+                    pending.append(self._events.get_nowait())
+                except queue.Empty:
+                    break
+            kept: list[dict] = []
+            for ev in pending:
+                if ev.get("type") == kind and len(out) < limit:
+                    out.append(ev)
+                else:
+                    kept.append(ev)
+            # 未取走的事件按**原相对顺序**放回，队列语义（含满时丢最旧）
+            # 因此完全不变。超出 limit 的匹配事件同样留在队列里，
+            # 下次还能取到 —— 与无 kind 时的行为一致，不偷偷丢数据。
+            for ev in kept:
                 self._push_event(ev)
-                break
-            out.append(ev)
 
         # 统计剩余量（queue.qsize 只是近似，仅用于展示）
         return {

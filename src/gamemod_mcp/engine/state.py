@@ -563,6 +563,175 @@ def _with_settled_assemblies(sess, engine: str | None, init: dict) -> dict:
     return {**init, "assemblies": settled}
 
 
+def _is_under(path: str, root: str) -> bool:
+    """`path` 是否落在 `root` 目录下（含 root 自身，容错大小写）。"""
+    if not path or not root:
+        return False
+    try:
+        a = os.path.normcase(os.path.abspath(path))
+        b = os.path.normcase(os.path.abspath(root))
+    except Exception:
+        return False
+    return a == b or a.startswith(b + os.sep)
+
+
+def _build_index_for_context() -> dict:
+    """按当前会话的引擎决定要不要建索引；永不抛，失败如实回报。
+
+    刻意**不把索引失败当成整体失败**：调用方要的是「启动 / 注入这个进程」，
+    索引只是一个附加的一致性收益（没有它，`search_*` 用不了但进程照跑）。
+    但也不能假装成功 —— 失败原因原样放进返回值。
+    """
+    out: dict[str, Any] = {}
+    engine = (_state.engine or "").lower()
+    if engine not in ("il2cpp", "mono"):
+        # UE / 未知引擎没有集中元数据可索引（open_game 也是这么处理的）
+        out["index_skipped"] = (
+            f"{_state.engine or '未知'} 引擎没有集中元数据，不建索引")
+        return out
+    try:
+        res = ensure_index()
+    except Exception as exc:            # noqa: BLE001 - 索引失败不该影响启动
+        out["index_built"] = False
+        out["index_error"] = f"建索引时异常：{exc}"
+        return out
+    if res.get("ok"):
+        out["index_built"] = True
+    else:
+        out["index_built"] = False
+        out["index_error"] = res.get("error", "建索引失败")
+    return out
+
+
+def align_context_with_exe(exe: str, build_index: bool = True) -> dict:
+    """把会话上下文（游戏身份 + 索引）对齐到 `exe` 所属的游戏。
+
+    为什么需要它（实测缺陷，不是推测）
+    --------------------------------------------------
+    `launch_game(exe=...)` / `inject_process(pid=...)` 允许指定**任意**目标，
+    而会话里还带着「当前游戏是谁」（`game_dir` / `engine` / `metadata_path`）
+    以及由它建立的索引。两者指向不同游戏时，工具不会报任何错，
+    但索引与运行时已经错配 —— 实测表现是 `runtime_info` 报
+
+        image_count=143, static_image_count=140, image_count_matches=false
+
+    （运行时是刚启动的 ved，静态索引还是上一个会话的 Pass The Fear）。
+    更危险的是落点：拿 A 游戏的静态 token 去对 B 游戏的运行时地址，
+    对账必然失败，或更糟 —— 撞巧对上同一个 token 而挂错函数。
+    按 AGENTS.md「不许假成功」，这种静默错配必须在源头消除。
+
+    **不碰运行时**（重要）
+    --------------------------------------------------
+    本函数只调整「身份 + 索引」，绝不关闭当前 RuntimeSession：
+
+      · 调用方（`ensure_runtime`）此刻持有的运行时，要么是刚连上/刚 spawn 出来的
+        新会话（关掉就等于白注入），要么是它按「先连新的、再断旧的」语义
+        自己负责关闭的旧会话。两条路径的所有权都在调用方，不在这里。
+      · `select_game` 内部会调 `close_runtime()`，所以调用它之前必须把
+        `_state.runtime` 摘下来，切换完再原样放回去。
+
+    规则
+    --------------------------------------------------
+    · 能从 exe 反推出游戏目录、且与当前会话是同一个游戏 → 身份不动，
+      仅在缺索引时补建（例如会话刚 open_game 过一个没有索引的 UE 游戏）。
+    · 反推出来是**另一个游戏** → 切换身份并重建索引；返回 `switched=True`
+      + `previous_game_dir`，调用方必须把这件事报给用户，不能偷偷换。
+    · 反推不出来（exe 不在受支持的游戏目录里、或拿不到路径）→ **不猜**，
+      `identified=False`，由调用方如实说明上下文可能不匹配。
+
+    Args:
+        exe:         目标可执行文件路径。
+        build_index: 切换后是否建索引。默认 True（让会话自洽）。
+
+    Returns:
+        {ok, identified, switched, game_dir, engine, ...}
+        `ok=False` 只在「确实要切换、但切换本身失败」时出现。
+    """
+    with _state.lock:
+        try:
+            root = discovery.game_root_for_exe(exe)
+        except Exception as exc:        # noqa: BLE001 - 反推失败不该中断注入
+            return {"ok": True, "identified": False, "switched": False,
+                    "reason": f"从 exe 反推游戏目录失败：{exc}"}
+
+        if not root:
+            return {"ok": True, "identified": False, "switched": False,
+                    "reason": "这个 exe 不在任何可识别的游戏目录里"}
+
+        if _same_path(root, _state.game_dir):
+            # 同一个游戏：身份不动，避免把已选好的会话推倒重来
+            out: dict[str, Any] = {"ok": True, "identified": True,
+                                   "switched": False, "same_game": True,
+                                   "game_dir": _state.game_dir,
+                                   "engine": _state.engine}
+            if build_index and not _state.has_index():
+                out.update(_build_index_for_context())
+            return out
+
+        previous = _state.game_dir
+        # 摘掉运行时再 select_game：否则它会把「调用方正要用的那个会话」关掉。
+        # （这是本函数唯一需要小心的地方，故在 docstring 里也写了一遍。）
+        held_runtime = _state.runtime
+        _state.runtime = None
+        try:
+            sel = select_game(game_dir=root)
+        finally:
+            _state.runtime = held_runtime
+
+        if not sel.get("ok"):
+            return {"ok": False, "identified": True, "switched": False,
+                    "error": sel.get("error", f"切换到 {root} 失败")}
+
+        # 用**实际**身份变化判断是否真的换了游戏：万一两个目录指向同一份
+        # 元数据，select_game 会走「复用」分支而不改动身份。
+        switched = not _same_path(_state.game_dir, previous)
+        out = {"ok": True, "identified": True, "switched": switched,
+               "previous_game_dir": previous,
+               "game_dir": _state.game_dir, "engine": _state.engine}
+        if build_index:
+            out.update(_build_index_for_context())
+        return out
+
+
+def context_warning(exe: str, align: dict | None) -> str:
+    """上下文可能不匹配时给出的一句人话说明；没问题时返回空串。
+
+    只在「反推不出游戏目录」**且** exe 确实不在当前会话的游戏目录下时报警 ——
+    否则会给正常的同游戏调用刷出无意义的警告。
+    """
+    if not align or align.get("identified"):
+        return ""
+    if not _state.game_dir or _is_under(exe, _state.game_dir):
+        return ""
+    return ("无法从这个 exe 反推出它属于哪个游戏，会话上下文"
+            f"（{_state.game_dir}）可能与被注入的进程不是同一个游戏 —— "
+            "索引与运行时的对账结果可能无意义。"
+            "要更换上下文请显式调用 open_game。")
+
+
+def _align_and_note(exe: str) -> dict:
+    """对齐上下文并留痕（spawn / attach 两条路径共用）。
+
+    抽出来的理由与 `_with_settled_assemblies` 相同：两条路径都要做同一件事，
+    漏掉任何一条，那条路径上就会重现「索引与运行时错配」的缺陷。
+
+    另外把「上下文可能不匹配」的提示一并算好放进 `context_warning`，
+    免得每个调用点各自判断一遍（判断需要 exe，而 exe 只有这里最清楚）。
+    """
+    align = align_context_with_exe(exe)
+    if align.get("switched"):
+        _state.note(
+            f"会话上下文已跟随目标切换：{align.get('previous_game_dir') or '(空)'} "
+            f"→ {align.get('game_dir')}（引擎 {align.get('engine')}）")
+    elif align.get("index_built"):
+        _state.note(f"已按目标补齐索引（引擎 {_state.engine}）")
+    text = context_warning(exe, align)
+    if text:
+        align = {**align, "context_warning": text}
+        _state.note("警告：无法确认被注入的进程属于当前会话的游戏")
+    return align
+
+
 def ensure_runtime(
     pid: int = 0,
     auto_find: bool = True,
@@ -649,6 +818,15 @@ def ensure_runtime(
                 return {"ok": False, "error": str(exc)}
             _state.runtime = sess
             _state.note(f"已启动并注入 {Path(launcher_exe).name} (pid={sess.pid})")
+            # spawn 的是**参数指定的 exe**，未必是会话当前选中的那个游戏。
+            # 必须在这一步把上下文对齐过去，否则索引（旧游戏）与运行时（新游戏）
+            # 会静默错配 —— 详见 align_context_with_exe。
+            # 放在 wait_ready **之前**：就绪预算按引擎给，引擎得先是对的。
+            align = _align_and_note(launcher_exe)
+            if not align.get("ok"):
+                # 切换失败：进程已经起来了，如实报告并把会话状态一并带出。
+                return {"ok": False, "error": align.get("error", "会话上下文切换失败"),
+                        "align": align, **_state.summary()}
             init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                    preferred_module=preferred_module)
             if not init.get("ok"):
@@ -660,12 +838,13 @@ def ensure_runtime(
                     "ok": True,
                     "warning": f"进程已启动并注入，但 {label} 运行时未就绪",
                     "init": init,
+                    "align": align,
                     **_state.summary(),
                 }
             # 「注入成功」不等于「可以 Hook 托管方法」：Mono 的程序集是懒加载的，
             # 此时去 Hook/调用会把游戏打崩（实测见 _settle_assemblies）。
             init = _with_settled_assemblies(sess, _state.engine, init)
-            return {"ok": True, "init": init, **_state.summary()}
+            return {"ok": True, "init": init, "align": align, **_state.summary()}
 
         # 找 pid
         target_pid = pid
@@ -702,6 +881,15 @@ def ensure_runtime(
             info = discovery.process_identity(target_pid)
             proc_name = info.get("name", "")
 
+        # 目标进程的可执行文件路径：既用于给会话一个像样的名字，
+        # 也用于把会话上下文对齐到它所属的游戏（见下方 _align_and_note）。
+        # 顺带订正：这里以前读的是 `info.get("name")`，而 `process_identity`
+        # 返回的键是 `path` —— 于是 `proc_name` 恒为空串，会话摘要里
+        # 一直显示成「已注入 pid=17920 ()」。同一份数据换个键就读对了。
+        target_exe = discovery.process_exe_path(target_pid)
+        if target_exe:
+            proc_name = Path(target_exe).name
+
         try:
             sess = attach(target_pid, name=proc_name,
                           preferred_module=preferred_module, init=False)
@@ -728,6 +916,16 @@ def ensure_runtime(
 
         _state.runtime = sess
         _state.note(f"已注入 pid={target_pid} ({proc_name})")
+        # 注入的目标未必是会话当前选中的那个游戏（显式 pid / 自动匹配都可能是
+        # 另一个游戏）。必须把上下文对齐过去，否则索引与运行时会静默错配。
+        # 放在 wait_ready **之前**：就绪预算按引擎给，引擎得先是对的。
+        align = _align_and_note(target_exe) if target_exe else {
+            "ok": True, "identified": False, "switched": False,
+            "reason": "拿不到该进程的映像路径，无法反推游戏目录"}
+        if not align.get("ok"):
+            return {"ok": False, "pid": target_pid,
+                    "error": align.get("error", "会话上下文切换失败"),
+                    "align": align, **_state.summary()}
         # 进程已经在跑，模块本该就在；预算仍按引擎给
         init = sess.wait_ready(timeout=ready_timeout_for(_state.engine),
                                preferred_module=preferred_module)
@@ -740,12 +938,13 @@ def ensure_runtime(
                 "warning": f"已注入，但 {label} 运行时未就绪"
                            "（非 Unity 托管游戏属正常）",
                 "init": init,
+                "align": align,
                 **_state.summary(),
             }
         # 与 spawn 路径同理：进程已经在跑时程序集通常已经稳定，
         # 但「注入一个刚起来的 Mono 游戏」同样会碰到懒加载，所以一并等。
         init = _with_settled_assemblies(sess, _state.engine, init)
-        return {"ok": True, "pid": target_pid, "init": init,
+        return {"ok": True, "pid": target_pid, "init": init, "align": align,
                 **_state.summary()}
 
 

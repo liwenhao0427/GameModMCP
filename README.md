@@ -182,15 +182,15 @@ Agent 会自动：
 ### 运行时层（需要注入游戏）
 | 工具 | 作用 |
 |---|---|
-| `inject_process` | 注入已在运行的进程 |
-| `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**；同名进程已在跑时直接拒绝，避免白等 60 秒） |
-| `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检 |
+| `inject_process` | 注入已在运行的进程。目标换了游戏时会**把会话身份与索引一起换过去**，并在返回里给 `context_switched` |
+| `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**；同名进程已在跑时直接拒绝，避免白等 60 秒）。`exe` 指向另一个游戏时会自动切换会话上下文（建新索引），返回里给 `context_switched` 说明换了哪个 |
+| `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检（`image_count_matches`） |
 | `runtime_class_info` | **真实字段偏移**与**方法真实地址**。嵌套类型请传完整嵌套名（`search_classes` 的 `nested_name`）；短名命中多个时拒绝并给 `candidates` |
 | `find_hook_target` | 定位 Hook 落点并比对 token（同样支持完整嵌套名，歧义时拒绝） |
 | `hook_method` | 按类名+方法名装 Hook（用 `token` 指定重载；多候选未指定则拒绝） |
 | `hook_address` | 按绝对地址装 Hook |
 | `unhook` / `hook_status` | 卸载与查看 Hook（`unhook` 不带参数即卸载全部） |
-| `drain_events` | 取走捕获到的调用事件 |
+| `drain_events` | 取走捕获到的调用事件。`kind` 过滤作用于**整条队列**（不是只看队首）；不匹配的事件会原序留在队列里，不会被吞 |
 | `read_memory` / `write_memory` | 读写内存 |
 | `read_field_value` | 按字段偏移读值 |
 | `scan_pattern` | AOB 特征码扫描（兜底手段） |
@@ -357,8 +357,8 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 41 个可复现的验证脚本，
-每个都对着**真实游戏**和**地面真值**跑（其中 40 个进自动套件，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 43 个可复现的验证脚本，
+每个都对着**真实游戏**和**地面真值**跑（其中 42 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
 | 脚本 | 验证内容 |
@@ -369,6 +369,8 @@ GameModMCP/
 | `verify_lazy_handles.py` | 结果句柄惰性物化：用**解析条数**断言证明翻页只解析一页 |
 | `verify_handle_scope.py` | 结果句柄的**作用域**：跨游戏/重开索引的旧句柄必须被拒绝，不许读到另一个结果集 |
 | `verify_session_switch.py` | **会话身份**：切换游戏时上一个游戏的 `exe` 不许留下来（纯函数注入 + 真实 Mono→IL2CPP→UE 切换 + 进程级 stdio，含非空转反证） |
+| `verify_context_follow.py` | **上下文跟随目标**：`launch_game(exe=…)` / `inject_process(pid=…)` 换了游戏时必须把会话身份与索引一起换过去（否则 `image_count_matches=false`，静态 token 与运行时地址属于两个游戏）；反推不出游戏目录时不许硬猜、不许把上下文指到盘符根（`C:\` 曾被误判为 Mono 游戏）；对齐过程不许关掉刚注入的运行时。含非空转反证 |
+| `verify_drain_kind_filter.py` | **`drain_events(kind=…)` 的过滤作用于整条队列**，不是只看队首（旧写法遇到队首那条 `notice`(probe_ready) 就 `break`，实测在真游戏上返回 0 条而待取 201 条 —— 调用方会误判成「Hook 没触发」而去排查落点）。含不匹配事件不许被吞、超 `limit` 不许丢、顺序不变、`kind=""` 行为不变，以及把旧写法搬回来的反证 |
 | `verify_mcp_discovery.py` | **目录布局判定**：容器目录（装着多款游戏的父目录）不许被当成某一个游戏、UE 不许被送去建索引、不支持的引擎要给出家族提示（真实样本 + 合成布局 + 进程级 stdio，含非空转反证） |
 | `verify_subtype.py` | 继承过滤反过来查：**与旧的逐条判定逐条相等** + 邻接表只建一次 |
 | `verify_fieldtypes.py` | 字段类型解析率与**精度**（对 27,264 条 dump 真值） |

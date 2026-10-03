@@ -187,6 +187,21 @@ launch_game(exe="D:\\...\\Game.exe")          # 还没启动（能抢在初始�
 `launch_game` 更强：能在对象被创建**之前**装好 Hook，适合拦截只执行一次的初始化逻辑。
 但它需要等游戏加载 DLL，返回里的 `init.waited` 会告诉你等了多久。
 
+**会话上下文会自动跟随目标**（`launch_game(exe=...)` 与 `inject_process(pid=...)`
+都一样）：目标属于**另一个游戏**时，会话身份（`game_dir` / `engine` /
+`metadata_path`）与静态索引会一起切过去，返回里给 `context_switched` 说明换了哪个。
+这一步是必须的 —— 否则 `search_classes` 查的是 A 游戏、`runtime_class_info`
+拿的是 B 游戏的地址，而 **token 对账这把"尺子"本身就是错的**。
+实测过：会话停在 Pass The Fear（索引 140 个 image），`launch_game` 起 ved 之后
+`runtime_info` 报 `image_count=143 / static_image_count=140 /
+image_count_matches=false`，而全程每个工具都是 `ok: true`，一个错都不报。
+
+所以看到 `context_switched` 时**别当成噪音**：它意味着你之前的静态查询结果
+已经不能用了，要重新用 `search_classes` / `class_detail` 定位。
+反推不出 exe 属于哪个游戏时（比如它不在游戏目录里）工具**不猜**，
+改用 `context_warning` 提示 —— 这时 `runtime_info` 的一致性自检结果**不可信**，
+要么显式 `open_game` 换上下文，要么别把静态与运行时的结果对着看。
+
 **同名进程已经在跑时它会直接拒绝**（`ok:false` + `running_pid` + `hint`）：
 Unity 游戏普遍带单实例锁，第二个进程**不会**加载 `GameAssembly.dll`，
 继续启动只会白等 60 秒再报「IL2CPP 运行时未就绪」—— 那个报错会把你带向
@@ -504,6 +519,16 @@ for _ in range(10):
     ev = drain_events(limit=500)
     total += len([e for e in ev["events"] if e["phase"] == "enter"])
 ```
+
+**`kind` 过滤的是整条队列**，不是只看队首。这条值得记住，因为它曾经坏过：
+注入后队列里恒有一条 `notice`（`probe_ready`），旧实现一见队首不是要的类型就
+`break`，于是 `drain_events(kind="hook")` 返回 **0 条**（而实际待取 201 条），
+调用方会误判成"Hook 没触发"、跑去改 token 换方法 —— 而落点完全正确。
+
+所以：**`drain_events(kind=...)` 返回空，不等于没有该类型事件。**
+返回里的 `pending_approx` 若明显大于 0，就说明队列里还有东西；
+不放心时用不带 `kind` 的 `drain_events()` 看一眼实际类型（`hook` /
+`notice` / `log` / `script_error`），再决定过滤条件。
 
 ### 高频方法会刷爆事件队列
 
