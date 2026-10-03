@@ -42,6 +42,13 @@ htmlcov/
 # 教训：本轮曾留下 11 个 _probe_*.py 待提交，靠人工记得删是不可靠的。
 devtools/_probe_*.py
 
+# ---- 归档侦察脚本的运行产物 ----
+# archive/probes/ 下的脚本自己会写 .log / .jsonl（逐轮结果落盘），
+# 路径就是脚本旁边（`Path(__file__).with_suffix(".log")`）。
+# 它们每次运行都在变、体积会涨，与「脚本可复现」无关，不入库。
+devtools/archive/probes/*.log
+devtools/archive/probes/*.jsonl
+
 # ---- 编辑器 / 操作系统杂项 ----
 .vscode/
 .idea/

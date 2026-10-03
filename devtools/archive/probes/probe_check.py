@@ -23,7 +23,18 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# 仓库根**自寻**：向上找含 src/gamemod_mcp/server.py 的那一层。
+# 不写死 .parent 的层数 —— 这些脚本曾被从 devtools/ 挪进 devtools/archive/probes/，
+# 当时写死的 parent.parent 就指到了 devtools/archive，SERVER 变成不存在的路径，
+# 每个脚本都在 tools/list 崩在 OSError: [Errno 22]，看起来却像「MCP 服务器起不来」。
+def _repo_root() -> Path:
+    for p in Path(__file__).resolve().parents:
+        if (p / "src" / "gamemod_mcp" / "server.py").is_file():
+            return p
+    raise SystemExit("找不到仓库根（没有 src/gamemod_mcp/server.py）")
+
+
+ROOT = _repo_root()
 sys.path.insert(0, str(ROOT / "devtools"))
 from mcp_stdio import McpStdioServer, script_form_env  # noqa: E402
 

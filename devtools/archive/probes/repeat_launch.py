@@ -21,7 +21,15 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# 仓库根**自寻**（理由见 runtime_matrix.py 的说明）：不写死 .parent 层数。
+def _repo_root() -> Path:
+    for p in Path(__file__).resolve().parents:
+        if (p / "src" / "gamemod_mcp" / "server.py").is_file():
+            return p
+    raise SystemExit("找不到仓库根（没有 src/gamemod_mcp/server.py）")
+
+
+ROOT = _repo_root()
 sys.path.insert(0, str(ROOT / "devtools"))
 from mcp_stdio import McpStdioServer, script_form_env  # noqa: E402
 

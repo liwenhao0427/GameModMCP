@@ -31,7 +31,15 @@ import threading
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# 仓库根**自寻**（理由见 runtime_matrix.py 的说明）：不写死 .parent 层数。
+def _repo_root() -> Path:
+    for p in Path(__file__).resolve().parents:
+        if (p / "src" / "gamemod_mcp" / "server.py").is_file():
+            return p
+    raise SystemExit("找不到仓库根（没有 src/gamemod_mcp/server.py）")
+
+
+ROOT = _repo_root()
 PY = r"C:\Users\temp\AppData\Local\Programs\Python\Python310\python.exe"
 SERVER = ROOT / "src" / "gamemod_mcp" / "server.py"
 GAME = r"E:\project\Pass The Fear"
