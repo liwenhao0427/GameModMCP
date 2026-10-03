@@ -789,6 +789,12 @@ def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
         out["runtime"] = rt
         if not rt.get("ok"):
             failures.append(str(rt.get("error") or "运行时会话关闭失败"))
+        if rt.get("wedged"):
+            # 探针卡死：**没**恢复原状（Hook 可能还在游戏里），但会话已释放。
+            # 这两件事必须分开说 —— 早先只把 `restored: False` 放进 runtime
+            # 子对象，顶层却照旧 `restored: True`，自相矛盾（实测发现）。
+            out["wedged"] = True
+            out["session_released"] = bool(rt.get("session_released"))
     if close_index:
         ix = st.close_index()
         out["index"] = ix

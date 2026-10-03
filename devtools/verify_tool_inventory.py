@@ -103,6 +103,10 @@ NON_TOOL_IDENTIFIERS = {
     # close_session 返回的 steps 字段（表明探针线程已从引擎域摘除），
     # 是返回字段不是工具
     "domain_released",
+    # close_session 在探针卡死时返回的两个字段：
+    # `wedged` = 探针已卡死；`session_released` = 会话对象已作废（可以重新注入），
+    # 与 `restored`（游戏是否已恢复原状）是**两件事**。都是返回字段不是工具。
+    "wedged", "session_released",
     # 类名没解析出来时返回的「已搜过几个程序集」，是返回字段不是工具
     "searched_images",
     # decompile 返回的「实际反编译出来的类型名」（嵌套类型会退让到最外层，

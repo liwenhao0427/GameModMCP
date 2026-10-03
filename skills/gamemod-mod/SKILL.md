@@ -631,7 +631,7 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 | `open_game` 报「这个目录本身不是游戏，它下面的 X 是」 | 游戏外面套了一层目录 | 把 `game_dir` 指到返回里 `game_root` 的路径 |
 | `close_session` 报 `ok:true` 后**游戏在一两分钟内自己崩了** | 探针线程没从 IL2CPP 域摘除（**已在 1.0.0+ 修复**，见下方） | 见下方「收尾后游戏崩溃」 |
 | 工具调用**长时间不返回**，且期间**任何**工具都不回话 | 探针卡在 IL2CPP/Mono 内部（旧版本会永久挂住；**1.0.0+ 有 30 秒超时**） | 等它超时后看 `wedged`；游戏通常已 `Fatal error in GC`，`taskkill` 后重新注入。见下方「工具调用卡住」 |
-| `close_session` 返回 `restored:false` + `wedged:true` | 探针已卡死，卸载/摘域这些同步收尾步骤**同样会挂住**，所以被跳过 | 这不是「收尾失败要重试」：先结束游戏进程，再重新注入 |
+| `close_session` 返回 `restored:false` + `wedged:true` | 探针已卡死，卸载/摘域这些同步收尾步骤**同样会挂住**，所以被跳过 | 这不是「收尾失败要重试」：先结束游戏进程，再重新注入。注意 `session_released:true` 只表示可以重新注入，**不**表示游戏已恢复原状 |
 | 某个慢查询在跑时，另一个工具也超时 | 旧版本会把事件循环占死（**1.0.0+ 已修**：同步工具 offload 到线程） | 升级到 1.0.0+；仍出现请报告 |
 
 ### 收尾后游戏崩溃（`frida-agent.dll_unloaded`）——已修复
@@ -693,8 +693,11 @@ IL2CPP 为此在线程本地存了一份该线程的 `Il2CppThread` 记录。
   后续调用**立刻**失败（不再各等 30 秒）。`wait_ready` 也会提前退出，
   不吃满预算。
 - 卡死时 `close_session` **有界返回**：它跳过「卸载 Hook / 摘域 / 卸载脚本」
-  这些**同样会挂住**的同步收尾步骤，如实返回 `restored: false` +
-  `wedged: true` + `warning`，并告诉你出路是**结束游戏进程后重新注入**。
+  这些**同样会挂住**的同步收尾步骤，并如实返回
+  `ok:false` + `restored:false` + `wedged:true` + `session_released:true` +
+  `warning`。两个字段含义**不同**，别混：
+  `session_released` = 会话对象已作废、可以重新注入；
+  `restored` = 游戏是否已恢复原状 —— 卡死时是 `false`（Hook 可能还留在进程里）。
   **不要**把 `restored:false` 当成「收尾失败要重试」——
   卡死时重试同样会挂住，先 `taskkill` 掉游戏。
 - 慢工具不再阻塞其它工具：一个工具在跑时，`get_session` 之类的调用照常秒回。

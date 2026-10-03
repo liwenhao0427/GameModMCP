@@ -225,13 +225,41 @@ def part_rpc_timeout() -> None:
     dt4 = time.time() - t3
     check("卡死时 close() 有界返回（不挂住收尾）",
           dt4 < 5.0, f"耗时 {dt4:.2f}s")
-    check("卡死时的 close() 如实标注 restored=False（不假成功）",
-          cl.get("restored") is False and cl.get("wedged") is True,
-          f"restored={cl.get('restored')} wedged={cl.get('wedged')}")
+    check("卡死时的 close() **不报 ok:True**（没恢复原状就不许说成功）",
+          cl.get("ok") is False, f"ok={cl.get('ok')}")
+    check("卡死时的 close() 如实标注 restored=False",
+          cl.get("restored") is False, f"restored={cl.get('restored')}")
+    check("卡死时的 close() 区分「会话已释放」与「已恢复原状」",
+          cl.get("session_released") is True and cl.get("restored") is False,
+          f"session_released={cl.get('session_released')} "
+          f"restored={cl.get('restored')}")
     check("卡死时的 close() 给出了可执行的出路（结束游戏进程）",
           "taskkill" in str(cl.get("warning", ""))
           or "重启" in str(cl.get("warning", "")),
           str(cl.get("warning", ""))[:70])
+
+    # 顶层 close_session 必须与子对象一致（曾经顶层 restored:true
+    # 而 runtime.restored:false，自相矛盾 —— 实测发现并修掉）
+    import gamemod_mcp.server as S
+    from gamemod_mcp.engine import state as _state_mod
+    _st = _state_mod.state()
+    _st.runtime = rs2          # 直接塞一个已卡死的会话
+    rs2._alive = True          # 让 close() 真的走卡死分支
+    top = S.close_session(close_runtime=True, close_index=False)
+    check("顶层 close_session 在探针卡死时报 ok:False（与子对象一致）",
+          top.get("ok") is False, f"ok={top.get('ok')}")
+    check("顶层 restored 与 runtime.restored 一致（不许自相矛盾）",
+          top.get("restored") is False
+          and (top.get("runtime") or {}).get("restored") is False,
+          f"顶层={top.get('restored')} "
+          f"子={((top.get('runtime') or {}).get('restored'))}")
+    check("顶层如实带出 wedged / session_released",
+          top.get("wedged") is True
+          and top.get("session_released") is True,
+          f"wedged={top.get('wedged')} "
+          f"session_released={top.get('session_released')}")
+    check("卡死收尾之后会话引用已释放（可以重新注入）",
+          _st.runtime is None)
 
     # ---- 非空转反证：把超时去掉（改回旧的直接调用），必须挂住 ----
     rs3 = sess_mod.RuntimeSession(999997, FakeSession(), FakeScript(),

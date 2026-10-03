@@ -831,18 +831,36 @@ class RuntimeSession:
             with _sessions_lock:
                 if _sessions.get(self.pid) is self:
                     del _sessions[self.pid]
+            # **ok 必须是 False**：本工具的语义是「游戏已恢复原状」，
+            # 而卡死时我们**没能**卸载 Hook / 摘域 —— 游戏进程里可能仍留着
+            # 探针与 Hook。报 ok:True 就是 AGENTS.md 禁止的假成功
+            # （`close_session` 的 docstring 专门写了这一条）。
+            #
+            # 但 `session_released` 是 True：这个会话对象确实已经作废、
+            # 登记也已摘掉，调用方**可以重新注入**。两件事必须分开表达 ——
+            # 早先这里只给了 `restored: False` 却把 `ok` 留成 True，
+            # 结果 `close_session` 顶层报出 `restored: true`，
+            # 与子对象里的 `restored: false` 自相矛盾（实测发现）。
             return {
-                "ok": True,
+                "ok": False,
                 "pid": self.pid,
                 "hooks_removed": 0,
                 "restored": False,
+                #: 会话对象已作废且已注销 —— 调用方可以重新注入，
+                #: 但这**不等于**游戏已恢复原状。
+                "session_released": True,
                 "wedged": True,
                 "steps": steps,
+                "error": (
+                    f"探针已卡死（{self._wedged_reason}），无法卸载 Hook / "
+                    "摘除引擎域 —— 游戏**可能未被恢复原状**。"
+                ),
                 "warning": (
                     f"探针已卡死（{self._wedged_reason}），无法执行卸载 Hook / "
                     "摘除引擎域 / 卸载脚本这些同步收尾步骤 —— 它们同样会挂住。"
-                    "已断开本会话的登记，但**游戏进程内可能仍留有探针与 Hook**，"
-                    "请直接结束该游戏进程（taskkill / 重启游戏）后再重新注入。"
+                    "已断开本会话的登记（可以重新注入），但**游戏进程内可能仍留有"
+                    "探针与 Hook**，请直接结束该游戏进程（taskkill / 重启游戏）后"
+                    "再重新注入。"
                 ),
             }
         try:

@@ -108,6 +108,14 @@ class SessionState:
             return {"ok": False, "error": str(exc)}
         if res.get("ok"):
             self.runtime = None
+        elif res.get("session_released"):
+            # 探针卡死：`close()` 如实报 ok:False（游戏**没**恢复原状），
+            # 但那个会话对象已经作废、登记也摘掉了 —— 留着引用只会让
+            # `has_runtime()` 继续报 True，而后续每个 runtime_* 都撞
+            # 「会话已失效」。所以这里按「会话已释放」摘掉引用，
+            # 同时**把失败原因带出去**（不能因为摘了引用就当成功）。
+            warn(f"运行时会话已释放但未恢复原状：{res.get('error')}")
+            self.runtime = None
         else:
             warn(f"运行时会话未完全关闭：{res.get('error')}")
         return res
