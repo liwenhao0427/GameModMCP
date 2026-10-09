@@ -511,21 +511,61 @@ hook_method(name="BodyPart", method="Visualize", param_count=1)
 >
 > 挂完**务必**核对返回里的 `chosen.token` 与静态查到的是否一致。
 
-### 配方 7：验收 Mod —— 点界面 + 看日志（弱视觉）
+### 配方 7：验收 Mod —— 等到可以判、再判、留证据
 
-Mod 改完之后要**自动验收**：点开界面、确认结果。这类活**不需要强视觉** ——
-大多数时候只要「屏幕上有没有这几个字」和「日志里有没有那一行」。
+Mod 改完之后要**自动验收**。验收的关键**不是**「看一眼截图」，而是三步：
+
+```
+等到可以判  →  判  →  留下可证伪的证据
+```
+
+**第一步：等 —— 游戏是异步的，不等就会得到大量假失败。**
 
 ```python
-# 1. 找「开始游戏」按钮 —— OCR 给文本与**屏幕绝对坐标**
-r = ocr(expected="开始游戏", match="contains")
-# → {ok, matched_count: 1,
-#    best_match: {text, box, center, click_point},
-#    click_point: [x, y],              ← 可直接用来点击（屏幕绝对坐标）
-#    coordinate_space: "screen_absolute"}
+wait_for(kind="ocr", target="开始游戏", region="0,600,1280,200",
+         timeout_ms=20000, interval_ms=500)
+# → {ok, verdict: "pass"|"fail"|"unverifiable",
+#    polls: 12, elapsed_ms: 6100,
+#    evidence: [{poll, matched_count, ...}, ...],   ← 每次轮询的实测值
+#    last: {...}}
+```
 
-# 2. 只搜一块区域更快更准（实测整屏 4.1s，ROI 几十 ms）
-r = ocr(region="0,600,1280,200", expected="开始游戏")
+五种条件，**优先用引擎信号，少用像素**：
+
+| `kind` | 判据 | 参数 |
+|---|---|---|
+| `field` | 某字段值 == `equals` | `name`/`field`/`equals` |
+| `instances` | 某类活实例数 ≥ `min_count` | `name` |
+| `log` | 日志出现匹配 `pattern` 的行 | `target`=日志路径，`pattern` |
+| `ocr` | 屏幕 OCR 到 `target` | `target`（可选 `region`/`window`） |
+| `window` | 出现标题含 `target` 的窗口 | `target` |
+
+**`verdict` 是三态，别当成布尔**：
+
+| 值 | 含义 | 该怎么办 |
+|---|---|---|
+| `pass` | 条件成立 | 继续 |
+| `fail` | **判了**，条件没成立（含超时） | 看 `evidence` 里每次的实测值；**不要**直接断定 Mod 无效 |
+| `unverifiable` | **没法判**（例如引擎侧不支持枚举实例） | 这是「尺子坏了」而不是「量出来是坏的」。换一条判据或换个时机，**别去修一个不存在的缺陷** |
+
+**第二步：判 —— 证据要能证伪。**
+
+```python
+# 用日志确认 Mod 真的生效（最可靠，且 probe_log 只读、可反复轮询）
+wait_for(kind="log", target=r"D:\Game\BepInEx\LogOutput.log",
+         pattern="ModPanel.*ready", timeout_ms=15000)
+
+# 或用引擎信号确认状态（比 OCR 稳，不受分辨率影响）
+wait_for(kind="field", name="UserData", field="gold", equals="9999")
+wait_for(kind="instances", name="ModPanel", min_count=1)
+```
+
+**第三步：留证据 —— 失败时必须能复盘。**
+
+```python
+# OCR 没匹配到就自动把当时的截图存下来（等价 MaaFramework 的 save_on_error）
+ocr(region="0,600,1280,200", expected="开始游戏",
+    save_on_failure=r"D:\evidence\start_button_missing.png")
 ```
 
 **三条铁律**（都是同类项目踩过的坑）：
@@ -536,7 +576,7 @@ r = ocr(region="0,600,1280,200", expected="开始游戏")
 | **`matched_count == 0` ≠ 不存在** | 那只是**本次没找到**：界面可能还没加载、或文字被 OCR 拆成多个框。别据此断定按钮没有 |
 | **坐标是屏幕绝对坐标** | 返回里 `coordinate_space: "screen_absolute"`。拿裁剪图坐标去点会**点偏**（MaaMCP 专门写进坑） |
 
-**用日志确认结果**（最可靠的验收通道）：
+**用日志确认结果**（最可靠的验收通道之一）：
 
 ```python
 probe_log(path=r"D:\Game\BepInEx\LogOutput.log", pattern="ModPanel|ERROR")
@@ -557,8 +597,8 @@ probe_log(path=r"D:\Game\BepInEx\LogOutput.log", pattern="ModPanel|ERROR")
 | 帧计数连续 N 帧不变 | 「画面稳定」的近似，不需要截图 |
 
 **点击怎么做**：本工具集**不提供点击工具**（那样会与 `ocr` 的定位职责重叠）。
-语义化点击属于「改逻辑」，走 `eval_script` + `ExecuteEvents` 配方
-（见下）；纯坐标点击请用系统级输入（`SendInput`），并注意它需要窗口在前台。
+语义化点击属于「改逻辑」，走配方 8 的 `eval_script` 路线；
+纯坐标点击请用系统级输入（`SendInput`），并注意它需要窗口在前台。
 
 ### 配方 8：语义化点击 UI（不靠屏幕坐标）
 

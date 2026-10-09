@@ -30,7 +30,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
                      drain_events / read_memory / write_memory /
                      read_field_value / set_field_value / scan_pattern /
                      eval_script / gc_control
-    6. 弱视觉/UI层: capture_screen / ocr / probe_log
+    6. 弱视觉/UI层: capture_screen / ocr / probe_log / wait_for
     7. UE 层       : detect_ue / ue_profile / ue_list_entries /
                      ue_script_objects / ue_manifest
     8. 诊断层      : get_diagnostics
@@ -83,6 +83,7 @@ import json
 import os
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -2659,6 +2660,245 @@ def _parse_region(region: str) -> Any:
     if vals[2] <= 0 or vals[3] <= 0:
         return _BAD_REGION
     return vals
+
+
+@mcp.tool(annotations=_ann("轮询等待一个条件成立（带证据）",
+                           read_only=False, open_world=True,
+                           destroy=False, idempotent=True))
+@_cap_response
+def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
+             name: str = "", namespace: str = "", image: str = "",
+             field: str = "", equals: str = "", pattern: str = "",
+             timeout_ms: int = 20000, interval_ms: int = 500,
+             min_count: int = 1) -> dict:
+    """**轮询等待**某个条件成立，返回证据。验收闭环里「等到可以判了」的那一步。
+
+    为什么必须有它：游戏是**异步**的 —— 点完按钮要等界面出来、场景加载要
+    等几秒。不等待就直接断言，会得到大量**假失败**（其实只是还没加载完）。
+    同类工具（MaaFramework）把它写成一句伪代码：
+    `while(!hit && !timeout) { 检查; sleep(rate_limit); }`。
+
+    支持的条件（`kind`）覆盖三类信号，**优先用引擎信号，少用像素**：
+
+    | kind | 判据 | 需要哪些参数 |
+    |---|---|---|
+    | `field` | 某字段的值等于 `equals` | `name`/`field`/`equals`（`instance` 不需要：会先用 `find_instances` 找） |
+    | `instances` | 某类的活实例数 ≥ `min_count` | `name`（可选 `namespace`/`image`） |
+    | `ocr` | 屏幕上 OCR 到 `target` 文本 | `target`（可选 `region`/`window`） |
+    | `log` | 日志里出现匹配 `pattern` 的行 | `pattern` |
+    | `window` | 出现标题含 `target` 的窗口 | `target` |
+
+    **返回值就是证据包**（不是光秃秃的布尔）：
+      · `ok` —— 条件成立了
+      · `verdict` —— `pass` / `fail` / `unverifiable` 三态。
+        `unverifiable` 表示「**没法判**」（例如依赖不可用、探针不上线），
+        与 `fail`（判了、没成立）严格区分 —— 把「没法判」说成「没通过」
+        会让 Agent 去修一个根本不存在的缺陷。
+      · `polls` / `elapsed_ms` / `interval_ms` —— 轮询了几次、花了多久
+      · `evidence` —— 每次轮询的实测值（最后若干次），可核查
+      · `hint` —— 超时时给出下一步建议
+
+    超时**如实报 `verdict=fail`**，不静默当成通过。
+
+    Args:
+        kind:        上面五种之一。
+        target:      `ocr` / `window` 的目标文本。
+        region:      `ocr` 用："x,y,w,h" 屏幕绝对坐标。
+        window:      `ocr` 用：窗口标题子串。
+        name/namespace/image: `field` / `instances` 的类定位参数。
+        field:       `field` 用：字段名。
+        equals:      `field` 用：期望值（按字段类型比较）。
+        pattern:     `log` 用：日志正则。**必须同时给 `path`**。
+        timeout_ms:  总超时（默认 20000）。
+        interval_ms: 轮询间隔（默认 500）。别设太小 —— 徒增开销。
+        min_count:   `instances` 用的实例数下限（默认 1）。
+
+    Returns:
+        {ok, verdict, kind, polls, elapsed_ms, evidence, last, hint?}
+    """
+    kinds = ("field", "instances", "ocr", "log", "window")
+    if kind not in kinds:
+        return _err(f"kind 只能是 {'/'.join(kinds)}，收到 {kind!r}")
+    timeout_ms = max(0, int(timeout_ms))
+    interval_ms = max(50, int(interval_ms))
+    deadline = time.time() + timeout_ms / 1000.0
+
+    # `log` 需要 path —— 复用 pattern 之外的 path 参数会与别的 kind 混淆，
+    # 所以约定用 target 传路径（target 在 log 分支里本就是空的）。
+    log_path = target if kind == "log" else ""
+
+    evidence: list[dict] = []
+    polls = 0
+    started = time.time()
+    last_err = ""
+    unverifiable_reason = ""
+
+    while True:
+        polls += 1
+        hit = False
+        detail: dict[str, Any] = {}
+
+        try:
+            if kind == "instances":
+                r = RAW_TOOLS["find_instances"](
+                    name=name, namespace=namespace, image=image, max_count=200)
+                if r.get("ok"):
+                    cnt = int(r.get("count") or 0)
+                    detail = {"count": cnt, "min_count": min_count}
+                    hit = cnt >= max(1, int(min_count))
+                elif r.get("unsupported"):
+                    # 「本时机不可用」不是「没成立」—— 继续等（可能只是
+                    # 程序集还没加载），但记下来，超时时如实说明
+                    unverifiable_reason = str(r.get("error", ""))[:200]
+                    detail = {"unsupported": True}
+                else:
+                    last_err = str(r.get("error", ""))[:200]
+
+            elif kind == "field":
+                fi = RAW_TOOLS["find_instances"](
+                    name=name, namespace=namespace, image=image, max_count=8)
+                if not fi.get("ok"):
+                    last_err = str(fi.get("error", ""))[:200]
+                    detail = {"instances_ok": False}
+                else:
+                    ptrs = [x.get("pointer") for x in (fi.get("instances") or [])]
+                    if not ptrs:
+                        detail = {"count": 0}
+                    else:
+                        rf = RAW_TOOLS["read_field_value"](
+                            instance=ptrs[0], name=name, field=field,
+                            namespace=namespace, image=image)
+                        if rf.get("ok"):
+                            got = _field_value_as_text(rf)
+                            detail = {"field": field, "actual": got,
+                                      "expected": equals}
+                            hit = _values_equal(got, equals, rf)
+                        else:
+                            last_err = str(rf.get("error", ""))[:200]
+                            detail = {"read_ok": False}
+
+            elif kind == "ocr":
+                o = RAW_TOOLS["ocr"](region=region, window=window,
+                                     expected=target, match="contains",
+                                     max_items=50)
+                if o.get("ok"):
+                    n = int(o.get("matched_count") or 0)
+                    detail = {"matched_count": n, "expected": target,
+                              "texts_seen": len(o.get("texts") or [])}
+                    hit = n > 0
+                else:
+                    last_err = str(o.get("error", ""))[:200]
+
+            elif kind == "log":
+                if not log_path:
+                    return _err("kind='log' 时请把日志路径放进 target")
+                lr = RAW_TOOLS["probe_log"](path=log_path, pattern=pattern,
+                                            max_lines=20)
+                if lr.get("ok"):
+                    n = int(lr.get("matched_count") or 0)
+                    detail = {"matched_count": n, "pattern": pattern}
+                    hit = n > 0
+                else:
+                    last_err = str(lr.get("error", ""))[:200]
+
+            elif kind == "window":
+                from .engine import screen as _screen
+                w = _screen.find_window_rect(target)
+                detail = {"window_found": bool(w.get("ok")),
+                          "title": w.get("title")}
+                hit = bool(w.get("ok"))
+                if not w.get("ok"):
+                    last_err = ""      # 「还没有这个窗口」是正常中间态
+        except Exception as exc:
+            last_err = str(exc)[:200]
+
+        evidence.append({"poll": polls, **detail})
+        if len(evidence) > 30:            # 只留最近若干条，别把返回撑爆
+            evidence = evidence[-30:]
+        if hit:
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(interval_ms / 1000.0)
+
+    elapsed = int((time.time() - started) * 1000)
+    out: dict[str, Any] = {
+        "ok": hit,
+        "verdict": "pass" if hit else ("unverifiable" if unverifiable_reason
+                                       else "fail"),
+        "kind": kind,
+        "polls": polls,
+        "elapsed_ms": elapsed,
+        "interval_ms": interval_ms,
+        "timeout_ms": timeout_ms,
+        "evidence": evidence,
+        "last": evidence[-1] if evidence else {},
+    }
+    if not hit:
+        out["error"] = (f"等待 {kind} 条件超时（{elapsed}ms / {polls} 次轮询）")
+        if last_err:
+            out["last_error"] = last_err
+        if unverifiable_reason:
+            out["unverifiable_reason"] = unverifiable_reason
+            out["hint"] = ("这个条件**没法判**，不是「没通过」："
+                           "引擎侧暂时不支持枚举实例。先确认游戏已进到"
+                           "目标场景，或改用其它 kind（如 ocr / log）。")
+        else:
+            out["hint"] = ("超时可能因为：界面还没加载完 / 条件本身没被满足。"
+                           "先看 evidence 里每次轮询的实测值再决定；"
+                           "**不要**据此断定 Mod 无效。")
+    return out
+
+
+def _field_value_as_text(rf: dict) -> str:
+    """把 `read_field_value` 的结果压成一个可比较的字符串。
+
+    按**实际读取宽度**取值，不给这个宽度下没意义的解释
+    （与 `read_field_value` 自己的口径一致）：4 字节字段绝不拼 8 字节。
+    """
+    w = int(rf.get("read_width") or 8)
+    if w == 1:
+        if "as_uint8" in rf:
+            return str(rf["as_uint8"])
+    elif w == 2:
+        if "as_uint16" in rf:
+            return str(rf["as_uint16"])
+    elif w == 4:
+        if "as_int32" in rf:
+            return str(rf["as_int32"])
+    else:
+        if "as_int64" in rf:
+            return str(rf["as_int64"])
+    raw = str(rf.get("raw_hex") or "")
+    return raw
+
+
+def _values_equal(actual: str, expected: str, rf: dict) -> bool:
+    """比较字段实际值与期望值。按类型做**语义**比较，不做字符串比较。
+
+    为什么不能只比字符串：`equals="9999"` 与实际的 `as_int32=9999`
+    字符串比较是相等的，但 `equals="0x270F"`（同一个数的十六进制）就
+    不会相等 —— 而调用方完全可能这么写。浮点也一样（`1.0` vs `1`）。
+    """
+    if actual is None or expected is None:
+        return False
+    a, e = str(actual).strip(), str(expected).strip()
+    if a == e:
+        return True
+    ftype = str(rf.get("field_type") or "")
+    # 整数族：两边都按整数解析（支持 0x 前缀）
+    if ftype and ("Int" in ftype or "Byte" in ftype or "Char" in ftype
+                  or "Boolean" in ftype):
+        try:
+            return int(a, 0) == int(e, 0)
+        except (ValueError, TypeError):
+            pass
+    if ftype in ("System.Single", "System.Double", "float", "double"):
+        try:
+            return abs(float(a) - float(e)) < 1e-6
+        except (ValueError, TypeError):
+            pass
+    return False
 
 
 # ================================================================

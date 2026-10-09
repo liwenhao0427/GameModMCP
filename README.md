@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，43 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，44 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -103,7 +103,7 @@ Agent 会自动：
 
 ---
 
-## 工具一览（43 个）
+## 工具一览（44 个）
 
 > 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐（**9 处**检查）：
 > 数量或名字对不上就会非零退出。改工具请同步这张表。
@@ -205,6 +205,7 @@ Agent 会自动：
 | `capture_screen` | 截屏/截窗口**存盘并返回路径**（不回 base64）。**截图是证据、不是判据**；窗口找不到会如实失败，不静默改截整屏 |
 | `ocr` | **OCR 识别文本并给屏幕绝对坐标**（可直接用于点击）。只对给定 ROI 做（实测整屏 4.1s vs ROI 数十 ms）；`matched_count==0` 是「本次没找到」而**非**「不存在」；`save_on_failure` 失败留证据 |
 | `probe_log` | 读游戏日志**尾部**并按正则过滤（编码自动 utf-8/gbk）。**只读、不消费**，可反复轮询；同类 Bot 项目普遍没有这条「用日志确认结果」的通道 |
+| `wait_for` | **轮询等待条件成立并给出证据包**（验收闭环里「等到可以判了」那一步）。五种条件：`field` / `instances` / `ocr` / `log` / `window`。返回三态 `verdict`（`pass` / `fail` / **`unverifiable`** —— 把「没法判」与「没通过」严格区分）+ `polls` / `evidence`；**超时如实报 fail，不静默当通过** |
 
 ### 诊断
 | 工具 | 作用 |
@@ -259,7 +260,7 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（43 个工具）
+│   ├── server.py                MCP 服务器（44 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
@@ -366,7 +367,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 47 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 48 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -403,6 +404,7 @@ GameModMCP/
 | `verify_field_write.py` | **字段写入的编码**（`set_field_value`）：宽度按类型、溢出必须报错不截断、浮点/整数不混、引用类型被拒。含**非空转反证**（改回「一律 8 字节」或去掉范围检查，断言必须报红） |
 | `verify_find_instances.py` | **实例枚举的语义**（`find_instances`）：`max_count`/`namespace` 真的传下去、**派生类混入可核查**（`exact+derived==count`；实测 `Transform` 全返回 `RectTransform`）、「拿不到」不许冒充「没有」（Mono 时机限制必须 `unsupported`）、只读标注。含非空转反证 |
 | `verify_screen.py` | **弱视觉/UI 层**（`capture_screen`/`ocr`/`probe_log`）：**ROI 原点加回坐标**（用固定 OCR 桩做到确定性）、「没找到 ≠ 不存在」的语义、失败留证据、日志 GBK 自动探测与**只读不消费**、region 畸形输入。含非空转反证；缺可选依赖时记为「无法验证」而非通过 |
+| `verify_wait_for.py` | **轮询等待与三态判定**（`wait_for`）：超时如实报 `fail`（不静默当通过）、**`unverifiable` 与 `fail` 严格区分**、`timeout_ms`/`interval_ms` 真的影响行为、条件**后来**成立时能等到、`evidence` 有上限但 `polls` 计数完整。含非空转反证 |
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
@@ -416,7 +418,7 @@ GameModMCP/
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
-| `verify_tool_annotations.py` | 43 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
+| `verify_tool_annotations.py` | 44 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
 
@@ -459,7 +461,7 @@ python devtools\report_runtime_matrix.py      # 运行时：真的启动/注入/
 ```
 
 `report_runtime_matrix.py` 会**真的**启动每个游戏、注入探针、装 Hook、
-强制调用并读回参数与返回值，最后按「游戏 × 43 个工具」输出
+强制调用并读回参数与返回值，最后按「游戏 × 44 个工具」输出
 `ok / 不适用 / 失败` 三态（`--json` 落盘 + `--md` 出报告）。
 最近一次全量结果见 [`docs/多游戏运行时兼容性报告.md`](docs/多游戏运行时兼容性报告.md)。
 

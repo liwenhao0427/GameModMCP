@@ -60,3 +60,8 @@ desktop.ini
 .DS_Store
 *.tmp
 *~
+
+# ---- 临时提交信息文件 ----
+# 教训：用 git commit -F <file> 时若文件写在仓库内，git add -A 会把它
+# 一起入库（本轮踩了两次）。以后统一用仓库外的临时路径，并在这里兜底。
+commit_msg*.txt

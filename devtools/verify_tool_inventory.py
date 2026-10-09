@@ -98,6 +98,8 @@ NON_TOOL_IDENTIFIERS = {
     "exact_class_count", "derived_count", "class_name_counts",
     # find_instances 返回的每个实例带的字段（真实类名）
     "class_name", "click_point", "coordinate_space", "best_match",
+    # wait_for 的参数（与 field/instances 分支共用）
+    "min_count", "equals", "timeout_ms", "interval_ms", "verdict",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
