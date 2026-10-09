@@ -4,6 +4,28 @@
 # 只用 Python 标准库，不依赖 pefile / lief / 反编译框架。
 #
 #   pip install -r requirements.txt
+#
+# ── 可选能力（**故意不列在这里**，装上就启用、没装则如实报不可用）──
+#
+# 本项目有两处**可选**依赖，它们不属于「跑起来的最低要求」，所以按
+# AGENTS.md §2.4（运行期只依赖 mcp + frida）不写进本文件。缺了不影响
+# 其它能力：`get_diagnostics` 会明确报告可用性，对应工具返回安装指引
+# 而不是抛异常。
+#
+#   1) 反编译（仅 Mono）—— 看 `get_diagnostics.decompiler.available`
+#        dotnet tool install --global ilspycmd
+#
+#   2) 弱视觉（截图 + OCR）—— 看 `get_diagnostics.screen`
+#        截图（二选一，dxcam 对全屏独占更稳）：
+#          pip install dxcam
+#          pip install mss
+#        OCR（二选一，rapidocr 中文更好）：
+#          pip install rapidocr-onnxruntime
+#          # 或装 Tesseract-OCR（含 chi_sim 语言包）+ pip install pytesseract
+#        按窗口标题定位还需要：
+#          pip install pywin32
+#
+# 装上后无需任何配置：capture_screen / ocr / probe_log 立即可用。
 
 mcp>=1.0.0
 frida>=16.0.0

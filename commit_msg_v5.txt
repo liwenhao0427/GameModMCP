@@ -1,0 +1,62 @@
+新增(弱视觉): capture_screen / ocr / probe_log —— Mod 自动验收的界面与日志通道
+
+按用户决策实施（截图做、加 OCR 辅助、UI 交互走 SKILL.md 配方）。
+本批是一次性做完 V5 + V6，共新增 3 个工具（40 → 43）。
+
+设计前提来自 7 个游戏自动化 Bot 项目的调研（MAA / MaaFramework /
+BetterGI / March7thAssistant / ALAS / ok-script / MaaMCP）：验收该靠
+引擎自己的信号，不该靠像素。所以这一层的纪律是：
+  · 截图是**证据**、不是判据（podium-mcp 原话 "Screenshots are NEVER
+    an oracle"）；
+  · 坐标一律**屏幕绝对坐标**（裁剪图不回传基准会让 Agent 点偏，
+    MaaMCP 专门把这条写进坑）；
+  · 只对 ROI 做 OCR（实测整屏 2560x1440 要 4.1s，ROI 只要几十 ms）；
+  · 截图只落盘、不回 base64（本项目 256KB 上限 vs 单图约 5 万 token）；
+  · 依赖全部**可选**，缺了如实报并与其它能力解耦。
+
+新增 engine/screen.py：
+- grab()：dxcam 优先（独占全屏更稳）→ mss 回退。**关键修正**：dxcam
+  在画面静止时返回 None，而「停在菜单上等我们点」正是验收常态 ——
+  第一版把它当失败，属典型**假失败**；现在重试几次后回退 mss 并如实
+  标注实际后端（"dxcam+mss"）。
+- ocr()：RapidOCR 优先 → tesseract 回退；阈值过滤、三种匹配模式、
+  best_match 取**置信度最高**（不是第一条）、save_on_failure 留证据。
+- read_log()：只读尾部、正则过滤、编码自动探测（utf-8/utf-8-sig/gbk）、
+  **只读不消费**（可反复轮询等某个日志行出现）。
+- available()：如实报告每个后端可用性与安装指引。
+
+新增 3 个 MCP 工具（server.py 新增「6. 弱视觉/UI 层」，后续节号顺延）：
+- capture_screen：窗口找不到时**如实失败**，不静默退化成截整屏。
+- ocr：matched_count==0 是「本次没找到」而**非**「不存在」（note 写明）。
+- probe_log：调研的 7 个 Bot 项目**没有一个**用游戏日志判断结果，
+  而用户明确要「通过日志确认结果」——这是本项目的差异化能力。
+
+V6（UI 交互走 SKILL.md 配方，不新增工具）：
+- 配方 7「验收 Mod —— 点界面 + 看日志」：OCR 定位 + 坐标三铁律 +
+  加载完成判据（sceneLoaded 早于 Start、isLoadingLevel 已废弃）。
+- 配方 8「语义化点击 UI」：find_instances → eval_script +
+  runtime_invoke 调 onClick；并说明 onClick.Invoke 会绕过事件管线
+  （验收会失真），以及 ExecuteEvents.Execute<T> 泛型需先 inflate。
+- 配方编号重排为 0..9（补回被替换掉的「大结果集翻页」为配方 9）。
+
+§4 五处同步全做：server.py（实现 + 分层 docstring + _ann 标注）、
+README（新增小节 + 四处工具数 40→43）、SKILL.md（配方 + 诊断说明）、
+验收脚本、verify_tool_annotations 语义表（probe_log 入 READONLY_LOCAL；
+capture_screen/ocr 入 MUTATING，非只读因为**落盘**但不破坏、可重复）。
+另把 get_diagnostics 补上 screen 段（与 decompiler 同样处理：可选能力
+必须现在就说，否则 Agent 会反复试一个必然失败的调用）。
+requirements.txt 加入可选依赖说明 —— 按 §2.4 只保留 mcp+frida 两个
+硬依赖，截图/OCR 全部列为可选并在文件里写明安装方式。
+
+验收：
+- 新增 devtools/verify_screen.py：55 项断言，含非空转反证。
+  坐标一致性那条**两次写错过**，最后改成用固定 OCR 桩：
+  ① 先在实时屏幕上验「同一文本两个 ROI」→ 脆弱（OCR 对同一画面
+     两次识别未必一致，实测第二次没命中）；
+  ② 再用合成图对比整图/裁剪 → 仍然脆弱（裁剪后 OCR 的框本身会漂
+     5~7px，那是引擎抖动不是坐标算错）；
+  ③ 最终**替换 OCR 引擎为固定返回**，被测的就只剩「ROI 原点有没有
+     被正确加回」，完全确定。教训：断言要打在被测逻辑上，
+     不要打在别人的抖动上。
+- 全套 46/46 通过，断言失败 0，动态覆盖率门禁通过。
+- 中文编码校验通过（UTF-8 无 BOM）。

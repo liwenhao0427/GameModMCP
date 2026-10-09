@@ -106,6 +106,10 @@ get_diagnostics()
 - Frida 装没装（没有的话**所有运行时工具都不能用**，只能做静态分析）
 - Mono / UE 解析器是否就绪
 - **`decompiler.available`** —— 反编译能力（可选的外部 `ilspycmd`）是否可用
+- **`screen.capture_usable` / `screen.ocr_usable`** —— 弱视觉能力
+  （可选：`dxcam`|`mss` 截图、`rapidocr`|`tesseract` OCR）是否可用，
+  以及实际会用的引擎名。为 false 时 `capture_screen` / `ocr` 会返回
+  安装指引而不是抛异常
 - 缓存目录在哪、当前会话状态
 
 > 它**默认不扫本机进程**（那一步实测要 2.7 秒，且与 `find_game_processes` 重复）。
@@ -507,7 +511,99 @@ hook_method(name="BodyPart", method="Visualize", param_count=1)
 >
 > 挂完**务必**核对返回里的 `chosen.token` 与静态查到的是否一致。
 
-### 配方 6：大结果集翻页
+### 配方 7：验收 Mod —— 点界面 + 看日志（弱视觉）
+
+Mod 改完之后要**自动验收**：点开界面、确认结果。这类活**不需要强视觉** ——
+大多数时候只要「屏幕上有没有这几个字」和「日志里有没有那一行」。
+
+```python
+# 1. 找「开始游戏」按钮 —— OCR 给文本与**屏幕绝对坐标**
+r = ocr(expected="开始游戏", match="contains")
+# → {ok, matched_count: 1,
+#    best_match: {text, box, center, click_point},
+#    click_point: [x, y],              ← 可直接用来点击（屏幕绝对坐标）
+#    coordinate_space: "screen_absolute"}
+
+# 2. 只搜一块区域更快更准（实测整屏 4.1s，ROI 几十 ms）
+r = ocr(region="0,600,1280,200", expected="开始游戏")
+```
+
+**三条铁律**（都是同类项目踩过的坑）：
+
+| 规矩 | 为什么 |
+|---|---|
+| **截图不是判据** | `capture_screen` 只用来**留证据**。判断「在哪个界面」用 `ocr` 的文本。`podium-mcp` 源码原话：*Screenshots are NEVER an oracle.* |
+| **`matched_count == 0` ≠ 不存在** | 那只是**本次没找到**：界面可能还没加载、或文字被 OCR 拆成多个框。别据此断定按钮没有 |
+| **坐标是屏幕绝对坐标** | 返回里 `coordinate_space: "screen_absolute"`。拿裁剪图坐标去点会**点偏**（MaaMCP 专门写进坑） |
+
+**用日志确认结果**（最可靠的验收通道）：
+
+```python
+probe_log(path=r"D:\Game\BepInEx\LogOutput.log", pattern="ModPanel|ERROR")
+# → {ok, matched_count, lines: [{line_no, text}], encoding, has_more}
+```
+
+`probe_log` **只读、不消费** —— 同一次读取可以反复做，所以适合轮询等某个
+日志行出现（不像 `drain_events` 那样取走即没）。
+编码自动探测（utf-8 → gbk），中文游戏日志常见 GBK。
+
+**判断「加载完了没有」不要只看单一信号**：
+
+| 信号 | 注意 |
+|---|---|
+| `SceneManager.sceneLoaded` | 触发在 `Start` **之前**，单独用它当「可验收」会**过早** |
+| `Scene.isLoaded` | 官方语义是「加载完成且对象已 enable」，可轮询 |
+| `Application.isLoadingLevel` | **已废弃**，不要用 |
+| 帧计数连续 N 帧不变 | 「画面稳定」的近似，不需要截图 |
+
+**点击怎么做**：本工具集**不提供点击工具**（那样会与 `ocr` 的定位职责重叠）。
+语义化点击属于「改逻辑」，走 `eval_script` + `ExecuteEvents` 配方
+（见下）；纯坐标点击请用系统级输入（`SendInput`），并注意它需要窗口在前台。
+
+### 配方 8：语义化点击 UI（不靠屏幕坐标）
+
+与配方 7 的 OCR 坐标点击相比，这条路**更稳**（不受分辨率/缩放/遮挡影响），
+但要求你能在元数据里定位到那个 UI 组件。
+
+```python
+# 思路：拿 Button 组件的 onClick 委托并 Invoke。
+# 先按类找实例（find_instances），再调它的方法。
+find_instances(name="Button", namespace="UnityEngine.UI", max_count=20)
+# → 每个实例带 class_name；挑出你真正想要的那个（注意派生类混入）
+
+# 然后用 eval_script 调它。IL2CPP 的泛型方法需要先 inflate：
+eval_script("""
+(function(){
+  var k = ptr('0x...');            // 上一步拿到的 Button 实例
+  // Button.onClick 是个属性，取 get_onClick 再 Invoke
+  var mi = funcs.il2cpp_class_get_method_from_name(
+      funcs.il2cpp_object_get_class(k), 'get_onClick', 0);
+  if (!mi || mi.isNull()) { return 'no get_onClick'; }
+  var ev = funcs.il2cpp_runtime_invoke(mi, k, NULL, NULL);
+  if (!ev || ev.isNull()) { return 'invoke returned null'; }
+  // ev 是 ButtonClickedEvent（UnityEvent），再 Invoke 它
+  var im = funcs.il2cpp_class_get_method_from_name(
+      funcs.il2cpp_object_get_class(ev), 'Invoke', 0);
+  if (!im || im.isNull()) { return 'no Invoke'; }
+  funcs.il2cpp_runtime_invoke(im, ev, NULL, NULL);
+  return 'clicked';
+})()
+""")
+```
+
+**三条注意**：
+
+| 注意 | 说明 |
+|---|---|
+| **先核对实例的 `class_name`** | `find_instances` 会返回**派生类**实例（实测 `Transform` 拿回的全是 `RectTransform`）。用错类的字段偏移会出错 |
+| **`onClick.Invoke()` 会绕过事件管线** | 它跳过 `Selectable` 状态机、`interactable` 校验与同级监听者。最省事，但**验收会失真** —— 想更接近真实点击，用 `ExecuteEvents.Execute` 派发 `PointerClick` |
+| **泛型方法要先 inflate** | `ExecuteEvents.Execute<T>` 在 IL2CPP 下是泛型方法，需要先拿到具体实例化版本，直接按名字取会拿到未实例化的 MethodInfo |
+
+> 更符合直觉但更复杂的做法是 `ExecuteEvents.Execute` + `PointerEventData`：
+> 需要目标 GameObject、一个用 `EventSystem.current` 构造的 `PointerEventData`，
+> 且场景里要有 `EventSystem`。用它之前先确认这三样都在。
+
+### 配方 9：大结果集翻页
 
 ```python
 r = search_classes(pattern="Player", limit=50)

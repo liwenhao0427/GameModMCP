@@ -82,6 +82,8 @@ READONLY_LOCAL = {
     "find_derived_classes", "analyze_dependency", "list_images",
     "read_query_result", "detect_ue", "ue_list_entries", "ue_manifest",
     "ue_script_objects", "get_diagnostics",
+    # probe_log 读**本地日志文件**：不碰游戏进程、不联网、也不消费文件
+    "probe_log",
 }
 
 #: 只读，但要有一个**活着的**游戏进程才答得出来 → `openWorldHint=True`。
@@ -100,6 +102,10 @@ MUTATING: dict[str, tuple[bool, bool, bool]] = {
     "ue_profile":     (False, True, False),   # 同上（output_path）
     "inject_process": (False, True, True),    # 同一进程重复注入会复用
     "gc_control":     (False, True, True),    # 可开可关
+    # 截图/OCR 会**落盘**（PNG），所以不是只读；但落的是自己的产物，
+    # 重复调用等价（同一画面截两次内容一致），不破坏任何东西。
+    "capture_screen": (False, True, True),
+    "ocr":            (False, True, True),
     # 每次调用都产生新的东西，重复调不等价
     "launch_game":    (False, False, True),   # 每次都是新进程
     "hook_method":    (False, False, True),

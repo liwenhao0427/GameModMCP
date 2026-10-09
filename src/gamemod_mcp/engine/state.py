@@ -1089,6 +1089,18 @@ def diagnostics(scan_processes: bool = False) -> dict:
             "hint": f"反编译模块加载失败：{exc}",
         }
 
+    # 弱视觉（截图 / OCR）同样是**可选**能力（dxcam|mss、rapidocr|tesseract）。
+    # 与 decompiler 同一个道理：缺了要**现在就说**，否则 Agent 会反复试
+    # capture_screen / ocr，每次拿回一个「没有可用后端」。
+    try:
+        from . import screen as _screen
+        info["screen"] = _screen.available()
+    except Exception as exc:
+        info["screen"] = {
+            "capture_usable": False, "ocr_usable": False,
+            "hint": f"弱视觉模块加载失败：{exc}",
+        }
+
     # 探测本机可用的游戏 —— 仅在显式要求时做（默认关闭，见 docstring）
     if scan_processes:
         try:

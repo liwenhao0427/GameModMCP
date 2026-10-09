@@ -30,9 +30,10 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
                      drain_events / read_memory / write_memory /
                      read_field_value / set_field_value / scan_pattern /
                      eval_script / gc_control
-    6. UE 层       : detect_ue / ue_profile / ue_list_entries /
+    6. 弱视觉/UI层: capture_screen / ocr / probe_log
+    7. UE 层       : detect_ue / ue_profile / ue_list_entries /
                      ue_script_objects / ue_manifest
-    7. 诊断层      : get_diagnostics
+    8. 诊断层      : get_diagnostics
 
 关键约定
 ------------------------------------------------------------
@@ -2460,7 +2461,208 @@ def gc_control(disable: bool = True) -> dict:
 
 
 # ================================================================
-# 6. Unreal 引擎层
+# 6. 弱视觉 / UI 层（截图 · OCR · 日志）
+# ================================================================
+#
+# 为什么叫「弱视觉」：调研了 7 个游戏自动化 Bot 项目后确认，游戏 Mod 的
+# **验收**绝大多数时候不需要强视觉 ——
+#   「找到开始游戏按钮」→ OCR 拿到文本与坐标
+#   「确认 Mod 面板起来了」→ OCR 找标题，或 probe_log 找日志行
+# 真正需要的只是**文本**与**点哪里**。
+#
+# 所以这一层的纪律是：
+#   · 截图是**证据**，不是判据（podium-mcp 原话：Screenshots are NEVER an oracle）；
+#   · 坐标一律**屏幕绝对坐标**，裁剪图不回传基准会让 Agent 点偏；
+#   · 截图只落盘、不回 base64（本项目 256 KB 上限 vs 单图约 5 万 token）；
+#   · 依赖全部**可选**，缺了如实报并与其它能力解耦。
+
+
+@mcp.tool(annotations=_ann("截取屏幕或窗口（存盘，返回路径）",
+                           read_only=False, open_world=True,
+                           destroy=False, idempotent=True))
+@_cap_response
+def capture_screen(region: str = "", window: str = "", save_path: str = "",
+                   max_side: int = 1920) -> dict:
+    """截取屏幕（或某个窗口 / 某块区域）并存成 PNG，**返回文件路径**。
+
+    ⚠️ **截图不是判据，只是证据**。要判断「现在在哪个界面」请用 `ocr`。
+    这条规矩来自同类项目的教训（`podium-mcp` 源码原文：
+    *"Screenshots are NEVER an oracle."*）—— 让模型看像素去下结论，
+    既贵（单张截图约 5 万 token）又不可靠。
+
+    **不返回 base64**：本项目任何返回都不超过 256 KB，而一张 2560x1440
+    的 PNG base64 会直接把它撑爆。图落在磁盘上，返回路径。
+
+    典型用途：验收失败时**留证据**（配合 `ocr` 的 `save_on_failure`）。
+
+    Args:
+        region:    "x,y,w,h" 屏幕绝对坐标；不传则截整个主屏。
+        window:    窗口标题**子串**；给了就用该窗口的矩形（优先于 region）。
+                   找不到会**如实失败**，不会静默退化成截整屏。
+        save_path: 保存路径；不传则落临时目录（返回里给路径）。
+        max_side:  证据图最长边上限（等比缩小，默认 1920）；0 = 不缩放。
+                   **只影响存盘的证据图，不影响坐标语义。**
+
+    Returns:
+        {ok, path, width, height, backend, region, coordinate_space, ...}
+    """
+    try:
+        from .engine import screen as _screen
+    except Exception as exc:  # pragma: no cover
+        return _err(f"加载截图模块失败：{exc}")
+
+    reg = _parse_region(region)
+    if reg is _BAD_REGION:
+        return _err(f"region 格式不对：{region!r}，应为 \"x,y,w,h\"（四个整数）")
+    try:
+        res = _screen.grab(region=reg, window=window, save_path=save_path,
+                           max_side=max(0, int(max_side)))
+    except Exception as exc:
+        return _err(f"截图失败：{exc}")
+    if not res.get("ok"):
+        return _err(res.get("error", "截图失败"),
+                    **{k: v for k, v in res.items() if k not in ("ok", "error")})
+    return _ok(**res)
+
+
+@mcp.tool(annotations=_ann("OCR 识别屏幕文本并给屏幕绝对坐标",
+                           read_only=False, open_world=True,
+                           destroy=False, idempotent=True))
+@_cap_response
+def ocr(region: str = "", window: str = "", expected: str = "",
+        match: str = "contains", threshold: float = 0.3,
+        case_sensitive: bool = False, max_items: int = 200,
+        save_on_failure: str = "") -> dict:
+    """对屏幕（或其中一块区域）做 OCR，返回**文本 + 可用于点击的绝对坐标**。
+
+    这是「弱视觉」的主力：验收时绝大多数判断只需要
+    「屏幕上有没有这几个字、它在哪」。
+
+    **只对给定的区域做 OCR**（实测整屏 2560x1440 要 4.1 秒，而 ROI
+    通常几十毫秒）—— 这也是同类项目的标配做法。
+
+    坐标一律是**屏幕绝对坐标**，可直接喂给点击；`coordinate_space`
+    字段会明说是 `screen_absolute`，避免「拿裁剪图坐标去点」这个经典坑。
+
+    匹配 `expected` 时的语义（**重要**）：
+      · `matched_count == 0` 的意思是「**本次没找到**」，
+        **不等于**「游戏里没有」—— 可能界面还没加载、或文字被 OCR
+        拆成了多个框。返回里的 `note` 会写明这一点。
+      · `best_match` 取的是**置信度最高**的那条，不是第一条。
+
+    Args:
+        region:   "x,y,w,h" 屏幕绝对坐标；与 `window` 二选一。
+        window:   窗口标题子串；用它定 ROI。
+        expected: 期望出现的文本；给了就把命中的单独列出来。
+        match:    `contains`（默认）/ `exact` / `regex`。
+        threshold: 置信度下限，低于它的丢弃（默认 0.3）。
+        case_sensitive: 文本匹配是否区分大小写。
+        max_items: 最多返回多少个文本框。
+        save_on_failure: 给了路径时，若没匹配到就**把当时的截图存到这里**
+                   （等价 MaaFramework 的 `save_on_error`）—— 失败要留证据。
+
+    Returns:
+        {ok, engine, count, results: [{text, score, box, center, click_point}],
+         texts, matched, matched_count, best_match, click_point,
+         coordinate_space: "screen_absolute", image, ...}
+    """
+    try:
+        from .engine import screen as _screen
+    except Exception as exc:  # pragma: no cover
+        return _err(f"加载 OCR 模块失败：{exc}")
+
+    reg = _parse_region(region)
+    if reg is _BAD_REGION:
+        return _err(f"region 格式不对：{region!r}，应为 \"x,y,w,h\"（四个整数）")
+    if match not in ("contains", "exact", "regex"):
+        return _err(f"match 只能是 contains / exact / regex，收到 {match!r}")
+    try:
+        res = _screen.ocr(region=reg, window=window, expected=expected,
+                          match=match, threshold=float(threshold),
+                          case_sensitive=bool(case_sensitive),
+                          max_items=max(1, int(max_items)),
+                          save_on_failure=save_on_failure)
+    except ValueError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"OCR 失败：{exc}")
+    if not res.get("ok"):
+        return _err(res.get("error", "OCR 失败"),
+                    **{k: v for k, v in res.items() if k not in ("ok", "error")})
+    return _ok(**res)
+
+
+@mcp.tool(annotations=_ann("读取游戏日志尾部并按正则过滤", read_only=True))
+@_cap_response
+def probe_log(path: str, pattern: str = "", max_lines: int = 200,
+              tail_bytes: int = 262144) -> dict:
+    """读游戏日志（或任意文本日志）的尾部，可按正则过滤。
+
+    **为什么单独做这件事**：调研的 7 个游戏自动化 Bot 项目里，
+    **没有一个**用游戏日志判断结果 —— 它们靠视觉、注册表或 CDP。
+    而「通过日志确认结果」恰恰是最可靠的验收通道之一
+    （Mod 自己的输出、游戏自己的报错都在日志里），所以这里补上。
+
+    做法刻意保守：
+      · 只读**尾部** `tail_bytes`（默认 256 KB）—— 日志动辄几百 MB，
+        **绝不**整个读进来；
+      · 给了 `pattern` 就只返回匹配行，并额外给 `matched_count`，
+        便于断言「没有出现 ERROR」这类**否定式**判据；
+      · 编码自动探测（utf-8 → utf-8-sig → gbk）—— 中文游戏常见 GBK。
+
+    ⚠️ 它是**只读**的，不消费日志（不像 `drain_events` 那样取走即没）。
+    同一次读取可以反复做，所以适合轮询等待某个日志行出现。
+
+    Args:
+        path:      日志文件路径。
+        pattern:   正则；只返回匹配行。留空返回尾部所有行。
+        max_lines: 最多返回多少行（默认 200，取**最后** N 行）。
+        tail_bytes: 从文件末尾读多少字节（默认 262144）。
+
+    Returns:
+        {ok, path, size, encoding, total_lines_in_tail, returned,
+         lines: [{line_no, text}], matched_count?, has_more?, truncated_head}
+    """
+    try:
+        from .engine import screen as _screen
+    except Exception as exc:  # pragma: no cover
+        return _err(f"加载日志模块失败：{exc}")
+    if not path:
+        return _err("必须给 path")
+    try:
+        res = _screen.read_log(path=path, pattern=pattern,
+                               max_lines=max(1, int(max_lines)),
+                               tail_bytes=max(1024, int(tail_bytes)))
+    except Exception as exc:
+        return _err(f"读取日志失败：{exc}")
+    if not res.get("ok"):
+        return _err(res.get("error", "读取日志失败"),
+                    **{k: v for k, v in res.items() if k not in ("ok", "error")})
+    return _ok(**res)
+
+
+#: `region="x,y,w,h"` 解析失败时的哨兵（与「没给 region」的 None 区分开）
+_BAD_REGION = object()
+
+
+def _parse_region(region: str) -> Any:
+    """解析 `"x,y,w,h"`。空串 → None（表示不限定区域）。"""
+    if not region:
+        return None
+    parts = [p.strip() for p in str(region).split(",")]
+    if len(parts) != 4:
+        return _BAD_REGION
+    try:
+        vals = [int(float(p)) for p in parts]
+    except ValueError:
+        return _BAD_REGION
+    if vals[2] <= 0 or vals[3] <= 0:
+        return _BAD_REGION
+    return vals
+
+
+# ================================================================
+# 7. Unreal 引擎层
 # ================================================================
 #
 # UE 没有 IL2CPP 那样的集中元数据文件，所以这一节的工具不是「查类型」，
@@ -2762,7 +2964,7 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
 
 
 # ================================================================
-# 7. 诊断层
+# 8. 诊断层
 # ================================================================
 
 
@@ -2788,7 +2990,7 @@ def get_diagnostics(scan_processes: bool = False) -> dict:
 
 
 # ================================================================
-# 8. 资源（MCP resources）
+# 9. 资源（MCP resources）
 # ================================================================
 #
 # 只做一个资源，理由写在模块 docstring 的「资源」一节：

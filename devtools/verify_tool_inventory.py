@@ -96,6 +96,8 @@ NON_TOOL_IDENTIFIERS = {
     # find_instances 的参数与返回字段
     "max_count", "overflow", "unsupported",
     "exact_class_count", "derived_count", "class_name_counts",
+    # find_instances 返回的每个实例带的字段（真实类名）
+    "class_name", "click_point", "coordinate_space", "best_match",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
@@ -108,6 +110,10 @@ NON_TOOL_IDENTIFIERS = {
     # set_field_value 文档里说明「静态字段该用哪个引擎 API」时提到它，
     # 是 IL2CPP C API 导出名，不是 MCP 工具。
     "il2cpp_field_static_set_value",
+    # SKILL.md「语义化点击 UI」配方里演示 eval_script 时用到的 IL2CPP
+    # C API 导出名（引擎 API，不是 MCP 工具）
+    "il2cpp_class_get_method_from_name", "il2cpp_object_get_class",
+    "il2cpp_runtime_invoke",
     # close_session 返回的 steps 字段（表明探针线程已从引擎域摘除），
     # 是返回字段不是工具
     "domain_released",
