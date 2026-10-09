@@ -19,7 +19,11 @@ classifiers = [
 # 只依赖 MCP 协议库与 Frida。
 # 引擎解析（PE / IL2CPP / Mono / UE）全部手写，只用标准库，不引入 pefile / lief。
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 必须 <2：本代码用 1.x 的 `mcp.server.fastmcp.FastMCP`；
+    # 2.x 把它改名成 MCPServer（`mcp.server.mcpserver`），导入路径变了。
+    # 只写 `>=1.0.0` 会让全新环境装到 2.x 然后 import 失败
+    # —— 打包分享包时实测到（干净 venv → 2.3.0 → 服务器起不来）。
+    "mcp>=1.0.0,<2",
     "frida>=16.0.0",
 ]
 

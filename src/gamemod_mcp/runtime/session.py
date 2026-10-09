@@ -1011,9 +1011,17 @@ def attach(pid: int, name: str = "", timeout: float = 10.0,
     try:
         session = device.attach(pid)
     except Exception as exc:
+        # ⚠️ 这里**不再**写「需以管理员身份运行」—— 实测（2026-10）
+        # 普通用户权限就能注入游戏进程：本 python 与游戏进程的完整性
+        # 级别都是 `Medium`，attach → runtime_info → find_instances 全成功。
+        # 真正的失败条件是**权限级不匹配**：游戏以管理员身份运行时
+        # 完整性级别是 `High`，普通权限的 Agent 才注入不进去。
+        # 一句话：**同级别就行，不是「必须管理员」**。
         raise SessionError(
-            f"注入 pid={pid} 失败：{exc}。常见原因：进程已退出、权限不足"
-            "（需以管理员身份运行）、或目标为受保护进程。"
+            f"注入 pid={pid} 失败：{exc}。常见原因：进程已退出、"
+            "**权限级不匹配**（游戏以管理员身份运行、而本进程不是；"
+            "普通权限的游戏用普通权限即可注入，不需要管理员）、"
+            "或目标游戏带反调试 / 反注入保护。"
         ) from exc
 
     # 等待 session 就绪（某些情况下 attach 后需要短暂等待）

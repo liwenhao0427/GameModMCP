@@ -50,13 +50,14 @@ pip install -r requirements.txt      # 只有 mcp + frida
 一键安装（含冒烟测试）：
 
 ```powershell
-# Windows
-pwsh -ExecutionPolicy Bypass -File .\install.ps1
+python install.py          # 主推：纯 Python，Windows 自带 PowerShell 5.1 读不了
+                           # 无 BOM 的 UTF-8 中文脚本（会语法报错），而 pwsh 不一定装了
+python install.py --vision # 连可选弱视觉（截图 / OCR）一起装
 ```
-```bash
-# macOS / Linux
-bash install.sh
-```
+
+> **本项目只支持 Windows。**
+> `install.ps1` 仍保留，但**只能用 `pwsh`（PowerShell 7）跑** ——
+> 用 Windows 自带的 `powershell`（5.1）会因中文编码问题直接语法报错。
 
 ### 2. 接进你的 Agent
 
@@ -263,7 +264,8 @@ GameModMCP/
 ├── README.md                    本文件
 ├── pyproject.toml               打包配置（pip install -e . 可用）
 ├── requirements.txt             运行依赖（只有 mcp + frida）
-├── install.ps1 / install.sh     一键安装 + 冒烟测试
+├── install.py                   一键安装（**主推**）+ 冒烟测试
+├── install.ps1                  同上，但**只能用 pwsh 7**（5.1 读中文会语法报错）
 │
 ├── src/gamemod_mcp/
 │   ├── server.py                MCP 服务器（45 个工具）
@@ -373,7 +375,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 49 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 50 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -412,6 +414,7 @@ GameModMCP/
 | `verify_screen.py` | **弱视觉/UI 层**（`capture_screen`/`ocr`/`probe_log`）：**ROI 原点加回坐标**（用固定 OCR 桩做到确定性）、「没找到 ≠ 不存在」的语义、失败留证据、日志 GBK 自动探测与**只读不消费**、region 畸形输入。含非空转反证；缺可选依赖时记为「无法验证」而非通过 |
 | `verify_wait_for.py` | **轮询等待与三态判定**（`wait_for`）：超时如实报 `fail`（不静默当通过）、**`unverifiable` 与 `fail` 严格区分**、`timeout_ms`/`interval_ms` 真的影响行为、条件**后来**成立时能等到、`evidence` 有上限但 `polls` 计数完整、**`kind="log"` 等的是增量而非存在**（旧日志已有时不许秒过）。含非空转反证 |
 | `verify_verify_state.py` | **证据充分性契约**（`verify_state`）：**单条证据不得判 `pass`**（`require_independent` 默认 2）、三态区分、`checks` 写法校验、与 `wait_for` 共用同一套条件语义（`_eval_condition`）。含非空转反证（把要求降到 1 则同一输入变 `pass`） |
+| `verify_docs_admin_claim.py` | **不许再出现「注入需要管理员权限」这个错误说法**（曾扩散到 8 处以上，源头是 `session.py` 失败提示里的一句猜测性归因；实测普通权限注入成功）。同时**要求**正面给出「不需要管理员」+ 权限级例外 —— 只删错误说法不留正确说法 = 丢信息。含非空转反证（用**真实出现过**的原句做样本） |
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
@@ -454,7 +457,8 @@ python devtools\run_all_verify.py --only verify_lazy_handles
 ```
 
 > `verify_mcp_tools.py` 会**真的启动一个游戏**并在结束时结束它。
-> 它需要 Frida 和管理员权限，且本机要有 Garden of Witches。
+> 它需要 Frida 与一个 IL2CPP 样本（如 Garden of Witches）。
+> **不需要管理员权限** —— 实测普通用户权限即可（见下方「权限」一节）。
 > 样本不存在的脚本会记为「无法验证」并跳过 —— **跳过不算通过**。
 
 ### 多游戏矩阵：能力边界不靠单一样本推断
@@ -609,7 +613,14 @@ IL2CPP 和 Mono 是**两个根本不同的元数据体系**：
   这是预期的，不要反复重试。
 - **Unreal 支持受限**。UE 没有像 IL2CPP 那样集中的元数据文件，
   结构信息依赖 UE profile / `.usmap`。能力以 `get_diagnostics()` 报告为准。
-- **Windows 注入通常需要管理员权限**。
+- **Windows 注入不需要管理员权限**（实测订正）。
+  只要 Agent 与游戏的**完整性级别相同**即可 —— 普通权限的 python
+  注入普通权限的 IL2CPP 游戏**实测成功**。唯一的例外是
+  **游戏以管理员身份运行**（完整性级别 `High`），此时才需要同样提权；
+  反之游戏是普通权限、Agent 是管理员，通常也能注入。
+  > 这条曾经写错成「通常需要管理员权限」，来源是失败提示里的一句
+  > 猜测性归因。实测证据：本进程与游戏进程的完整性级别都是
+  > `Medium`，`attach` → `runtime_info` → `find_instances` 全部成功。
 - **Headless 环境验证不到自然调用**。没有显示/GPU 的机器上游戏不渲染帧，
   每帧方法不会自己触发。Hook 有效性通过从注入侧主动调用来证明。
 
@@ -617,11 +628,48 @@ IL2CPP 和 Mono 是**两个根本不同的元数据体系**：
 
 ## 环境要求
 
+- **Windows**（本项目只支持 Windows）
 - **Python ≥ 3.10**（实测 3.13.1）
-- `mcp ≥ 1.0`、`frida ≥ 16`（实测 17.17.0）
+- `mcp ≥ 1.0, < 2`、`frida ≥ 16`（实测 frida 17.17.0）
 
-> 没有别的可选依赖。这里曾写着「可选：`capstone`（需要看机器码时）」——
-> 但本工具集**没有**指令级分析能力，装上它也不会多出任何功能，已删除。
+> ⚠️ `mcp` **必须 < 2**：本代码用 1.x 的 `mcp.server.fastmcp.FastMCP`，
+> 2.x 已改名成 `MCPServer`（`mcp.server.mcpserver`）。只写 `>=1.0.0`
+> 会让全新环境装到 2.x 然后**服务器起不来** —— 这是打包分享包时实测到的。
+
+> 可选弱视觉（截图 / OCR）：`dxcam`|`mss` + `rapidocr-onnxruntime`|`pytesseract`
+> + `numpy`/`opencv-python`/`pillow`/`pywin32`。**不装不影响其它工具**，
+> `get_diagnostics()` 的 `screen` 段会如实报告可用性。
+
+---
+
+## 分享包（给别人测试用）
+
+一条命令生成一个**自带依赖、开箱即用**的分享包：
+
+```powershell
+python devtools\build_share.py            # 打包（会下载 wheel）
+python devtools\build_share.py --no-wheels  # 只打源码（体积小）
+python devtools\build_share.py --check      # 只校验已有分享包
+```
+
+产物落在**仓库同级** `..\GameModMCP-share\`（不进 git），并自动打 zip。
+形态：
+
+```
+GameModMCP-share/
+├── 安装说明.md      ← 给 AI 读的入口（**整个目录直接交给对方的 Agent**）
+├── install.py       ← 一键安装（主推）
+├── src/ skills/ mcp-config/ devtools/ docs/
+└── wheels/required|optional   ← 依赖 wheel（离线可装，必需约 63 MB）
+```
+
+打包后**自检 38 项**，其中最关键的一条是**用包内源码真起一次服务器**
+数工具数 —— 它能抓到「拷漏了文件」「依赖装错版本」这类只有对方才会踩到的
+问题（实测就是靠它发现 `mcp>=1.0.0` 会装到 2.x 导致起不来）。
+
+> **为什么入口是 Python 而不是 .ps1**：Windows 自带的 PowerShell 5.1
+> 读**无 BOM 的 UTF-8** 中文脚本会按 GBK 解码、直接语法报错，而 `pwsh`
+> 对方不一定装了。对方装了 Python 才能跑 MCP，所以 Python 一定在。
 
 ---
 

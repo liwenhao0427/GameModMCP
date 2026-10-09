@@ -934,9 +934,25 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 
 ### 权限问题
 
-注入需要权限。Windows 上通常要**管理员身份**运行 MCP 服务器。
-带反调试/反注入的游戏（常见于网游、带 EAC/BattlEye 的游戏）会注入失败——
-这是预期的，不要反复重试。
+**不需要管理员权限**（实测订正 —— 这条以前写错了）。
+
+只要 **MCP 服务器进程与游戏进程的完整性级别相同**就能注入：
+
+| 游戏以什么权限运行 | Agent 该用什么权限 | 能注入吗 |
+|---|---|---|
+| 普通用户（`Medium`） | 普通用户 | ✅ **实测成功**（默认就是这种情形） |
+| 普通用户（`Medium`） | 管理员（`High`） | ✅ 通常可以（高往低） |
+| 管理员（`High`） | 普通用户 | ❌ 失败 —— **这时才需要提权** |
+
+实测证据：普通权限的 python（完整性级别 `Medium`）注入同样普通权限的
+IL2CPP 游戏，`attach` → `runtime_info` → `find_instances` **全部成功**。
+所以**默认按普通权限跑，不要一上来就要求管理员**。
+
+真正会让注入失败的是这两类，**与权限无关**：
+
+- **反调试 / 反注入保护**（EAC / BattlEye 等，常见于网游）——
+  这是预期的，**不要反复重试**；
+- 目标进程已退出、或运行时还没加载好（换 `launch_game`、或等就绪）。
 
 ### 静态查询不需要游戏在运行
 
@@ -997,7 +1013,7 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 | `runtime_class_info` 报「类名有歧义」 | 短名对应多个嵌套类型（如 `State` 有 131 个） | 从 `candidates[].full_name` 里挑一个当 `name` 回灌；或补 `image=` |
 | `runtime_class_info` 报「未找到类」而静态明明有 | 传的是短名，而嵌套类型必须用完整名 | 用 `search_classes` 的 `nested_name` 作为 `name`（见上方嵌套类型说明） |
 | 字段类型是 `None` | 该字段类型在元数据里无法解析 | 正常现象（约 10% 字段）；用偏移 + 内存读确认实际用途 |
-| `inject_process` 失败 | 权限不足 / 反调试 / 进程刚启动 | 试管理员；或改用 `launch_game` |
+| `inject_process` 失败 | **权限级不匹配**（游戏是管理员、而本进程不是）/ 反调试 / 进程刚启动 | 先看游戏是不是以管理员身份运行的；是则用管理员跑 Agent，否则**不用提权**。或改用 `launch_game` |
 | `runtime_class_info` 报错 | 类在游戏里还没被加载 | 先让游戏运行到相关场景（进游戏、打开对应界面） |
 | Hook 装上但 0 次触发 | 目标方法在当前场景/状态不会被调 | 换个确实会执行的方法；或 `launch_game` 早期挂钩 |
 | token 两边对不上 | 挂到了同名的重载 | 用 `token=` 精确指定；或 `param_count=`（见配方 5） |

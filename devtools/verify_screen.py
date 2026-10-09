@@ -377,6 +377,81 @@ check("若把「没匹配到」写成 ok:false，就分不清「本次没找到�
       _wrong_shape["ok"] is False, "这正是要避免的语义混淆")
 
 # ================================================================
+section("6. region 的两种形态都必须能用（借分享包验收时踩到的缺陷）")
+
+# 实测背景：`engine.screen.ocr()` 是**公开的引擎 API**，工具层传的是
+# **字符串** `"x,y,w,h"`，而验收脚本习惯传**列表** `[x,y,w,h]`。
+# 旧实现只写了 `int(region[0])`：
+#   · 传列表 → 正常；
+#   · 传字符串 → `int(',')` 抛 ValueError（"0,0,300,120" 的 [1] 是逗号）。
+# 于是「测试脚本直接调引擎 API 会崩、而 MCP 工具调用没事」——
+# 一个只在换调用方时才暴露的**接口契约缺陷**。
+# 更糟的是它在 `verify_screen.py` 里表现为**静默失败**：
+# `_synthetic_coord_check()` 用列表调，抛异常被 except 吞掉 → 返回 None →
+# 下游几条断言连锁报红，而根因看不出来。
+for _form, _label in (([0, 0, 300, 120], "列表"),
+                      ("0,0,300,120", "字符串"),
+                      ((0, 0, 300, 120), "元组"),
+                      (" 0, 0, 300, 120 ", "带空白的字符串")):
+    try:
+        _g = SC.grab(region=_form)
+        check(f"grab 接受 {_label} 形态的 region",
+              _g.get("ok") is True and _g.get("width") == 300,
+              f"ok={_g.get('ok')} {_g.get('width')}x{_g.get('height')} "
+              f"err={str(_g.get('error'))[:50]}")
+    except Exception as _exc:                                # noqa: BLE001
+        check(f"grab 接受 {_label} 形态的 region", False,
+              f"抛异常 {type(_exc).__name__}: {_exc}")
+
+for _form, _label in (([0, 0, 300, 120], "列表"),
+                      ("0,0,300,120", "字符串")):
+    try:
+        _o = SC.ocr(region=_form)
+        check(f"ocr 接受 {_label} 形态的 region",
+              _o.get("ok") is True, f"err={str(_o.get('error'))[:60]}")
+    except Exception as _exc:                                # noqa: BLE001
+        check(f"ocr 接受 {_label} 形态的 region", False,
+              f"抛异常 {type(_exc).__name__}: {_exc}")
+
+# region=None 表示「不限定区域」，必须走整屏而不是崩
+try:
+    _gn = SC.grab(region=None)
+    check("region=None 时截整屏（不是抛异常）",
+          _gn.get("ok") is True and (_gn.get("width") or 0) > 100,
+          f"{_gn.get('width')}x{_gn.get('height')}")
+except Exception as _exc:                                    # noqa: BLE001
+    check("region=None 时截整屏（不是抛异常）", False,
+          f"抛异常 {type(_exc).__name__}: {_exc}")
+
+# `_normalize_region` 的纯函数行为（不收参数就必须报错，不许静默当整屏）
+check("_normalize_region 拒绝畸形输入",
+      all(SC._normalize_region(x) is None
+          for x in ("nope", "1,2,3", [1, 2, 3], "1,2,0,50", 12345)))
+check("_normalize_region 接受两种合法形态",
+      SC._normalize_region("0,0,300,120") == [0, 0, 300, 120]
+      and SC._normalize_region([0, 0, 300, 120]) == [0, 0, 300, 120])
+check("_normalize_region 允许负坐标（多显示器左侧）",
+      SC._normalize_region("-1920,0,1920,1080") == [-1920, 0, 1920, 1080])
+
+# dxcam 回退分支里那句 log 曾经是 `log("...")`，而 `log` 是从 logutil
+# 导入的 **logger 对象**（不是函数）→ `'Logger' object is not callable`。
+# 只在「dxcam 拿不到新帧」时才触发，属**隐藏分支缺陷**（平时跑不到）。
+# 这里静态扫源码防回归：找出形如 `log(` 但**不是** `log.debug(` 的调用。
+#
+# ⚠️ 判定前**必须先剥掉注释**：源码注释里可能**引用**错误写法当例子
+# （本文件上方那段注释里就有 `log("...")`），不剥会把注释误判成代码
+# ——实测踩到过（报了 1 处假阳性）。
+import inspect as _inspect
+import re as _re
+
+_code_only = "\n".join(
+    ln.split("#", 1)[0] for ln in _inspect.getsource(SC).splitlines())
+_bare_log = _re.findall(r"(?<![\w.])log\s*\(", _code_only)
+check("screen.py 里没有把 logger 当函数调用（应写 log.debug(...)）",
+      not _bare_log,
+      f"发现裸 log( 调用 {len(_bare_log)} 处" if _bare_log else "（干净）")
+
+# ================================================================
 print()
 print("=" * 78)
 print(f"通过 {PASS} 项，失败 {FAIL} 项" + (f"，警告 {WARN} 项" if WARN else ""))

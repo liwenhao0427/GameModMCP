@@ -86,8 +86,10 @@ if ($specs.Count -gt 0) {
     Write-Host "  待安装: $($specs -join ', ')" -ForegroundColor DarkGray
     & $py -m pip install @specs
 } else {
-    # requirements.txt 缺失或为空时的兜底
-    & $py -m pip install 'mcp>=1.0.0' 'frida>=16.0.0'
+    # requirements.txt 缺失或为空时的兜底。
+    # ⚠️ mcp 必须 <2（理由见 requirements.txt 里的说明）—— 只写 >=1.0.0
+    # 会让全新环境装到 mcp 2.x，然后 `mcp.server.fastmcp` 导入失败。
+    & $py -m pip install 'mcp>=1.0.0,<2' 'frida>=16.0.0'
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ✗ 依赖安装失败。若在公司网络下，可能需要配置 pip 镜像源。" -ForegroundColor Red
@@ -140,7 +142,9 @@ Write-Host ""
 Write-Host "  各客户端的现成配置在 mcp-config\ 目录，详见 mcp-config\README.md" -ForegroundColor Gray
 Write-Host ""
 
-Write-Host "  ⚠ 注入游戏进程通常需要管理员权限，请用管理员身份启动你的 Agent。" -ForegroundColor Yellow
+Write-Host "  提示：注入游戏进程**不需要管理员权限**（实测）。" -ForegroundColor Gray
+Write-Host "        只要 Agent 与游戏以相同权限运行即可；" -ForegroundColor Gray
+Write-Host "        只有游戏本身以管理员运行时才需要提权。" -ForegroundColor Gray
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " 安装完成" -ForegroundColor Green

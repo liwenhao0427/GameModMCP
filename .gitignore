@@ -68,3 +68,11 @@ desktop.ini
 # 教训：用 git commit -F <file> 时若文件写在仓库内，git add -A 会把它
 # 一起入库（本轮踩了两次）。以后统一用仓库外的临时路径，并在这里兜底。
 commit_msg*.txt
+
+# ---- 分享包（由 devtools/build_share.py 生成）----
+# 实际落在**仓库同级**（../GameModMCP-share），本来就不在库里；
+# 这几行是兜底：万一有人把它生成到仓库内也不会误入库。
+# 注意：分享包里有整套 *.md 副本，若放进仓库会被
+# verify_tool_inventory.py 的「扫描所有 *.md」连带扫到。
+GameModMCP-share/
+GameModMCP-share.zip

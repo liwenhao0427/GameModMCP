@@ -268,7 +268,7 @@ def main() -> int:
     if crashed:
         print(f"崩溃：{', '.join(crashed)}")
         print("  崩溃多为 Frida 自注入本进程导致，非产品缺陷；")
-        print("  但**不算通过**，需在有显示环境/管理员权限下复核。")
+        print("  但**不算通过**，需在有显示环境下复核（与管理员权限无关）。")
     if timedout:
         print(f"超时：{', '.join(timedout)}")
         print("  超时说明脚本**自己没结束**（死循环，或卡在某个调用上）；"

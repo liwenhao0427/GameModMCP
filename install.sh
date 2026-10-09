@@ -64,7 +64,10 @@ if [ ${#SPECS[@]} -gt 0 ]; then
     echo "  待安装: ${SPECS[*]}"
     $PY -m pip install "${SPECS[@]}"
 else
-    $PY -m pip install 'mcp>=1.0.0' 'frida>=16.0.0'
+    # requirements.txt 缺失或为空时的兜底。
+    # ⚠️ mcp 必须 <2（理由见 requirements.txt）—— 只写 >=1.0.0 会让全新
+    # 环境装到 mcp 2.x，然后 `mcp.server.fastmcp` 导入失败。
+    $PY -m pip install 'mcp>=1.0.0,<2' 'frida>=16.0.0'
 fi
 echo "  ✓ 依赖就绪"
 

@@ -128,6 +128,40 @@ def ocr_engine_name() -> str:
     return ""
 
 
+# ---------------------------------------------------------------- 区域规范化
+
+def _normalize_region(region: Any) -> list[int] | None:
+    """把 region 规范成 `[x, y, w, h]` 列表；认不出来返回 None。
+
+    接受的形态（**故意两种都收**）：
+      · `[x, y, w, h]`（list/tuple）—— 引擎 API 与验收脚本的自然写法；
+      · `"x, y, w, h"`（字符串）—— MCP 工具层的入参形态。
+
+    宽高必须为正 —— 不然是「零面积区域」，截图会得到一个空图，
+    与其让它悄悄成功，不如明确判为格式错误（返回 None 由调用方报错）。
+    负坐标是**合法**的（多显示器时窗口可能在主屏左侧）。
+    """
+    if region is None:
+        return None
+    try:
+        if isinstance(region, str):
+            parts = [p.strip() for p in region.split(",")]
+            if len(parts) != 4:
+                return None
+            vals = [int(float(p)) for p in parts]
+        elif isinstance(region, (list, tuple)):
+            if len(region) != 4:
+                return None
+            vals = [int(float(v)) for v in region]
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
+    if vals[2] <= 0 or vals[3] <= 0:
+        return None
+    return vals
+
+
 # ---------------------------------------------------------------- 窗口定位
 
 #: DPI 感知是否已（尝试）设置过。设置一次即可，重复调用无意义。
@@ -312,6 +346,16 @@ def grab(region: list[int] | None = None, window: str = "",
     img = None
     used = ""
     try:
+        # region 允许 `[x,y,w,h]` 或 `"x,y,w,h"`（见 `_normalize_region`）。
+        # 旧实现在两处分支各自 `for v in region`，传字符串时会逐字符迭代
+        # 并抛 ValueError —— 同一个缺陷的另一半。
+        if region:
+            _reg = _normalize_region(region)
+            if _reg is None:
+                return {"ok": False,
+                        "error": f"region 格式不对：{region!r}，"
+                                 f"应为 [x,y,w,h] 或 \"x,y,w,h\""}
+            region = _reg
         if backend == "dxcam":
             global _DXCAM
             import dxcam  # type: ignore
@@ -321,11 +365,13 @@ def grab(region: list[int] | None = None, window: str = "",
             if cam is None:
                 raise RuntimeError("dxcam.create() 返回 None（可能没有可用输出）")
             if region:
-                x, y, w, h = [int(v) for v in region]
-                left, top, right, bottom = x, y, x + w, y + h
+                x, y, w, h = region
+                dx_region = (x, y, x + w, y + h)
             else:
-                left = top = 0
-                right, bottom = None, None
+                # ⚠️ 不能传 `region=(0, 0, None, None)` —— dxcam 内部会拿它
+                # 跟整数比大小，抛 `'>=' not supported between instances of
+                # 'int' and 'NoneType'`（实测）。整屏要**不传**这个参数。
+                dx_region = None
 
             # ⚠️ dxcam 在「没有新帧」时返回 None —— 而**画面静止恰恰是
             # 验收场景的常态**（停在菜单上等我们点）。若把 None 当成失败，
@@ -334,12 +380,18 @@ def grab(region: list[int] | None = None, window: str = "",
             # 当前帧），并如实标注实际用的后端。
             frame = None
             for attempt in range(4):
-                frame = cam.grab(region=(left, top, right, bottom))
+                frame = (cam.grab(region=dx_region) if dx_region is not None
+                         else cam.grab())
                 if frame is not None:
                     break
                 time.sleep(0.05 * (attempt + 1))
             if frame is None:
-                log("dxcam 连续 4 次未拿到新帧（画面静止），回退 mss")
+                # ⚠️ `log` 是从 logutil 导入的 **logger 对象**，不是函数 ——
+                # 必须 `log.debug(...)`。写成 `log("...")` 会抛
+                # `'Logger' object is not callable`（实测踩到的缺陷：
+                # 只在「dxcam 拿不到新帧、走这条回退分支」时才触发，
+                # 平时跑到不，属于典型的**隐藏分支缺陷**）。
+                log.debug("dxcam 连续 4 次未拿到新帧（画面静止），回退 mss")
                 used_fallback = True
             else:
                 used_fallback = False
@@ -353,7 +405,7 @@ def grab(region: list[int] | None = None, window: str = "",
             import mss  # type: ignore
             with mss.mss() as sct:
                 if region:
-                    x, y, w, h = [int(v) for v in region]
+                    x, y, w, h = region      # 已在上面规范化过
                     mon = {"left": x, "top": y, "width": w, "height": h}
                 else:
                     mon = sct.monitors[1]
@@ -482,7 +534,24 @@ def ocr(region: list[int] | None = None, window: str = "",
                     "window_search": win_info}
         r = win_info["rect"]
         region = [r[0], r[1], r[2] - r[0], r[3] - r[1]]
+    # region 允许两种形态：`[x, y, w, h]` 列表，或 `"x,y,w,h"` 字符串。
+    #
+    # ⚠️ 这两种**都必须支持**（实测踩到的缺陷）：
+    # MCP 工具层收到的是字符串并已经 `_parse_region` 成列表；
+    # 但本函数是**公开的引擎 API**，`devtools/verify_screen.py` 与
+    # 分享包的验收脚本都会**直接**用 `[x,y,w,h]` 调它。
+    # 旧实现只写了 `int(region[0])`：
+    #   · 传列表 → 正常；
+    #   · 传字符串 → `int(',')` 抛 ValueError（"0,0,300,120" 的 [1] 是逗号）。
+    # 结果：**测试脚本直接调引擎 API 就崩**，而工具层调用却没事 ——
+    # 一个只在「换个调用方」时才暴露的接口契约缺陷。
     if region:
+        reg = _normalize_region(region)
+        if reg is None:
+            return {"ok": False,
+                    "error": f"region 格式不对：{region!r}，"
+                             f"应为 [x,y,w,h] 或 \"x,y,w,h\""}
+        region = reg
         origin_x, origin_y = int(region[0]), int(region[1])
 
     shot = grab(region=region)
