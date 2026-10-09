@@ -579,9 +579,16 @@ wait_for(kind="ocr", target="开始游戏", region="0,600,1280,200",
 |---|---|---|
 | `field` | 某字段值 == `equals` | `name`/`field`/`equals` |
 | `instances` | 某类活实例数 ≥ `min_count` | `name` |
-| `log` | 日志出现匹配 `pattern` 的行 | `target`=日志路径，`pattern` |
+| `log` | 日志里**新增**匹配 `pattern` 的行 | `target`=日志路径，`pattern` |
 | `ocr` | 屏幕 OCR 到 `target` | `target`（可选 `region`/`window`） |
 | `window` | 出现标题含 `target` 的窗口 | `target` |
+
+> **`kind="log"` 等的是「新增」，不是「存在」**（真机实战踩出来的）：
+> 第一次轮询记下基线匹配数，之后**超过**基线才算成立。
+> 否则日志里早就有的旧行会让它**秒过** —— 实测某日志已有 5 条
+> 「已修改 精核」时，`wait_for(kind="log", pattern="已修改 精核")`
+> 在 **1ms** 内返回 `pass`，而本次操作**根本没发生**（假阳性）。
+> 要判「当前是否已有」请直接用 `probe_log`。
 
 **`verdict` 是三态，别当成布尔**：
 

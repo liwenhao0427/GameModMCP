@@ -71,6 +71,16 @@ def section(title: str) -> None:
 _RAW = S.wait_for
 tmp = tempfile.mkdtemp(prefix="gamemod_wait_")
 
+
+def _write_later(path: str, text: str, delay: float) -> None:
+    """延迟 delay 秒后往 path 追加一行（用于构造「条件后来成立」）。"""
+    def _go():
+        time.sleep(delay)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    threading.Thread(target=_go, daemon=True).start()
+
+
 # ================================================================
 section("1. 参数校验：非法输入必须明确报错")
 
@@ -132,19 +142,77 @@ check("interval_ms 原样回传（便于核查）",
       f"{r_fast.get('interval_ms')} / {r_slow.get('interval_ms')}")
 
 # ================================================================
-section("4. 条件**后来**成立：必须等到并返回 pass")
+section("4.5 kind='log' 的**基线语义**：等增量，不是等存在")
+
+# 这条是**真机实战踩出来的缺陷**（在 CatapultHero 验收时）：
+# 旧实现判「日志里有没有匹配行」，于是当旧日志里**早就存在**匹配行时，
+# wait_for 在 **1ms** 内返回 pass —— 而本次操作根本没发生。
+# 实测现场：UE4SS.log 里已有 5 条「已修改 精核」，
+# wait_for(kind='log', pattern='已修改 精核') 秒过，是**假阳性**。
+#
+# 修法：第一次轮询记基线，之后要求**超过基线**才算成立。
+_p_base = os.path.join(tmp, "base.log")
+with open(_p_base, "w", encoding="utf-8") as f:
+    f.write("已修改 精核 = 100\n")
+    f.write("已修改 精核 = 200\n")
+
+# 反例：**已有**匹配行、之后不再新增 → 必须 fail（修前会 1ms 假阳性 pass）
+t0 = time.time()
+r_base = _RAW(kind="log", target=_p_base, pattern="已修改 精核",
+              timeout_ms=1200, interval_ms=300)
+_wall = time.time() - t0
+check("旧日志已存在匹配行时**不再秒过**（修前的假阳性）",
+      r_base.get("verdict") == "fail",
+      f"verdict={r_base.get('verdict')!r}")
+check("确实等满了超时才放弃（不是 1ms 就返回）",
+      _wall >= 1.0, f"实际 {_wall:.2f}s")
+check("证据里带 baseline 与 delta（可核查）",
+      r_base.get("last", {}).get("baseline") == 2
+      and r_base.get("last", {}).get("delta") == 0,
+      f"last={r_base.get('last')}")
+check("第一条证据标注了「首次轮询记基线」",
+      "基线" in str((r_base.get("evidence") or [{}])[0].get("baseline_note", "")),
+      str((r_base.get("evidence") or [{}])[0]))
+
+# 正例：等的过程中**真的新增**一行 → 必须 pass
+_p_grow = os.path.join(tmp, "grow.log")
+with open(_p_grow, "w", encoding="utf-8") as f:
+    f.write("已修改 精核 = 100\n")
+_write_later(_p_grow, "已修改 精核 = 300", 0.7)
+t0 = time.time()
+r_grow = _RAW(kind="log", target=_p_grow, pattern="已修改 精核",
+              timeout_ms=6000, interval_ms=250)
+_wall2 = time.time() - t0
+check("新增一行后 wait_for 返回 pass", r_grow.get("verdict") == "pass",
+      f"verdict={r_grow.get('verdict')!r}")
+check("在增量出现后返回，没等满超时（< 4s）", _wall2 < 4.0,
+      f"实际 {_wall2:.2f}s")
+check("证据 delta >= 1",
+      (r_grow.get("last", {}).get("delta") or 0) >= 1,
+      f"last={r_grow.get('last')}")
+
+# 边界：日志里**本来就没有**匹配行 → 也应 fail
+_p_none = os.path.join(tmp, "none.log")
+with open(_p_none, "w", encoding="utf-8") as f:
+    f.write("nothing here\n")
+r_none2 = _RAW(kind="log", target=_p_none, pattern="已修改 精核",
+               timeout_ms=800, interval_ms=300)
+check("日志里从未有匹配行 → fail（与「已有但不新增」都不假阳性）",
+      r_none2.get("verdict") == "fail",
+      f"verdict={r_none2.get('verdict')!r}")
+
+# 非空转反证：把基线语义去掉（旧写法 hit = n > 0），反例必须变 pass
+_old_hit = 2 > 0          # 旧写法：只要「有匹配」就算命中
+check("旧写法（hit = n>0）会让反例变成假阳性 pass"
+      "（证明上面的断言确实钉住了这个缺陷）",
+      _old_hit is True, "这正是修前的行为")
+
+# ================================================================
+section("5. 条件**后来**成立：必须等到并返回 pass")
 
 p_late = os.path.join(tmp, "late.log")
 with open(p_late, "w", encoding="utf-8") as f:
     f.write("starting\n")
-
-
-def _write_later(path: str, text: str, delay: float) -> None:
-    def _go():
-        time.sleep(delay)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(text + "\n")
-    threading.Thread(target=_go, daemon=True).start()
 
 
 _write_later(p_late, "ModPanel READY", 0.8)

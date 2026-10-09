@@ -130,15 +130,82 @@ def ocr_engine_name() -> str:
 
 # ---------------------------------------------------------------- 窗口定位
 
+#: DPI 感知是否已（尝试）设置过。设置一次即可，重复调用无意义。
+_DPI_DONE = False
+_DPI_MODE = ""
+
+
+def _ensure_dpi_aware() -> str:
+    """尽力让本进程**DPI 感知**，使窗口坐标与截图像素处在同一坐标系。
+
+    为什么必须做（本机实测的缺陷，改前会截错区域）
+    ------------------------------------------------
+    本机是 **150% 缩放**（物理 2560x1440 / 虚拟 1707x960）。进程若不是
+    DPI 感知的，`GetWindowRect` 返回的是**虚拟化**后的坐标：
+
+        游戏窗口 GetWindowRect  → [451, 0, 1319, 517]     （虚拟，1707x960 系）
+        DWM 真实边界            → [685, 0, 1969, 767]     （物理，2560x1440 系）
+
+    而 `dxcam` / `mss` 截图用的是**物理像素**。两者混用 → 截到的区域
+    整体偏移（实测截出来是旁边那个终端窗口，而不是游戏），
+    而 `capture_screen` 会**如实返回 ok=true** —— 典型的假成功。
+
+    修法：进程级 DPI 感知 + 优先用 `DWMWA_EXTENDED_FRAME_BOUNDS`
+    （它给的是**视觉上**的窗口边界，不含不可见的调整边框）。
+
+    Returns:
+        实际生效的模式名（便于核查）；拿不到时返回空串。
+    """
+    global _DPI_DONE, _DPI_MODE
+    if _DPI_DONE:
+        return _DPI_MODE
+    _DPI_DONE = True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        # PER_MONITOR_AWARE_V2 = -4（Win10 1703+）。先试这个 —— 它不会像
+        # 老式 SetProcessDPIAware 那样在混合 DPI 多显示器上出问题。
+        try:
+            ctx = ctypes.c_void_p(-4)
+            if user32.SetProcessDpiAwarenessContext(ctx):
+                _DPI_MODE = "per_monitor_v2"
+                return _DPI_MODE
+        except Exception:
+            pass
+        # 回退 1：shcore.SetProcessDpiAwareness(2 = PER_MONITOR_AWARE)
+        try:
+            shcore = ctypes.windll.shcore
+            if shcore.SetProcessDpiAwareness(2) == 0:
+                _DPI_MODE = "per_monitor"
+                return _DPI_MODE
+        except Exception:
+            pass
+        # 回退 2：最老的 API
+        try:
+            if user32.SetProcessDPIAware():
+                _DPI_MODE = "system_aware"
+                return _DPI_MODE
+        except Exception:
+            pass
+        _ = wintypes  # 仅为保持 import 语义明确
+    except Exception:
+        pass
+    _DPI_MODE = ""
+    return _DPI_MODE
+
+
 def find_window_rect(title_substr: str) -> dict:
-    """按标题子串找窗口并返回它的屏幕矩形。
+    """按标题子串找窗口并返回它的**屏幕物理像素**矩形。
 
     用 win32gui（pywin32，可选）。**这不是必须的**：拿不到就如实报，
     调用方可以退化成「整屏 + region」。
 
     为什么要窗口矩形：验收时要截的是**游戏窗口**而不是整个桌面
     （桌面上可能有别的窗口遮挡）。而 OCR 后的坐标必须能直接用来点击，
-    所以窗口矩形要换算成屏幕绝对坐标。
+    所以窗口矩形必须与 `dxcam`/`mss` 截图处在**同一坐标系** ——
+    也就是物理像素。见 `_ensure_dpi_aware()` 里记的那个实测缺陷。
     """
     if not title_substr:
         return {"ok": False, "error": "没有给窗口标题"}
@@ -148,8 +215,28 @@ def find_window_rect(title_substr: str) -> dict:
         return {"ok": False, "error":
                 f"未安装 pywin32（`pip install pywin32`），无法按标题找窗口：{exc}"}
 
-    hits: list[tuple[int, str, tuple]] = []
+    dpi_mode = _ensure_dpi_aware()
+
+    hits: list[dict] = []
     needle = title_substr.lower()
+
+    def _bounds(hwnd: int) -> tuple[list[int], str]:
+        """返回 (rect, 来源)。优先 DWM 真实边界，回退 GetWindowRect。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            ext = wintypes.RECT()
+            # DWMWA_EXTENDED_FRAME_BOUNDS = 9
+            hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(hwnd), ctypes.c_uint(9),
+                ctypes.byref(ext), ctypes.sizeof(ext))
+            if hr == 0 and (ext.right - ext.left) > 0 and (ext.bottom - ext.top) > 0:
+                return [ext.left, ext.top, ext.right, ext.bottom], "dwm_extended_frame"
+        except Exception:
+            pass
+        r = win32gui.GetWindowRect(hwnd)
+        return list(r), "get_window_rect"
 
     def _cb(hwnd, _):
         try:
@@ -157,7 +244,8 @@ def find_window_rect(title_substr: str) -> dict:
                 return
             t = win32gui.GetWindowText(hwnd) or ""
             if needle in t.lower():
-                hits.append((hwnd, t, win32gui.GetWindowRect(hwnd)))
+                rect, src = _bounds(hwnd)
+                hits.append({"hwnd": hwnd, "title": t, "rect": rect, "source": src})
         except Exception:
             return
 
@@ -170,15 +258,18 @@ def find_window_rect(title_substr: str) -> dict:
         return {"ok": False, "error": f"没有标题含 {title_substr!r} 的可见窗口",
                 "searched": True}
     # 取面积最大的那个（游戏主窗口通常最大；同名小窗如启动器会被排掉）
-    def _area(r):
+    def _area(h):
+        r = h["rect"]
         return max(0, r[2] - r[0]) * max(0, r[3] - r[1])
 
-    hwnd, title, rect = max(hits, key=lambda x: _area(x[2]))
+    best = max(hits, key=_area)
     return {
         "ok": True,
-        "hwnd": hwnd,
-        "title": title,
-        "rect": list(rect),
+        "hwnd": best["hwnd"],
+        "title": best["title"],
+        "rect": best["rect"],
+        "rect_source": best["source"],
+        "dpi_awareness": dpi_mode or "none",
         "candidates": len(hits),
     }
 

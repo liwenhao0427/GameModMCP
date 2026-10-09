@@ -16,6 +16,9 @@
 # 调研阶段抓下来的第三方网页/源码快照（子 Agent 用）。
 # 是「外部材料的本地副本」，不是交付物；结论已沉淀进 docs/ 与 agent_logs/。
 .cache-research/
+# 真机验收时的现场产物：截图、一次性点击/发键脚本、诊断脚本。
+# 结论沉淀进 docs/ 与 SKILL.md 配方，脚本本身不入库。
+.cache-verify/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

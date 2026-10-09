@@ -2685,8 +2685,14 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
     | `field` | 某字段的值等于 `equals` | `name`/`field`/`equals`（`instance` 不需要：会先用 `find_instances` 找） |
     | `instances` | 某类的活实例数 ≥ `min_count` | `name`（可选 `namespace`/`image`） |
     | `ocr` | 屏幕上 OCR 到 `target` 文本 | `target`（可选 `region`/`window`） |
-    | `log` | 日志里出现匹配 `pattern` 的行 | `pattern` |
+    | `log` | 日志里**新增**匹配 `pattern` 的行 | `target`=日志路径，`pattern` |
     | `window` | 出现标题含 `target` 的窗口 | `target` |
+
+    **`kind='log'` 等的是「新增」，不是「存在」**（这条是真机实战踩出来的）：
+    第一次轮询会记下基线匹配数，之后**超过**基线才算成立。
+    否则旧日志里早就有的匹配行会让它在 **1ms** 内返回 `pass`，
+    而本次操作根本没发生（实测：日志里已有 5 条「已修改 精核」时确实如此）。
+    要判「当前是否已有」请直接用 `probe_log`，不要用 `wait_for`。
 
     **返回值就是证据包**（不是光秃秃的布尔）：
       · `ok` —— 条件成立了
@@ -2732,6 +2738,8 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
     started = time.time()
     last_err = ""
     unverifiable_reason = ""
+    #: `kind='log'` 的基线匹配数（见该分支里「基线语义」的说明）
+    log_baseline: int | None = None
 
     while True:
         polls += 1
@@ -2796,8 +2804,35 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
                                             max_lines=20)
                 if lr.get("ok"):
                     n = int(lr.get("matched_count") or 0)
-                    detail = {"matched_count": n, "pattern": pattern}
-                    hit = n > 0
+                    # ⚠️ **基线语义**（真机实战踩出来的缺陷，改前会假阳性）
+                    #
+                    # 这一条判的是「日志里**有没有**匹配行」。但用它来等
+                    # 「某个动作发生」时，**旧日志里早就有的匹配行会立刻命中**
+                    # —— 实测：日志里已有 5 条「已修改 精核」，调
+                    # wait_for(kind='log', pattern='已修改 精核') 在 **1ms** 内
+                    # 返回 pass，而本次操作**根本没发生**。
+                    #
+                    # 所以第一次轮询先记下基线，之后要求**超过基线**才算成立。
+                    # 这才符合「等一个**新**事件发生」的直觉用法。
+                    # 想判「当前是否已有」应直接用 probe_log，而不是 wait_for。
+                    if log_baseline is None:
+                        log_baseline = n
+                        detail = {"matched_count": n, "pattern": pattern,
+                                  "baseline": n,
+                                  "baseline_note": "首次轮询记基线，等增量"}
+                        hit = False
+                        # 本轮不算命中，但仍要把基线记进证据后继续
+                        evidence.append({"poll": polls, **detail})
+                        if len(evidence) > 30:
+                            evidence = evidence[-30:]
+                        if time.time() >= deadline:
+                            break
+                        time.sleep(interval_ms / 1000.0)
+                        continue
+                    detail = {"matched_count": n, "pattern": pattern,
+                              "baseline": log_baseline,
+                              "delta": n - log_baseline}
+                    hit = n > log_baseline
                 else:
                     last_err = str(lr.get("error", ""))[:200]
 
