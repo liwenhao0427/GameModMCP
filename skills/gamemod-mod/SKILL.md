@@ -511,6 +511,49 @@ hook_method(name="BodyPart", method="Visualize", param_count=1)
 >
 > 挂完**务必**核对返回里的 `chosen.token` 与静态查到的是否一致。
 
+### 配方 6：语义化点击 UI（不靠屏幕坐标）
+
+与配方 7 的 OCR 坐标点击相比，这条路**更稳**（不受分辨率/缩放/遮挡影响），
+但要求你能在元数据里定位到那个 UI 组件。
+
+```python
+# 思路：拿 Button 组件的 onClick 委托并 Invoke。
+# 先按类找实例（find_instances），再调它的方法。
+find_instances(name="Button", namespace="UnityEngine.UI", max_count=20)
+# → 每个实例带 class_name；挑出你真正想要的那个（注意派生类混入）
+
+# 然后用 eval_script 调它。IL2CPP 的泛型方法需要先 inflate：
+eval_script("""
+(function(){
+  var k = ptr('0x...');            // 上一步拿到的 Button 实例
+  // Button.onClick 是个属性，取 get_onClick 再 Invoke
+  var mi = funcs.il2cpp_class_get_method_from_name(
+      funcs.il2cpp_object_get_class(k), 'get_onClick', 0);
+  if (!mi || mi.isNull()) { return 'no get_onClick'; }
+  var ev = funcs.il2cpp_runtime_invoke(mi, k, NULL, NULL);
+  if (!ev || ev.isNull()) { return 'invoke returned null'; }
+  // ev 是 ButtonClickedEvent（UnityEvent），再 Invoke 它
+  var im = funcs.il2cpp_class_get_method_from_name(
+      funcs.il2cpp_object_get_class(ev), 'Invoke', 0);
+  if (!im || im.isNull()) { return 'no Invoke'; }
+  funcs.il2cpp_runtime_invoke(im, ev, NULL, NULL);
+  return 'clicked';
+})()
+""")
+```
+
+**三条注意**：
+
+| 注意 | 说明 |
+|---|---|
+| **先核对实例的 `class_name`** | `find_instances` 会返回**派生类**实例（实测 `Transform` 拿回的全是 `RectTransform`）。用错类的字段偏移会出错 |
+| **`onClick.Invoke()` 会绕过事件管线** | 它跳过 `Selectable` 状态机、`interactable` 校验与同级监听者。最省事，但**验收会失真** —— 想更接近真实点击，用 `ExecuteEvents.Execute` 派发 `PointerClick` |
+| **泛型方法要先 inflate** | `ExecuteEvents.Execute<T>` 在 IL2CPP 下是泛型方法，需要先拿到具体实例化版本，直接按名字取会拿到未实例化的 MethodInfo |
+
+> 更符合直觉但更复杂的做法是 `ExecuteEvents.Execute` + `PointerEventData`：
+> 需要目标 GameObject、一个用 `EventSystem.current` 构造的 `PointerEventData`，
+> 且场景里要有 `EventSystem`。用它之前先确认这三样都在。
+
 ### 配方 7：验收 Mod —— 等到可以判、再判、留证据
 
 Mod 改完之后要**自动验收**。验收的关键**不是**「看一眼截图」，而是三步：
@@ -597,51 +640,115 @@ probe_log(path=r"D:\Game\BepInEx\LogOutput.log", pattern="ModPanel|ERROR")
 | 帧计数连续 N 帧不变 | 「画面稳定」的近似，不需要截图 |
 
 **点击怎么做**：本工具集**不提供点击工具**（那样会与 `ocr` 的定位职责重叠）。
-语义化点击属于「改逻辑」，走配方 8 的 `eval_script` 路线；
-纯坐标点击请用系统级输入（`SendInput`），并注意它需要窗口在前台。
+所有输入都走配方 8 的 `eval_script` 路线 —— 下面是**本机实测跑通**的完整配方。
 
-### 配方 8：语义化点击 UI（不靠屏幕坐标）
+### 配方 8：模拟按键 / 点击（实测跑通的完整链路）
 
-与配方 7 的 OCR 坐标点击相比，这条路**更稳**（不受分辨率/缩放/遮挡影响），
-但要求你能在元数据里定位到那个 UI 组件。
+用户场景里最关键的一步：「按热键唤起我们自己的 Mod 面板」。
+本工具集没有 `send_key` 这类工具（有意的，见下），但 `eval_script`
+能在**游戏进程内**调 `user32!SendInput` —— 这条路**本机实测跑通了**。
+
+**⚠️ 四个实测踩到的坑，缺一个都发不出键：**
+
+| 坑 | 现象 | 正确做法 |
+|---|---|---|
+| **前台锁** | `SetForegroundWindow` 返回 **0**，键发到了别的窗口（实测发给了浏览器） | 先 `AttachThreadInput` 附加到当前前台线程，再 `SetForegroundWindow`（见下表实测结果） |
+| Frida 17 的 API 变了 | `Module.getExportByName` 报 **"not a function"** | 先 `Process.getModuleByName('user32.dll')` 再 `findExportByName` |
+| `eval_script` 的 `//` 注释 | 报 `unexpected token`（它先按**表达式**求值，包一层 `return (...)`，换行注释会吃掉后面的语句） | JS 里只用 `/* */` 注释 |
+| `SendInput` 只看**前台**窗口 | 「投递成功」（返回 1）**不等于**游戏收到了 —— 前台窗口不对时，键进了别的程序 | 发键前**必须核对前台窗口**，发完再核对一次 |
+
+**实测数据（PathOfIdle，本机）**：
+
+```
+直接 SetForegroundWindow        → returned=0, fg_is_game=false   ← 失败，键发去了浏览器
+SetForegroundWindow + AttachThreadInput → returned=1, fg_is_game=true  ← 成功
+SendInput（游戏在前台时）        → sent=1
+```
+
+**完整配方（先抢前台，再发键）**：
 
 ```python
-# 思路：拿 Button 组件的 onClick 委托并 Invoke。
-# 先按类找实例（find_instances），再调它的方法。
-find_instances(name="Button", namespace="UnityEngine.UI", max_count=20)
-# → 每个实例带 class_name；挑出你真正想要的那个（注意派生类混入）
-
-# 然后用 eval_script 调它。IL2CPP 的泛型方法需要先 inflate：
+# 第一步：把游戏窗口抢到前台。必须走 AttachThreadInput，
+# 否则 SetForegroundWindow 会被 Windows 前台锁挡掉（返回 0 且不生效）。
 eval_script("""
 (function(){
-  var k = ptr('0x...');            // 上一步拿到的 Button 实例
-  // Button.onClick 是个属性，取 get_onClick 再 Invoke
-  var mi = funcs.il2cpp_class_get_method_from_name(
-      funcs.il2cpp_object_get_class(k), 'get_onClick', 0);
-  if (!mi || mi.isNull()) { return 'no get_onClick'; }
-  var ev = funcs.il2cpp_runtime_invoke(mi, k, NULL, NULL);
-  if (!ev || ev.isNull()) { return 'invoke returned null'; }
-  // ev 是 ButtonClickedEvent（UnityEvent），再 Invoke 它
-  var im = funcs.il2cpp_class_get_method_from_name(
-      funcs.il2cpp_object_get_class(ev), 'Invoke', 0);
-  if (!im || im.isNull()) { return 'no Invoke'; }
-  funcs.il2cpp_runtime_invoke(im, ev, NULL, NULL);
-  return 'clicked';
+  var u = Process.getModuleByName('user32.dll');
+  var k = Process.getModuleByName('kernel32.dll');
+  var E = function(m, n) { return m.findExportByName(n); };
+  var EnumWindows = new NativeFunction(E(u,'EnumWindows'), 'int', ['pointer','pointer']);
+  var GetWindowTextW = new NativeFunction(E(u,'GetWindowTextW'), 'int', ['pointer','pointer','int']);
+  var IsWindowVisible = new NativeFunction(E(u,'IsWindowVisible'), 'int', ['pointer']);
+  var GetWindowThreadProcessId = new NativeFunction(E(u,'GetWindowThreadProcessId'), 'uint', ['pointer','pointer']);
+  var GetForegroundWindow = new NativeFunction(E(u,'GetForegroundWindow'), 'pointer', []);
+  var SetForegroundWindow = new NativeFunction(E(u,'SetForegroundWindow'), 'int', ['pointer']);
+  var ShowWindow = new NativeFunction(E(u,'ShowWindow'), 'int', ['pointer','int']);
+  var BringWindowToTop = new NativeFunction(E(u,'BringWindowToTop'), 'int', ['pointer']);
+  var AttachThreadInput = new NativeFunction(E(u,'AttachThreadInput'), 'int', ['uint','uint','int']);
+  var GetCurrentThreadId = new NativeFunction(E(k,'GetCurrentThreadId'), 'uint', []);
+
+  var mypid = Process.id, found = null;
+  var cb = new NativeCallback(function(h){
+    if (!IsWindowVisible(h)) { return 1; }
+    var pb = Memory.alloc(8);
+    GetWindowThreadProcessId(h, pb);
+    if (pb.readU32() !== mypid) { return 1; }
+    var b = Memory.alloc(512); GetWindowTextW(h, b, 240);
+    var t = b.readUtf16String() || '';
+    if (t.length > 0) { found = {hwnd:h, title:t}; return 0; }
+    return 1;
+  }, 'int', ['pointer','pointer']);
+  EnumWindows(cb, NULL);
+  if (!found) { return {ok:false, why:'no window'}; }
+
+  var fgThread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+  var myThread = GetCurrentThreadId();
+  AttachThreadInput(myThread, fgThread, 1);   /* 附加 */
+  ShowWindow(found.hwnd, 9);                  /* SW_RESTORE */
+  var okSet = SetForegroundWindow(found.hwnd);
+  BringWindowToTop(found.hwnd);
+  AttachThreadInput(myThread, fgThread, 0);   /* 摘掉，别留副作用 */
+
+  var fg = GetForegroundWindow();
+  return { ok:true, set_ok:okSet, fg_is_game:fg.equals(found.hwnd), title:found.title };
+})()
+""")
+# 返回 fg_is_game=false 就**不要**继续发键 —— 键会进别的程序。
+
+# 第二步：发键。VK 码见下。
+eval_script("""
+(function(){
+  var u = Process.getModuleByName('user32.dll');
+  var sendInput = new NativeFunction(u.findExportByName('SendInput'),
+      'uint', ['uint','pointer','int']);
+  var inp = Memory.alloc(64);
+  inp.writeU32(1);              /* INPUT_KEYBOARD */
+  inp.add(8).writeU16(0x70);    /* VK_F1 */
+  var sent = sendInput(1, inp, 40);
+  /* 松键也要发，否则游戏可能认为一直按着 */
+  inp.add(12).writeU32(2);      /* KEYEVENTF_KEYUP */
+  sendInput(1, inp, 40);
+  return { sent: sent };
 })()
 """)
 ```
 
-**三条注意**：
+**为什么把它写成配方而不是工具**：这是你有意选择的路线。
+理由也成立 —— 输入模拟与「定位」是两个不同的关注点，
+`ocr` 负责「点哪里」，`eval_script` 负责「怎么点」，
+硬造一个 `click(x,y)` 工具会让职责重叠，还要处理缩放的换算。
 
-| 注意 | 说明 |
-|---|---|
-| **先核对实例的 `class_name`** | `find_instances` 会返回**派生类**实例（实测 `Transform` 拿回的全是 `RectTransform`）。用错类的字段偏移会出错 |
-| **`onClick.Invoke()` 会绕过事件管线** | 它跳过 `Selectable` 状态机、`interactable` 校验与同级监听者。最省事，但**验收会失真** —— 想更接近真实点击，用 `ExecuteEvents.Execute` 派发 `PointerClick` |
-| **泛型方法要先 inflate** | `ExecuteEvents.Execute<T>` 在 IL2CPP 下是泛型方法，需要先拿到具体实例化版本，直接按名字取会拿到未实例化的 MethodInfo |
+> ⚠️ **反作弊提醒**：`SendInput` 是**系统级合成输入**，
+> 带 EAC / BattlEye 的网游会检测并可能封号。本配方只适用于
+> **单机 / 离线**场景。工具集本身不做任何隐藏（探针注入同样会被检测）。
 
-> 更符合直觉但更复杂的做法是 `ExecuteEvents.Execute` + `PointerEventData`：
-> 需要目标 GameObject、一个用 `EventSystem.current` 构造的 `PointerEventData`，
-> 且场景里要有 `EventSystem`。用它之前先确认这三样都在。
+**常用 VK 码**：`F1`=0x70 … `F12`=0x7B、`Enter`=0x0D、`Esc`=0x1B、
+`Space`=0x20、`Tab`=0x09、字母/数字用其 ASCII 大写值（`A`=0x41、`0`=0x30）。
+
+**要点击屏幕坐标**（而不是发键）？把上面的 `INPUT_KEYBOARD` 换成
+`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN/UP`，坐标要归一到
+0~65535（`x*65535/屏幕宽`）。⚠️ 这一步**没有**在本机实测过
+（只实测了键盘路径），用之前先自己验一次。
+
 
 ### 配方 9：大结果集翻页
 

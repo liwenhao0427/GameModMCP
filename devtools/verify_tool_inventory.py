@@ -100,6 +100,10 @@ NON_TOOL_IDENTIFIERS = {
     "class_name", "click_point", "coordinate_space", "best_match",
     # wait_for 的参数（与 field/instances 分支共用）
     "min_count", "equals", "timeout_ms", "interval_ms", "verdict",
+    # SKILL.md 配方 8（模拟按键）里提到的 Win32 常量与「本项目**没有**的
+    # 工具名」：`send_key` 是明说「本工具集没有它、所以走 eval_script」
+    # 时提到的，不是引用一个存在的工具。INPUT_KEYBOARD 是 Win32 常量。
+    "INPUT_KEYBOARD", "send_key", "MOUSEEVENTF_ABSOLUTE",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
