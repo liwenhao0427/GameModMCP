@@ -613,6 +613,17 @@ class RuntimeSession:
             preferred_module or None,
         )
 
+    def find_instances(self, namespace: str = "", name: str = "", image: str = "",
+                       max_count: int = 100,
+                       preferred_module: str = "") -> dict:
+        """枚举某个类的活对象实例（拿 instance 指针的正路）。"""
+        return self._call(
+            "findInstances",
+            {"namespace": namespace, "name": name, "image": image,
+             "max_count": max_count},
+            preferred_module or None,
+        )
+
     # -------------------------------------------------- Hook
 
     def hook(self, address: str, args: list[str] | None = None,

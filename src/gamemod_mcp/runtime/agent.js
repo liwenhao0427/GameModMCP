@@ -104,6 +104,9 @@
         'il2cpp_free',
         // 对象 / 字符串
         'il2cpp_object_new',
+        // 实例枚举用：拿到某个实例**真实**的类（liveness 会连派生类实例
+        // 一起返回 —— 实测 find_instances(Transform) 拿到的是 RectTransform）
+        'il2cpp_object_get_class',
         'il2cpp_string_new',
         'il2cpp_string_length',
         'il2cpp_string_chars',
@@ -112,7 +115,20 @@
         'il2cpp_resolve_icall',
         // 元数据
         'il2cpp_method_get_token',
-        'il2cpp_class_get_type_token'
+        'il2cpp_class_get_type_token',
+        // 实例枚举（GC liveness）—— 见 findInstances() 的说明。
+        // 这四个是 Unity 自家内存分析器用的导出，也是 frida-il2cpp-bridge
+        // 的 `gc.choose` 走的路径；`il2cpp_class_get_instances` 这种
+        // 「按类直接列实例」的导出**并不存在**（5 个样本实测）。
+        'il2cpp_unity_liveness_allocate_struct',
+        'il2cpp_unity_liveness_calculation_from_statics',
+        'il2cpp_unity_liveness_finalize',
+        'il2cpp_unity_liveness_free_struct',
+        // 注意导出名是 `il2cpp_stop_gc_world`，**不是** `il2cpp_gc_stop_world`
+        // （本机 5 个样本实测：前者 5/5 存在，后者 0/5）。
+        'il2cpp_stop_gc_world',
+        'il2cpp_start_gc_world',
+        'il2cpp_alloc'
     ];
 
     // Il2CppString 布局（64 位）：
@@ -211,7 +227,12 @@
         'mono_type_get_name',
         'mono_string_to_utf8',
         'mono_string_new',
-        'mono_free'
+        'mono_free',
+        // 实例枚举（Mono 侧只有受限的堆遍历；`mono_gc_walk_heap` 的官方
+        // 注释写明「只在 pre-stop-world 回调内有效」—— 见 findInstancesMono）。
+        // Mono **没有** il2cpp 那套 liveness 导出，也没有按类列实例的 API。
+        'mono_gc_walk_heap',
+        'mono_object_get_class'
     ];
 
     // 回退：System.String 长度字段名（不同 Mono/CoreCLR 命名不同）
@@ -542,6 +563,7 @@
             il2cpp_free: ['void', ['pointer']],
 
             il2cpp_object_new: ['pointer', ['pointer']],
+            il2cpp_object_get_class: ['pointer', ['pointer']],
             il2cpp_string_new: ['pointer', ['pointer']],
             il2cpp_string_length: ['pointer', ['pointer']],
             il2cpp_string_chars: ['pointer', ['pointer']],
@@ -550,7 +572,18 @@
             il2cpp_resolve_icall: ['pointer', ['pointer']],
 
             il2cpp_method_get_token: ['pointer', ['pointer']],
-            il2cpp_class_get_type_token: ['pointer', ['pointer']]
+            il2cpp_class_get_type_token: ['pointer', ['pointer']],
+
+            // 实例枚举（GC liveness）。签名逐字对照
+            // `frida-il2cpp-bridge@0.14.0/lib/exports.ts`，写错会崩游戏。
+            il2cpp_unity_liveness_allocate_struct:
+                ['pointer', ['pointer', 'int', 'pointer', 'pointer', 'pointer']],
+            il2cpp_unity_liveness_calculation_from_statics: ['void', ['pointer']],
+            il2cpp_unity_liveness_finalize: ['void', ['pointer']],
+            il2cpp_unity_liveness_free_struct: ['void', ['pointer']],
+            il2cpp_stop_gc_world: ['void', []],
+            il2cpp_start_gc_world: ['void', []],
+            il2cpp_alloc: ['pointer', ['size_t']]
         };
 
         for (var nm in sigs) {
@@ -1346,6 +1379,17 @@
         mono_class_is_enum: ['pointer', ['pointer']],
         mono_class_is_valuetype: ['pointer', ['pointer']],
         mono_class_get_interfaces: ['pointer', ['pointer', 'pointer']],
+        // 实例枚举（签名逐字对照 mono/metadata/mono-gc.h）：
+        //   int mono_gc_walk_heap(int flags, MonoGCReferences cb, void *data)
+        // 回调返回非 0 继续遍历。官方限制：堆遍历「只在 pre-stop-world
+        // 回调内有效」—— 见 findInstancesMono 的说明。
+        //
+        // ⚠️ 返回类型登记为 **pointer** 而非 int：本文件统一如此
+        // （见 buildFunctions 的说明 —— 数值返回按 pointer 拿、调用方
+        // 用 `.toInt32()` 截断）。历史上非 pointer 的数值返回类型
+        // 造成过一次真实崩溃，verify_mono_runtime.py 有断言钉住这条规矩。
+        mono_gc_walk_heap: ['pointer', ['int', 'pointer', 'pointer']],
+        mono_object_get_class: ['pointer', ['pointer']],
         mono_class_get_fields: ['pointer', ['pointer', 'pointer']],
         mono_class_get_field_from_name: ['pointer', ['pointer', 'pointer']],
         mono_field_get_name: ['pointer', ['pointer']],
@@ -2109,6 +2153,299 @@
         });
     }
 
+    // ================================================================ 实例枚举
+
+    /**
+     * 枚举某个类在堆上的**活对象实例**（IL2CPP）。
+     *
+     * 为什么需要它：`read_field_value` / `set_field_value` 都要 `instance=`，
+     * 而在此之前，拿实例的唯一办法是「Hook 一个恰好会收到该对象的函数，
+     * 从 args[0] 里捡」—— 那是**碰运气**，与本项目「元数据优先」相悖。
+     *
+     * 走的是 Unity 自家内存分析器用的 GC liveness 导出：
+     *
+     *     stopWorld()                        // il2cpp_stop_gc_world
+     *     state = livenessAllocateStruct(klass, 0, cb, NULL, reallocCb)
+     *     livenessCalculationFromStatics(state)
+     *     livenessFinalize(state)
+     *     startWorld()                       // il2cpp_start_gc_world
+     *     livenessFreeStruct(state)
+     *
+     * 这是 `frida-il2cpp-bridge` 的 `gc.choose` 的 `allocate_struct` 分支
+     * （另一分支用 `liveness_calculation_begin`，**本机样本上不存在**）。
+     *
+     * 三条实测得来的注意点：
+     *
+     * 1. **不能对值类型调用**（结构体没有堆实例）。调用方应先查
+     *    `il2cpp_class_is_valuetype`，是的话直接返回空而不是硬跑。
+     * 2. **stopWorld 之后必须 startWorld**，否则一次异常就把游戏冻住。
+     *    所以下面用 try/finally 保证一定恢复。
+     * 3. **realloc 回调返回的指针必须被 JS 侧长期持有**，否则会被 GC →
+     *    游戏 use-after-free。所以从一个**预先分配、闭包持有**的内存池里
+     *    切分，而不是回调里临时 `Memory.alloc`。
+     *    另外只在「句柄非空且 size==0」时 free —— 实测第一版对
+     *    NULL/0xffff... 句柄调 free 会报 access violation。
+     */
+    function findInstancesIL2CPP(klass, maxCount) {
+        var miss = [];
+        var need = ['il2cpp_unity_liveness_allocate_struct',
+                    'il2cpp_unity_liveness_calculation_from_statics',
+                    'il2cpp_unity_liveness_finalize',
+                    'il2cpp_unity_liveness_free_struct',
+                    'il2cpp_stop_gc_world', 'il2cpp_start_gc_world'];
+        for (var i = 0; i < need.length; i++) {
+            if (!funcs[need[i]]) { miss.push(need[i]); }
+        }
+        if (miss.length) {
+            return fail('本版 IL2CPP 运行时缺少实例枚举所需导出：' +
+                        miss.join(', ') +
+                        '（这是**版本差异**，不是探针缺陷；' +
+                        '可改用 eval_script + il2cpp_gc_foreach_heap 兜底）', {
+                engine: 'il2cpp', missing: miss, unsupported: true
+            });
+        }
+
+        // 值类型没有堆实例 —— 明确说明，而不是返回空列表让人以为「没有」
+        //
+        // ⚠️ 必须 `.toInt32() !== 0`：这些 `is_*` 导出在本探针里统一按
+        // 'pointer' 返回类型包装（见 buildFunctions 的说明），于是 C 的
+        // `false` 会变成一个**非空但内容为 0** 的 NativePointer 对象，
+        // 而 JS 里任何对象都是 truthy —— 直接 `if (fn(k))` 会把
+        // **每个类**都判成值类型（实测踩到：`UnityEngine.Transform`
+        // 这种明确的引用类型也被拒了）。
+        if (funcs.il2cpp_class_is_valuetype) {
+            try {
+                if (funcs.il2cpp_class_is_valuetype(klass).toInt32() !== 0) {
+                    return fail('目标是**值类型**（struct），它没有堆实例，' +
+                                '无法枚举实例；请用 read_field_value 直接读持有它的字段', {
+                        engine: 'il2cpp', unsupported: true, is_value_type: true
+                    });
+                }
+            } catch (e) { /* 查不出来就按引用类型继续 */ }
+        }
+
+        // 目标类的短名，用于区分「实例就是该类本身」还是它的派生类
+        var targetShortName = null;
+        try {
+            if (funcs.il2cpp_class_get_name) {
+                targetShortName = cstr(funcs.il2cpp_class_get_name(klass));
+            }
+        } catch (e) { targetShortName = null; }
+
+        var matches = [];
+        var overflow = false;
+        var poolExhausted = false;
+        var cbError = null;
+
+        var cb = new NativeCallback(function (objects, size) {
+            try {
+                for (var i = 0; i < size; i++) {
+                    if (matches.length >= maxCount) { overflow = true; return; }
+                    var p = objects.add(i * Process.pointerSize).readPointer();
+                    if (p && !p.isNull()) { matches.push(p); }
+                }
+            } catch (e) { cbError = String(e.message || e); }
+        }, 'void', ['pointer', 'int', 'pointer']);
+
+        // 池：闭包持有 ⇒ 生命周期覆盖整个调用，不会被 GC 掉
+        var POOL_SIZE = 8 * 1024 * 1024;
+        var pool = Memory.alloc(POOL_SIZE);
+        var poolUsed = 0;
+        function poolAlloc(size) {
+            var w = Number(size);
+            if (!w || w < 0) { return NULL; }
+            w = (w + 15) & ~15;
+            if (poolUsed + w > POOL_SIZE) { poolExhausted = true; return NULL; }
+            var p = pool.add(poolUsed);
+            poolUsed += w;
+            return p;
+        }
+
+        var reallocCb = new NativeCallback(function (handle, size) {
+            try {
+                // 只在「非空句柄 + 明确要求释放(size==0)」时 free。
+                // 实测第一版无条件对句柄调 free，会拿 NULL/0xffff… 去解引用，
+                // 报 `access violation accessing 0xffffffffffffffff`。
+                if (handle && !handle.isNull() && size.compare(0) === 0) {
+                    if (funcs.il2cpp_free) { funcs.il2cpp_free(handle); }
+                    return NULL;
+                }
+                return poolAlloc(size);
+            } catch (e) { cbError = String(e.message || e); return NULL; }
+        }, 'pointer', ['pointer', 'size_t', 'pointer']);
+
+        var state = NULL;
+        var stopped = false;
+        var startWorldError = null;
+        try {
+            funcs.il2cpp_stop_gc_world();
+            stopped = true;
+            state = funcs.il2cpp_unity_liveness_allocate_struct(
+                klass, 0, cb, NULL, reallocCb);
+            if (!state || state.isNull()) {
+                return fail('liveness allocate_struct 返回空 —— 该运行时可能不支持此路径',
+                            { engine: 'il2cpp', unsupported: true });
+            }
+            funcs.il2cpp_unity_liveness_calculation_from_statics(state);
+            funcs.il2cpp_unity_liveness_finalize(state);
+        } catch (e) {
+            return fail('实例枚举失败：' + (e.message || e), {
+                engine: 'il2cpp', counted: matches.length
+            });
+        } finally {
+            // **必须**恢复 GC world：否则一次异常就把游戏冻住
+            if (stopped) {
+                try { funcs.il2cpp_start_gc_world(); }
+                catch (e) { startWorldError = String(e.message || e); }
+            }
+            if (state && !state.isNull()) {
+                try { funcs.il2cpp_unity_liveness_free_struct(state); } catch (e) { }
+            }
+        }
+
+        var out = {
+            ok: true,
+            engine: 'il2cpp',
+            count: matches.length,
+            pointers: matches.map(function (p) { return p.toString(); }),
+            overflow: overflow
+        };
+
+        // 每个实例**真实**的类名。
+        //
+        // 为什么必须给：liveness 拿的是「该类**及其派生类**」的实例 ——
+        // 实测 `find_instances(UnityEngine.Transform)` 返回的全是
+        // `RectTransform`（Unity 里 UI 节点都是 RectTransform）。
+        // 这不是缺陷（语义如此），但**是个陷阱**：若调用方拿 Transform
+        // 的字段偏移去读一个 RectTransform，偏移可能不对。
+        // 所以把真实类名与「是否就是目标类本身」一并给出，让调用方能自证。
+        if (funcs.il2cpp_object_get_class && funcs.il2cpp_class_get_name) {
+            var exact = 0;
+            var names = {};
+            out.instances = matches.map(function (p) {
+                var nm = null;
+                try {
+                    var k = funcs.il2cpp_object_get_class(p);
+                    if (k && !k.isNull()) { nm = cstr(funcs.il2cpp_class_get_name(k)); }
+                } catch (e) { nm = null; }
+                if (nm) {
+                    names[nm] = (names[nm] || 0) + 1;
+                    if (nm === targetShortName) { exact++; }
+                }
+                return { pointer: p.toString(), class_name: nm };
+            });
+            out.class_name_counts = names;
+            out.exact_class_count = exact;
+            out.derived_count = matches.length - exact;
+            if (out.derived_count > 0) {
+                out.note = '返回的实例包含 ' + out.derived_count + ' 个**派生类**实例' +
+                           '（见 instances[].class_name）。用目标类的字段偏移去读' +
+                           '派生类实例可能出错，请按 class_name 甄别。';
+            }
+        }
+        if (poolExhausted) { out.pool_exhausted = true; }
+        if (cbError) { out.callback_error = cbError; }
+        if (startWorldError) {
+            // 恢复 GC world 失败是**严重**事件（游戏可能卡住），必须报出来
+            out.warning = '恢复 GC world 失败：' + startWorldError +
+                          '（游戏可能卡住，建议重启后重新注入）';
+        }
+        return out;
+    }
+
+    // ================================================================ 实例枚举
+
+    /**
+     * 枚举某个类在堆上的**活对象实例**（Mono）。
+     *
+     * 与 IL2CPP 不同：Mono **没有**「按类枚举实例」的 liveness 导出。
+     * 唯一相关的是 `mono_gc_walk_heap`，而它的官方头文件里写着一条硬限制
+     * （原文，注意这里不能写成块注释以免提前闭合）：
+     *
+     *     「heap walking is only valid in the pre-stop-world event callback」
+     *     MONO_API int mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data);
+     *
+     * 也就是说：**从 Frida 线程直接调它，官方语义下并不保证有效**。
+     * 这里如实实现并返回真实结果 —— 能拿到就报数，拿不到就明确说
+     * 「本运行时/本时机不可用」，**不假装成功**，也不拿空列表冒充「没有实例」。
+     *
+     * 回调签名（mono-gc.h）：
+     *     typedef int (*MonoGCReferences)(MonoObject *obj, MonoClass *klass,
+     *         uintptr_t size, uintptr_t num, MonoObject **refs,
+     *         uintptr_t *offsets, void *data);
+     * 返回非 0 继续遍历，返回 0 停止。
+     */
+    function findInstancesMono(klass, maxCount) {
+        if (!monoFuncs.mono_gc_walk_heap) {
+            return fail('本版 Mono 运行时没有 mono_gc_walk_heap 导出，' +
+                        '无法枚举实例（这是**版本差异**，不是探针缺陷）。' +
+                        '替代路径：Hook 一个会经过该对象的方法，从 args[0] 取实例',
+                        { engine: 'mono', unsupported: true });
+        }
+        if (!monoFuncs.mono_object_get_class) {
+            return fail('缺少 mono_object_get_class，无法按类过滤实例',
+                        { engine: 'mono', unsupported: true });
+        }
+
+        var matches = [];
+        var scanned = 0;
+        var overflow = false;
+        var cbError = null;
+        var target = klass;
+
+        var cb = new NativeCallback(function (obj, k, size, num, refs, offsets, data) {
+            try {
+                if (!obj || obj.isNull()) { return 1; }
+                scanned++;
+                if (scanned > 4000000) { return 0; }   // 防御性上限
+                var kk = k;
+                if (!kk || kk.isNull()) {
+                    kk = monoFuncs.mono_object_get_class(obj);
+                }
+                if (kk && !kk.isNull() && kk.equals(target)) {
+                    if (matches.length >= maxCount) { overflow = true; return 0; }
+                    matches.push(obj);
+                }
+            } catch (e) { cbError = String(e.message || e); return 0; }
+            return 1;
+        }, 'int', ['pointer', 'pointer', 'size_t', 'size_t',
+                   'pointer', 'pointer', 'pointer']);
+
+        var rc = null;
+        try {
+            // 返回类型按 pointer 包装（全文件统一），所以这里显式截成 int
+            var rcRaw = monoFuncs.mono_gc_walk_heap(0, cb, NULL);
+            rc = (rcRaw && rcRaw.toInt32) ? rcRaw.toInt32() : Number(rcRaw);
+        } catch (e) {
+            return fail('mono_gc_walk_heap 调用失败：' + (e.message || e), {
+                engine: 'mono', scanned: scanned, counted: matches.length
+            });
+        }
+
+        // rc == 0 且一个对象都没遍历到 ⇒ 官方那条限制生效了（不在
+        // pre-stop-world 回调里）。如实报「不可用」，而不是报「0 个实例」。
+        if (!matches.length && scanned === 0) {
+            return fail('mono_gc_walk_heap 返回 ' + rc + ' 且未遍历到任何对象。' +
+                        '按 Mono 官方头文件，堆遍历**只在 pre-stop-world 回调内有效**，' +
+                        '从外部线程调用不保证可用 —— 本次记为「本时机不可用」，' +
+                        '**不能**据此断定该实例不存在。' +
+                        '替代路径：Hook 会经过该对象的方法，从 args[0] 取实例',
+                        { engine: 'mono', unsupported: true, rc: rc,
+                          scanned: scanned });
+        }
+
+        var out = {
+            ok: true,
+            engine: 'mono',
+            count: matches.length,
+            scanned_objects: scanned,
+            pointers: matches.map(function (p) { return p.toString(); }),
+            overflow: overflow
+        };
+        if (cbError) { out.callback_error = cbError; }
+        return out;
+    }
+
     // ================================================================ 后端装配
 
     /** IL2CPP 的父类指针（fieldsWithInheritance 用）。 */
@@ -2176,6 +2513,9 @@
         },
         apiCount: function () { return Object.keys(funcs).length; },
         gcSupported: true,
+        findInstances: function (klass, maxCount) {
+            return findInstancesIL2CPP(klass, maxCount);
+        },
         // 「这个候选能不能 Hook」是**引擎相关**的判断，必须由后端给出：
         // IL2CPP 的机器码一定在 GameAssembly 里，所以不在模块内就是可疑候选
         // （空指针、转发桩）。见 BE_MONO 里的同名方法 —— Mono 恰好相反。
@@ -2201,6 +2541,9 @@
         gcControl: monoGcControl,
         apiCount: function () { return Object.keys(monoFuncs).length; },
         gcSupported: false,
+        findInstances: function (klass, maxCount) {
+            return findInstancesMono(klass, maxCount);
+        },
         // Mono 的 JIT 代码**一定**在 mono 模块外，所以「不在模块内」完全正常，
         // 不能用它筛掉候选 —— 只要 mono_compile_method 给出了非空地址就能 Hook。
         // 实测踩到的：session.py 曾用 `in_module is not False` 过滤候选，
@@ -2430,6 +2773,47 @@
                 count: fs.length,
                 fallbacks: fallbacks
             };
+        },
+
+        /**
+         * 枚举某个类的活对象实例（走 GC liveness）。
+         *
+         * 这是「拿到 instance 指针」的正路 —— 在此之前只能靠 Hook 碰运气。
+         * 引擎差异由后端各自处理（IL2CPP 有 liveness 导出；Mono 只有受限的
+         * mono_gc_walk_heap，可能如实报「本时机不可用」）。
+         */
+        findInstances: function (opts, preferredModule) {
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
+            if (!ready.ok) { return ready; }
+            opts = opts || {};
+            var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
+            if (!found.ok) { return found; }
+            if (!be.findInstances) {
+                return fail('当前引擎后端不支持实例枚举（' + be.kind + '）', {
+                    engine: be.kind, unsupported: true
+                });
+            }
+            var maxCount = opts.max_count;
+            if (typeof maxCount !== 'number' || maxCount <= 0) { maxCount = 100; }
+            if (maxCount > 100000) { maxCount = 100000; }
+
+            var res;
+            try {
+                res = be.findInstances(found.klass, maxCount);
+            } catch (e) {
+                return fail('实例枚举异常：' + (e.message || e), { engine: be.kind });
+            }
+            if (!res || !res.ok) { return res || fail('实例枚举失败'); }
+
+            // 把类的身份补进去：调用方据此确认「枚举的确实是这个类」
+            res.class = be.fullNameOf(found.klass);
+            res.image = found.image ? found.image.name : null;
+            res.klass = found.klass.toString();
+            res.max_count = maxCount;
+            if (fallbacks.length) { res.fallbacks = fallbacks; }
+            return res;
         },
 
         /**

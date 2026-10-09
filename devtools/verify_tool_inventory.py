@@ -93,6 +93,9 @@ NON_TOOL_IDENTIFIERS = {
     "running_pid",
     # set_field_value 的返回字段：写完回读到的实际值（`verified` 的依据）
     "read_back", "write_width", "write_kind", "value_before",
+    # find_instances 的参数与返回字段
+    "max_count", "overflow", "unsupported",
+    "exact_class_count", "derived_count", "class_name_counts",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",

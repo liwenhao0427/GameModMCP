@@ -230,6 +230,37 @@ runtime_class_info(name="PresetLoaderV2")
 # → methods: [{name, token, pointer, rva_hex, in_module}] ← 真实方法地址
 ```
 
+**拿对象实例：用 `find_instances`，别靠 Hook 碰运气。**
+
+`read_field_value` / `set_field_value` 都要一个 `instance=` 指针。
+以前唯一的办法是「Hook 一个恰好会收到该对象的函数、从 `args[0]` 捡」——
+那是碰运气。现在直接枚举该类的活实例：
+
+```python
+find_instances(name="UserData", max_count=20)
+# → {ok, class, engine, count: 3,
+#    pointers: ["0x1dd...", ...],
+#    instances: [{pointer, class_name}, ...],
+#    exact_class_count: 3, derived_count: 0}
+# 然后拿 pointers[0] 去 read_field_value / set_field_value
+```
+
+| 引擎 | 情况 |
+|---|---|
+| **IL2CPP** | ✅ 可用，实测毫秒级（GameObject / Transform / String 各约 10ms） |
+| **Mono** | ⚠️ 官方头文件写明堆遍历「只在 pre-stop-world 回调内有效」，从外部线程调用**不保证**可用。拿不到时它返回 `ok:false` + `unsupported:true` —— 那是「本时机不可用」，**不是**「没有实例」，别据此下结论 |
+
+四条注意：
+- **值类型（struct）没有堆实例**，会直接报错说明，不是返回空列表。
+- **⚠️ 返回的实例包含派生类**：实测 `find_instances("Transform",
+  namespace="UnityEngine")` 拿回的**全是 `RectTransform`**（Unity 里 UI 节点
+  都是它，而它是 Transform 的派生类）。**用基类的字段偏移去读派生类实例
+  可能出错** —— 按返回里的 `instances[].class_name` 甄别。
+  `exact_class_count` / `derived_count` 能一眼看出混没混。
+- `overflow:true` 表示实例数超过 `max_count`，**还有更多**。
+- 拿到的指针**只在游戏继续运行时有效**，对象可能被 GC 回收或随场景切换失效 ——
+  **立即使用**，不要跨步骤长期保存。
+
 **类名怎么传**（`runtime_class_info` / `find_hook_target` / `read_field_value` 通用）：
 
 | 你要找的 | 怎么传 | 结果 |

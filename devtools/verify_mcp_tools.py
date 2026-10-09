@@ -1062,12 +1062,76 @@ if pid:
                     break
             check("read_field_value 能读 this 的实例字段（args[0] 确实是对象）",
                   ok_field is not None, "；".join(tried) or "该类没有字段")
-            if ok_field:
-                _fr = ok_field[1]
-                print(f"       {ok_field[0]} = {_fr.get('raw_hex')} "
-                      f"（宽度 {_fr.get('read_width')} 字节，"
-                      f"地址 {_fr.get('field_address')}，"
-                      f"as_pointer={_fr.get('as_pointer')}）")
+
+        # ---- find_instances：**不靠 Hook** 直接枚举活实例
+        #
+        # 这是「最后一公里」的关键能力：在此之前，拿 instance 指针的唯一
+        # 办法就是上面那段「Hook 一个恰好会经过该对象的函数、等它自然调用」
+        # —— 碰运气。现在可以直接问运行时。
+        #
+        # 判据分三层，逐层加强：
+        #   1. 工具返回 ok 且 count>0（拿到了东西）
+        #   2. **独立读对象头**解出类名，与工具报的 class_name 一致
+        #      （证明指针真的是那个类的实例，不是野指针）
+        #   3. 派生类语义可核查：exact + derived == count
+        print()
+        print("     find_instances —— 直接枚举活对象实例：")
+        fi = S.find_instances(name="Transform", namespace="UnityEngine",
+                              max_count=5)
+        check("find_instances 返回 ok", fi.get("ok") is True,
+              str(fi.get("error"))[:100])
+        if fi.get("ok"):
+            print(f"       class={fi.get('class')} count={fi.get('count')} "
+                  f"overflow={fi.get('overflow')}")
+            print(f"       class_name_counts={fi.get('class_name_counts')} "
+                  f"exact={fi.get('exact_class_count')} "
+                  f"derived={fi.get('derived_count')}")
+            check("拿到非空实例列表", (fi.get("count") or 0) > 0,
+                  f"count={fi.get('count')}")
+            check("count 不超过 max_count", (fi.get("count") or 0) <= 5,
+                  f"count={fi.get('count')} max_count=5")
+            check("exact_class_count + derived_count == count",
+                  (fi.get("exact_class_count") or 0)
+                  + (fi.get("derived_count") or 0) == fi.get("count"),
+                  f"{fi.get('exact_class_count')}+{fi.get('derived_count')}"
+                  f" vs {fi.get('count')}")
+
+            insts = fi.get("instances") or []
+            check("instances 每项都带 class_name",
+                  bool(insts) and all(x.get("class_name") for x in insts),
+                  f"前 2 项={insts[:2]}")
+            # 第 2 层：独立复核指针有效 —— 读对象头，解出类名，与工具报的对照
+            if insts:
+                head = S.read_memory(address=insts[0]["pointer"], size=8)
+                kaddr = None
+                h = (head.get("hex") or "") if head.get("ok") else ""
+                if len(h) >= 16:
+                    kaddr = hex(int.from_bytes(bytes.fromhex(h[:16]), "little"))
+                check("实例指针可读（不是野指针）", kaddr is not None,
+                      f"read_memory ok={head.get('ok')}")
+                if kaddr:
+                    nm = S.eval_script(
+                        "(function(){"
+                        f" var k = ptr('{kaddr}');"
+                        "  try { return String(funcs.il2cpp_class_get_name(k)"
+                        ".readUtf8String()); } catch(e) { return 'ERR'; }"
+                        "})()"
+                    ).get("value")
+                    check("对象头解出的类名 == instances[0].class_name"
+                          "（证明这确实是该类的实例）",
+                          nm == insts[0].get("class_name"),
+                          f"内存={nm!r} 工具={insts[0].get('class_name')!r}")
+        # 值类型必须明确报错，不许用空列表冒充「没有实例」
+        vt = S.find_instances(name="Vector3", namespace="UnityEngine")
+        check("值类型如实报错（不返回空列表冒充「没有实例」）",
+              vt.get("ok") is False and "值类型" in str(vt.get("error", "")),
+              f"ok={vt.get('ok')} err={str(vt.get('error'))[:60]}")
+        if ok_field:
+            _fr = ok_field[1]
+            print(f"       {ok_field[0]} = {_fr.get('raw_hex')} "
+                  f"（宽度 {_fr.get('read_width')} 字节，"
+                  f"地址 {_fr.get('field_address')}，"
+                  f"as_pointer={_fr.get('as_pointer')}）")
         S.unhook(h_self.get("hook_id"))
 
     # ============================================================ 12. 内存与扫描

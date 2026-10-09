@@ -939,6 +939,46 @@ else:
               f"试过 {min(12, len(_cands))} 个候选，均无法在运行时取得"
               f"带偏移的基础类型字段")
 
+    # ---- find_instances 在 Mono 上的**契约**（不是「必须成功」）
+    #
+    # Mono 没有 liveness 导出，唯一相关的是 `mono_gc_walk_heap`，而官方
+    # 头文件写明堆遍历「只在 pre-stop-world 回调内有效」。所以这里**不能**
+    # 断言「一定能拿到实例」——那会把一个已知的引擎限制写成产品缺陷。
+    #
+    # 要断言的是**契约**：两种结果都合法，但不合法的是「假成功」——
+    #   · 拿到实例 → ok:true 且 count>0 且 pointers 非空
+    #   · 拿不到   → ok:false 且 unsupported:true（**不能**是 count:0，
+    #                那会被读成「这个类没有实例」）
+    # 用 `_cls` 的**短名 + 命名空间**传参（工具的 name 收的是短名；
+    # 传整串 "Ns.Class" 也能解析，但这里按规范写法来，避免把
+    # 「参数写法不对」误判成「Mono 不支持」）。
+    _fi = {}
+    if _cls:
+        _short = _cls.rsplit(".", 1)[-1]
+        _ns = _cls.rsplit(".", 1)[0] if "." in _cls else ""
+        _fi = S.find_instances(name=_short, namespace=_ns)
+    if _fi:
+        print(f"     find_instances({_cls}): ok={_fi.get('ok')} "
+              f"count={_fi.get('count')} unsupported={_fi.get('unsupported')} "
+              f"scanned={_fi.get('scanned_objects')}")
+        if _fi.get("ok"):
+            check("Mono 拿到实例时 count>0 且 pointers 非空",
+                  (_fi.get("count") or 0) > 0 and bool(_fi.get("pointers")),
+                  f"count={_fi.get('count')}")
+        else:
+            check("Mono 拿不到实例时是 ok:false + unsupported:true"
+                  "（不是 count:0 冒充「没有实例」）",
+                  _fi.get("unsupported") is True,
+                  f"unsupported={_fi.get('unsupported')!r} "
+                  f"count={_fi.get('count')!r}")
+            check("拿不到时**不返回** count（不给会被误读成结果的值）",
+                  _fi.get("count") is None, f"count={_fi.get('count')!r}")
+        print(f"     （Mono 的这条限制是引擎侧的，见 mono-gc.h 注释；"
+              f"不构成本项目缺陷）")
+    else:
+        check("find_instances 可调用（Mono 路径）", False,
+              "没有可用类名，跳过", warn_only=True)
+
     # ---- 收尾（含上面 hook_address 可能留下的 hook）
     S.unhook()
 

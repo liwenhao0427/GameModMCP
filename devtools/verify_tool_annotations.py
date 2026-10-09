@@ -88,7 +88,7 @@ READONLY_LOCAL = {
 READONLY_OPEN = {
     "find_game_processes", "runtime_info", "runtime_class_info",
     "find_hook_target", "hook_status", "read_memory", "read_field_value",
-    "scan_pattern",
+    "scan_pattern", "find_instances",
 }
 
 #: 非只读。name -> (destructiveHint, idempotentHint, openWorldHint)

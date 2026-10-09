@@ -25,10 +25,11 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
                      analyze_dependency / list_images / decompile
     4. 结果句柄层  : read_query_result
     5. 运行时层    : inject_process / launch_game / runtime_info /
-                     runtime_class_info / find_hook_target / hook_method /
-                     hook_address / unhook / hook_status / drain_events /
-                     read_memory / write_memory / read_field_value /
-                     set_field_value / scan_pattern / eval_script / gc_control
+                     runtime_class_info / find_instances / find_hook_target /
+                     hook_method / hook_address / unhook / hook_status /
+                     drain_events / read_memory / write_memory /
+                     read_field_value / set_field_value / scan_pattern /
+                     eval_script / gc_control
     6. UE 层       : detect_ue / ue_profile / ue_list_entries /
                      ue_script_objects / ue_manifest
     7. 诊断层      : get_diagnostics
@@ -1689,6 +1690,91 @@ def runtime_class_info(
         })
     except Exception as exc:
         return _err(f"查询失败：{exc}")
+
+
+@mcp.tool(annotations=_ann("枚举类的活对象实例", read_only=True, open_world=True))
+@_cap_response
+def find_instances(
+    name: str,
+    namespace: str = "",
+    image: str = "",
+    max_count: int = 100,
+) -> dict:
+    """枚举某个类的**活对象实例**（拿到 `instance` 指针的正路）。
+
+    为什么需要它：`read_field_value` / `set_field_value` / `hook_method`
+    都要一个对象指针，而在此之前**唯一的办法**是「Hook 一个恰好会收到
+    该对象的函数，从 `args[0]` 里捡」—— 那是碰运气。本工具直接问运行时
+    「这个类现在有哪些实例」。
+
+    实现走 **GC liveness**（Unity 自家内存分析器用的那套导出）。
+    注意：`il2cpp_class_get_instances` 这种「按类直接列实例」的导出
+    **并不存在**（5 个真实样本实测），别照着那个名字找。
+
+    引擎差异（**都是如实声明，不是缺陷**）：
+
+    | 引擎 | 情况 |
+    |---|---|
+    | IL2CPP | ✅ 可用，实测毫秒级（GameObject/Transform/String 各约 10ms） |
+    | Mono | ⚠️ 官方头文件写明堆遍历「只在 pre-stop-world 回调内有效」，从外部线程调用**不保证**可用。拿不到时本工具返回 `ok:false` + `unsupported:true`，**不会**用空列表冒充「没有实例」 |
+
+    两个明确的限制：
+
+    - **值类型（struct）没有堆实例**，会直接报错说明，而不是返回空列表。
+    - 实例数超过 `max_count` 时截断，`overflow:true` 表示「还有更多」。
+
+    ⚠️ **返回的实例包含派生类**（这是最容易踩的坑）：
+    `find_instances(name="Transform", namespace="UnityEngine")` 拿回来的
+    实测**全是 `RectTransform`** —— 因为 Unity 里 UI 节点都是 RectTransform，
+    而它们是 Transform 的派生类。这不是缺陷（liveness 语义如此），
+    但**用基类的字段偏移去读派生类实例可能出错**。
+
+    所以返回里带 `instances: [{pointer, class_name}]`
+    与 `exact_class_count` / `derived_count` / `class_name_counts`，
+    请按 `class_name` 甄别你要的是哪一种。
+
+    ⚠️ 拿到的指针**只在游戏继续运行时有意义**：对象可能随时被 GC 回收，
+    或随场景切换失效。应当**立即使用**（读字段 / 写字段 / 下 Hook），
+    不要跨多个步骤长期保存。
+
+    Args:
+        name:      类名（嵌套类型传完整嵌套名，同 `runtime_class_info`）。
+        namespace: 命名空间。
+        image:     程序集名。
+        max_count: 最多返回多少个实例（默认 100，上限 100000）。
+
+    Returns:
+        {ok, class, engine, count, pointers: [...],
+         instances: [{pointer, class_name}],
+         exact_class_count, derived_count, class_name_counts, overflow}
+        也可能带 `unsupported`（引擎不支持这条路径，如 Mono 的时机限制）
+        或 `warning`（恢复 GC world 失败，游戏可能卡住）。
+    """
+    st = state.state()
+    if not st.has_runtime():
+        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
+                    "或 launch_game。")
+    try:
+        res = st.runtime.find_instances(
+            namespace=namespace, name=name, image=image,
+            max_count=max_count,
+        )
+        if res.get("ok"):
+            return res
+        # 失败路径：**把探针的 detail 摊平到顶层**。
+        # 探针的 `fail(msg, extra)` 把附加信息放在 `detail` 里（全项目统一），
+        # 但 `unsupported` 这类标记是调用方**直接读**的语义位，藏在
+        # detail 里会被漏看 —— 实测：Mono 的时机限制返回了
+        # `detail.unsupported=true`，而验收脚本读顶层读到 None，
+        # 于是把「引擎限制」误判成「工具没按契约标注」。
+        extra = {k: v for k, v in res.items() if k not in ("ok", "error")}
+        detail = extra.pop("detail", None)
+        if isinstance(detail, dict):
+            for k, v in detail.items():
+                extra.setdefault(k, v)
+        return _err(res.get("error", "枚举实例失败"), **extra)
+    except Exception as exc:
+        return _err(f"枚举实例失败：{exc}")
 
 
 @mcp.tool(annotations=_ann("定位方法的 Hook 落点", read_only=True, open_world=True))

@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，39 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，40 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -103,7 +103,7 @@ Agent 会自动：
 
 ---
 
-## 工具一览（39 个）
+## 工具一览（40 个）
 
 > 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐（**9 处**检查）：
 > 数量或名字对不上就会非零退出。改工具请同步这张表。
@@ -186,6 +186,7 @@ Agent 会自动：
 | `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**；同名进程已在跑时直接拒绝，避免白等 60 秒）。`exe` 指向另一个游戏时会自动切换会话上下文（建新索引），返回里给 `context_switched` 说明换了哪个 |
 | `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检（`image_count_matches`） |
 | `runtime_class_info` | **真实字段偏移**与**方法真实地址**。嵌套类型请传完整嵌套名（`search_classes` 的 `nested_name`）；短名命中多个时拒绝并给 `candidates` |
+| `find_instances` | **枚举类的活对象实例**（拿 `instance` 指针的正路，此前只能靠 Hook 碰运气）。走 GC liveness。**IL2CPP 可用（实测毫秒级）**；Mono 受官方限制，拿不到时如实报 `unsupported` 而不用空列表冒充。值类型无堆实例会明确报错 |
 | `find_hook_target` | 定位 Hook 落点并比对 token（同样支持完整嵌套名，歧义时拒绝） |
 | `hook_method` | 按类名+方法名装 Hook（用 `token` 指定重载；多候选未指定则拒绝） |
 | `hook_address` | 按绝对地址装 Hook |
@@ -251,7 +252,7 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（39 个工具）
+│   ├── server.py                MCP 服务器（40 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
@@ -358,7 +359,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 45 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 46 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -393,6 +394,7 @@ GameModMCP/
 | `verify_mcp_extra.py` | 补全主流程没覆盖到的工具 |
 | `verify_server_helpers.py` | `server.py` 的纯函数：命令行拆分（`launch_game`）与字段读取宽度（`read_field_value`） |
 | `verify_field_write.py` | **字段写入的编码**（`set_field_value`）：宽度按类型、溢出必须报错不截断、浮点/整数不混、引用类型被拒。含**非空转反证**（改回「一律 8 字节」或去掉范围检查，断言必须报红） |
+| `verify_find_instances.py` | **实例枚举的语义**（`find_instances`）：`max_count`/`namespace` 真的传下去、**派生类混入可核查**（`exact+derived==count`；实测 `Transform` 全返回 `RectTransform`）、「拿不到」不许冒充「没有」（Mono 时机限制必须 `unsupported`）、只读标注。含非空转反证 |
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
@@ -406,7 +408,7 @@ GameModMCP/
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
-| `verify_tool_annotations.py` | 39 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
+| `verify_tool_annotations.py` | 40 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
 
@@ -449,7 +451,7 @@ python devtools\report_runtime_matrix.py      # 运行时：真的启动/注入/
 ```
 
 `report_runtime_matrix.py` 会**真的**启动每个游戏、注入探针、装 Hook、
-强制调用并读回参数与返回值，最后按「游戏 × 39 个工具」输出
+强制调用并读回参数与返回值，最后按「游戏 × 40 个工具」输出
 `ok / 不适用 / 失败` 三态（`--json` 落盘 + `--md` 出报告）。
 最近一次全量结果见 [`docs/多游戏运行时兼容性报告.md`](docs/多游戏运行时兼容性报告.md)。
 
