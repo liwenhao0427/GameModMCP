@@ -13,6 +13,9 @@
 # 多游戏扫描（report_multi_game_matrix.py）的产物：矩阵 JSON、日志、
 # 外加临时探针脚本。都是本机跑出来的东西，不进仓库。
 .cache-matrix/
+# 调研阶段抓下来的第三方网页/源码快照（子 Agent 用）。
+# 是「外部材料的本地副本」，不是交付物；结论已沉淀进 docs/ 与 agent_logs/。
+.cache-research/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal
