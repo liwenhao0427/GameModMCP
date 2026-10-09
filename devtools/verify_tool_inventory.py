@@ -91,6 +91,8 @@ NON_TOOL_IDENTIFIERS = {
     "available_handles",
     # launch_game 被同名进程拦下时返回「是哪个 pid 在跑」，是返回字段不是工具
     "running_pid",
+    # set_field_value 的返回字段：写完回读到的实际值（`verified` 的依据）
+    "read_back", "write_width", "write_kind", "value_before",
     # 「外面套了一层」时返回的建议路径（游戏根），是返回字段不是工具
     "game_root",
     "image_count", "rva_hex", "hex_data", "module", "offset",
@@ -100,6 +102,9 @@ NON_TOOL_IDENTIFIERS = {
     # `il2cpp_thread_attach/detach` 是「收尾后游戏崩溃」那节的根因说明：
     # 探针把 Frida 线程挂进域却没摘，卸载后游戏在 GC 时崩。属引擎 API 名。
     "il2cpp_thread_attach", "il2cpp_thread_detach",
+    # set_field_value 文档里说明「静态字段该用哪个引擎 API」时提到它，
+    # 是 IL2CPP C API 导出名，不是 MCP 工具。
+    "il2cpp_field_static_set_value",
     # close_session 返回的 steps 字段（表明探针线程已从引擎域摘除），
     # 是返回字段不是工具
     "domain_released",
@@ -184,7 +189,16 @@ def code_tools() -> set[str]:
     for i, line in enumerate(lines):
         if not line.lstrip().startswith("@mcp.tool("):
             continue
-        for nxt in lines[i + 1:]:
+        # 先把这个装饰器自身的括号配平（`_ann(...)` 可能跨多行），
+        # 否则第 3 行那种续行会被当成「不是装饰器也不是 def」而 break 掉，
+        # 导致该工具**被静默漏掉** —— 而漏掉的后果是「门禁全绿但少算一个工具」，
+        # 比报红更糟（实测：set_field_value 用多行装饰器时门禁仍报 38/38）。
+        depth = line.count("(") - line.count(")")
+        j = i
+        while depth > 0 and j + 1 < len(lines):
+            j += 1
+            depth += lines[j].count("(") - lines[j].count(")")
+        for nxt in lines[j + 1:]:
             s = nxt.strip()
             # 空行 / 注释 / **还有别的装饰器** 都继续往下找
             if not s or s.startswith("#") or s.startswith("@"):

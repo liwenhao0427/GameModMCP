@@ -621,6 +621,96 @@ else:
               widths_seen <= {1, 4, 8},
               f"实测宽度集合 = {sorted(widths_seen)}")
 
+        # ---- set_field_value：read_field_value 的**对称写入口**
+        #
+        # 复用上面那套「伪造实例」底座：把缓冲区基址当 instance 传进去，
+        # 工具自己按字段真实偏移算地址，正好落在我们控制的缓冲区里。
+        # 这样验的是**工具自己的偏移计算 + 类型编码 + 回读**，
+        # 而不是我们手工算的地址。
+        #
+        # 判据与读取那边同源、但更强：写完要能与独立读回的字节**逐字节相等**。
+        # 只报 ok 不够 —— 「写进去了但编码错」才是这个工具的真实风险
+        # （float 当成 int 写、300 截成 44 都属于这一类，且都显示 ok:true）。
+        print()
+        print("     set_field_value 的写入（按字段类型编码 + 回读核对）：")
+        SET_PROBE = [
+            ("TeamTapas.ProjectR.Ingame.InteractionDetector",
+             "_blockInteractFrameCount", "System.Int32", 4, 0x11223344,
+             0x55667788),
+            ("PresetLoaderV2", "_isLoading", "System.Boolean", 1, None, True),
+        ]
+        set_ok = 0
+        for cls, fname, ftype, want_w, first_val, second_val in SET_PROBE:
+            rci = S.runtime_class_info(name=cls)
+            if not rci.get("ok"):
+                check(f"{cls} 可查（写入验收）", False,
+                      str(rci.get("error", ""))[:70], warn_only=True)
+                continue
+            fld = next((f for f in (rci.get("fields") or [])
+                        if f.get("name") == fname), None)
+            if not fld or fld.get("offset") is None:
+                check(f"{cls}.{fname} 可用于写入验收", False,
+                      "样本变了", warn_only=True)
+                continue
+            base = write_marker(int(fld.get("offset")), want_w,
+                                first_val if first_val is not None else 0)
+            if not base.get("ok"):
+                check(f"{fname} 预备缓冲区", False,
+                      str(base.get("error", ""))[:70])
+                continue
+            inst = base.get("value")
+            # 1) 写一个与初值**不同**的值
+            sv = S.set_field_value(instance=inst, name=cls, field=fname,
+                                   value=second_val)
+            if not sv.get("ok"):
+                check(f"set_field_value({fname}) 返回 ok", False,
+                      str(sv.get("error", ""))[:100])
+                continue
+            set_ok += 1
+            print(f"       {fname:30} kind={sv.get('write_kind')} "
+                  f"width={sv.get('write_width')} "
+                  f"before={sv.get('value_before_hex')} "
+                  f"after={sv.get('read_back_hex')}")
+            check(f"{fname} 的 write_width == {want_w}",
+                  sv.get("write_width") == want_w,
+                  f"实际 {sv.get('write_width')}")
+            # 2) 回读核对字段（工具自己算的验证位）
+            check(f"{fname} 写入后自校验 verified is True",
+                  sv.get("verified") is True,
+                  f"verified={sv.get('verified')!r} "
+                  f"read_back={sv.get('read_back_hex')!r}")
+            # 3) **独立**用 read_field_value 再读一次 —— 不信工具自己的回读
+            indep = S.read_field_value(instance=inst, name=cls, field=fname)
+            if indep.get("ok"):
+                want_hex = (second_val.to_bytes(want_w, "little").hex()
+                            if isinstance(second_val, int) else "01")
+                got_hex = (indep.get("raw_hex") or "").lower()
+                check(f"{fname} 独立读回的字节 == 写入值",
+                      got_hex == want_hex,
+                      f"读回={got_hex} 期望={want_hex}")
+            else:
+                check(f"{fname} 独立读回成功", False,
+                      str(indep.get("error", ""))[:70], warn_only=True)
+
+        # 4) **拒绝**分支：引用类型字段不许被写（改引用属改逻辑）
+        rej = S.set_field_value(instance="0x1000", name="PresetLoaderV2",
+                                field="userDataPresetFile", value="0x1234")
+        check("引用类型字段（TextAsset）被拒绝，且不是 ok:false 的假失败",
+              rej.get("ok") is False and "引用类型" in str(rej.get("error", "")),
+              f"error={str(rej.get('error'))[:90]}")
+
+        # 5) **溢出**分支：不许静默截断
+        ovf = S.set_field_value(
+            instance="0x1000",
+            name="TeamTapas.ProjectR.Ingame.InteractionDetector",
+            field="_blockInteractFrameCount", value=2 ** 40)
+        check("int32 字段写入超范围值被拒绝（不静默截断）",
+              ovf.get("ok") is False and "超出" in str(ovf.get("error", "")),
+              f"error={str(ovf.get('error'))[:90]}")
+
+        check("set_field_value 至少成功写完一个字段（否则上面是空转）",
+              set_ok >= 1, f"成功 {set_ok}/{len(SET_PROBE)} 例")
+
         # ---- gc_control（签名是 disable: bool，不是 action 字符串）
         gcd = S.gc_control(disable=True)
         check("gc_control(disable=True) 返回 ok", gcd.get("ok") is True,

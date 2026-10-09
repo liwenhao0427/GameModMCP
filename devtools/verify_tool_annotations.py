@@ -108,11 +108,13 @@ MUTATING: dict[str, tuple[bool, bool, bool]] = {
     "unhook":         (True, True, True),     # 不带 id 会把 Hook 全卸了
     "drain_events":   (True, False, True),    # **取走即消费**，事件没了就没了
     "write_memory":   (True, True, True),     # 写错地址立刻崩游戏
+    "set_field_value": (True, True, True),    # 同上：写错值/地址立刻崩游戏
     "eval_script":    (True, False, True),    # 游戏进程内任意代码执行
 }
 
 #: 必须声明为破坏性的工具（客户端要弹确认的就是它们）
-MUST_BE_DESTRUCTIVE = {"write_memory", "eval_script", "unhook", "drain_events"}
+MUST_BE_DESTRUCTIVE = {"write_memory", "set_field_value", "eval_script",
+                       "unhook", "drain_events"}
 
 #: **曾经写错**的标注 —— 点名钉住，防止有人改回去
 MUST_NOT_BE_READONLY = {

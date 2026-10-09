@@ -54,8 +54,23 @@ PASS = 0
 FAIL = 0
 WARN = 0
 
-#: 与其余验收脚本一致的工具数口径。
-EXPECTED_TOOLS = 38
+#: 工具数**不再写死**，而是从唯一真值（server.py 的 @mcp.tool）现算。
+#:
+#: 原来这里是 `EXPECTED_TOOLS = 38`。数值写死的清单必然漂移 ——
+#: 实测：新增 `set_field_value` 之后，本脚本报「工具数仍是 38 — 实际 39」，
+#: 而这条报红**并不代表 P2-3 的结论变了**（新工具同样是同步、同样不碰
+#: Context）。但它的提示语写着「请先读 §3.13 重新判断，不要直接改断言」，
+#: 于是一次纯粹的加工具就被迫做一轮「重新判断」，容易被误当成结论失效。
+#: 真正要钉住的是**下面第 2/3 节的性质**（没有人吃 ctx / 全是同步函数），
+#: 那才是 §3.13 的依据；工具总数只是防漂移的哨兵，交给真值来源即可。
+def _expected_tools() -> int:
+    import sys as _s
+    _s.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    import verify_tool_inventory as _inv
+    return len(_inv.code_tools())
+
+
+EXPECTED_TOOLS = _expected_tools()
 
 #: `RequestContext` 上**允许**出现的字段名（mcp 1.26.0 实测）。
 #: 这里不是「白名单」而是**观测记录**：哪天多出 `cancelled` 之类的字段，

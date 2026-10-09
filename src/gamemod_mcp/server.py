@@ -28,7 +28,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
                      runtime_class_info / find_hook_target / hook_method /
                      hook_address / unhook / hook_status / drain_events /
                      read_memory / write_memory / read_field_value /
-                     scan_pattern / eval_script / gc_control
+                     set_field_value / scan_pattern / eval_script / gc_control
     6. UE 层       : detect_ue / ue_profile / ue_list_entries /
                      ue_script_objects / ue_manifest
     7. 诊断层      : get_diagnostics
@@ -79,6 +79,7 @@ import asyncio
 import functools
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -515,6 +516,136 @@ def _field_read_width(type_name: Any) -> int:
     if not type_name:
         return 8
     return _FIELD_WIDTH.get(str(type_name).strip(), 8)
+
+
+#: 字段类型名 → 写值时的「解释方式」。与 `_FIELD_WIDTH` 同一张表的口径，
+#: 但**必须区分有符号/无符号/浮点**：同样 4 字节，写成 int 还是 float
+#: 得到的字节完全不同，而 `as_int32` 与 `as_float` 在读取时会同时给出，
+#: 写的时候却只能选一个 —— 选错的后果是「值看着变了、游戏行为不对」。
+_FIELD_WRITE_KIND: dict[str, str] = {
+    "System.Boolean": "bool", "bool": "bool",
+    "System.SByte": "int", "sbyte": "int",
+    "System.Byte": "uint", "byte": "uint",
+    "System.Int16": "int", "short": "int",
+    "System.UInt16": "uint", "ushort": "uint",
+    "System.Int32": "int", "int": "int",
+    "System.UInt32": "uint", "uint": "uint",
+    "System.Int64": "long", "long": "long",
+    "System.UInt64": "ulong", "ulong": "ulong",
+    "System.Single": "float", "float": "float",
+    "System.Double": "double", "double": "double",
+    "System.Char": "uint", "char": "uint",
+    "System.IntPtr": "long", "System.UIntPtr": "ulong",
+}
+
+
+def _field_write_kind(field_type: Any, width: int) -> str:
+    """字段类型 + 宽度 → 写值方式。
+
+    类型认不出来时**按宽度**给一个保底解释：4 字节按 int、8 字节按 long。
+    为什么不按 ptr：写指针是极危险的操作，而「引用类型字段」写指针
+    在语义上多半是错的（用户想要的是改内容而不是换对象），
+    所以引用类型这里**统一报错**，让调用方改用 `eval_script` 或 Hook。
+    """
+    key = str(field_type).strip() if field_type else ""
+    if key in _FIELD_WRITE_KIND:
+        return _FIELD_WRITE_KIND[key]
+    if width == 1:
+        return "uint"
+    if width == 2:
+        return "int"
+    if width == 4:
+        return "int"
+    if width == 8:
+        return "long"
+    return "bytes"
+
+
+def _encode_field_value(value: Any, width: int, kind: str) -> tuple[bytes | None, str]:
+    """把调用方给的值编码成 `width` 字节。返回 `(bytes, error)`。
+
+    抽成**纯函数**是为了能在不启动游戏的情况下验收（§5 要求纯函数与
+    端到端两层都验）：编码错了会让「写入成功但值不对」，而那种缺陷
+    在 e2e 里很难与「游戏自己覆盖了」区分开。
+
+    规矩：**溢出直接报错，绝不静默截断**。把 300 写进 1 字节字段如果
+    截成 44，调用方会看到「ok:true」却拿到一个自己没要的值。
+    """
+    import struct as _struct
+
+    def _need(cond: bool, msg: str) -> str | None:
+        return None if cond else msg
+
+    try:
+        if kind == "bytes":
+            s = str(value).strip()
+            if s.startswith("0x") or s.startswith("0X"):
+                s = s[2:]
+            s = s.replace(" ", "")
+            if len(s) % 2:
+                return None, f"字节串长度必须是偶数个十六进制字符：{value!r}"
+            try:
+                b = bytes.fromhex(s)
+            except ValueError:
+                return None, f"不是合法的十六进制字节串：{value!r}"
+            if len(b) != width:
+                return None, (f"字节串长度 {len(b)} 与字段宽度 {width} 不一致"
+                              f"（字段类型决定宽度，不能多也不能少）")
+            return b, ""
+
+        if kind == "bool":
+            if isinstance(value, bool):
+                return (b"\x01" if value else b"\x00"), ""
+            s = str(value).strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return b"\x01", ""
+            if s in ("0", "false", "no", "off"):
+                return b"\x00", ""
+            return None, f"bool 字段只认 true/false/1/0，收到 {value!r}"
+
+        if kind == "float":
+            return _struct.pack("<f", float(value)), ""
+        if kind == "double":
+            return _struct.pack("<d", float(value)), ""
+
+        # 整数族：先按字符串解析，避免 float 传进来被静默截断
+        if isinstance(value, bool):
+            return None, f"bool 不能写进 {kind} 字段（要写 1/0 请写整数）"
+        s = str(value).strip()
+        try:
+            iv = int(s, 0)  # 支持 0x 前缀
+        except ValueError:
+            return None, f"{kind} 字段要整数，收到 {value!r}"
+
+        limits = {
+            "int": (-(1 << 7), (1 << 7) - 1, "b", 1),
+            "uint": (0, (1 << 8) - 1, "B", 1),
+            "long": (-(1 << 63), (1 << 63) - 1, "q", 8),
+            "ulong": (0, (1 << 64) - 1, "Q", 8),
+        }
+        # 1/2/4 字节统一走 int/uint 的宽度表
+        width_limits = {
+            (1, "int"): (-128, 127), (1, "uint"): (0, 255),
+            (2, "int"): (-32768, 32767), (2, "uint"): (0, 65535),
+            (4, "int"): (-(1 << 31), (1 << 31) - 1),
+            (4, "uint"): (0, (1 << 32) - 1),
+        }
+        if kind in ("int", "uint") and (width, kind) in width_limits:
+            lo, hi = width_limits[(width, kind)]
+        elif kind in limits:
+            lo, hi = limits[kind][0], limits[kind][1]
+        else:
+            return None, f"不支持的值类型：{kind}"
+        if not (lo <= iv <= hi):
+            return None, (f"{iv} 超出 {kind}({width} 字节) 的范围 [{lo}, {hi}]；"
+                          f"溢出不会被静默截断")
+        fmt = {1: ("b" if kind == "int" else "B"),
+               2: ("h" if kind == "int" else "H"),
+               4: ("i" if kind == "int" else "I"),
+               8: ("q" if kind in ("long", "int") else "Q")}[width]
+        return _struct.pack("<" + fmt, iv), ""
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, f"编码失败：{exc}"
 
 
 # ================================================================
@@ -1979,6 +2110,182 @@ def read_field_value(
     except Exception as exc:
         return _err(f"读取字段失败：{exc}")
 
+
+@mcp.tool(annotations=_ann("写入对象实例的字段值", read_only=False, open_world=True,
+                           destroy=True, idempotent=True))
+@_cap_response
+def set_field_value(
+    instance: str,
+    name: str,
+    field: str,
+    value: Any,
+    namespace: str = "",
+    image: str = "",
+    verify: bool = True,
+) -> dict:
+    """写入某个对象实例上某个字段的值（`read_field_value` 的对称入口）。
+
+    ⚠️ **危险操作**：写错地址或写错值会立刻让游戏崩溃或行为异常。
+    写之前**务必先 `read_field_value` 读一次**，确认偏移与当前值符合预期。
+
+    与 `write_memory` 的分工（不是重复工具）：
+    `write_memory` 要「地址 + 裸十六进制字节」，是**原始内存**入口；
+    本工具要「哪个对象的哪个字段 + 一个语义化的值」，是**字段**入口。
+    它替你做了三件容易做错的事：查真实偏移、按字段类型定宽度、
+    按字段类型选整数/浮点/布尔的编码。
+
+    **写几个字节由字段类型决定**（与读取同一张表）：bool 1、int16 2、
+    int32/float 4、long/double/引用类型 8。**溢出直接报错，不静默截断** ——
+    把 300 写进 1 字节字段如果截成 44，你会看到 `ok:true` 却拿到没要的值。
+
+    **引用类型字段（class/string/数组）会被拒绝**：`field_type` 认不出基础类型
+    且宽度为 8 时，本工具报错而不是去写一个指针 —— 换对象引用属于改逻辑，
+    应该用 `eval_script` 或 Hook，而不是改一个字段的字节。
+
+    Args:
+        instance:  对象指针（十六进制）。可用 `find_instances` 拿，
+                   或从 Hook 事件的 args[0] 拿。
+        name:      类名。
+        field:     字段名。
+        value:     要写入的值。整数按字段宽度与符号解释；浮点字段给数字；
+                   bool 字段给 true/false/1/0；认不出类型时给 `0x...` 字节串。
+        namespace: 命名空间。
+        image:     程序集名。
+        verify:    写完后立刻回读一次并放进返回（默认 True）。
+                   **这是为了不留「假成功」**：写完把实测值给你，而不是只报 ok。
+
+    Returns:
+        {ok, class, field, instance, offset, field_address, wrote_hex,
+         write_width, write_kind, value_before?, read_back?...}
+    """
+    st = state.state()
+    if not st.has_runtime():
+        return _err("当前没有已注入的运行时会话。请先调用 inject_process。")
+    try:
+        ci = st.runtime.class_fields(namespace=namespace, name=name,
+                                     image=image, instance_only=True)
+        if not ci.get("ok"):
+            return _err(ci.get("error", "未找到类"), **{
+                k: v for k, v in ci.items() if k not in ("ok", "error")
+            })
+        hit = None
+        for f in ci.get("fields") or []:
+            if f.get("name") == field:
+                hit = f
+                break
+        if hit is None:
+            return _err(
+                f"类 {name} 里没有实例字段 {field}",
+                available=[f.get("name") for f in (ci.get("fields") or [])],
+            )
+        if hit.get("is_static") is True:
+            return _err(f"字段 {field} 是静态字段，本工具只写实例字段"
+                        "（静态字段请用 eval_script 调 il2cpp_field_static_set_value）")
+
+        off = hit.get("offset")
+        if off is None:
+            return _err(f"字段 {field} 没有运行时偏移")
+
+        try:
+            inst_val = int(instance, 16)
+        except (ValueError, TypeError):
+            return _err(f"instance 不是合法的十六进制地址：{instance}")
+
+        ftype = hit.get("type")
+        width = _field_read_width(ftype)
+        kind = _field_write_kind(ftype, width)
+
+        # 宽度 8 且类型认不出来 = 多半是引用类型。写指针会改逻辑，明确拒绝。
+        if kind == "long" and (not ftype or str(ftype).strip() not in _FIELD_WRITE_KIND):
+            return _err(
+                f"字段 {field} 的类型 {ftype!r} 认不出（宽度 8），"
+                f"疑似**引用类型**。写入指针属于改逻辑，请改用 eval_script / Hook；"
+                f"确实要写裸字节请用 write_memory。",
+                field_type=ftype, field_address=hex(inst_val + int(off)),
+            )
+
+        blob, enc_err = _encode_field_value(value, width, kind)
+        if blob is None:
+            return _err(f"值编码失败：{enc_err}",
+                        field_type=ftype, write_width=width, write_kind=kind)
+
+        field_addr = inst_val + int(off)
+
+        out: dict[str, Any] = {
+            "class": name,
+            "field": field,
+            "instance": instance,
+            "offset": off,
+            "field_address": hex(field_addr),
+            "field_type": ftype,
+            "write_width": width,
+            "write_kind": kind,
+            "wrote_hex": blob.hex(),
+        }
+
+        # 先读原值：既给回滚依据，也让「写前后有差别」这件事可核查
+        before = st.runtime.read_memory(hex(field_addr), width)
+        if before.get("ok"):
+            out["value_before_hex"] = before.get("hex")
+            out["value_before"] = _explain_bytes(before.get("hex") or "")
+
+        wr = st.runtime.write_memory(hex(field_addr), blob.hex())
+        if not wr.get("ok"):
+            return _err(wr.get("error", "写入内存失败"),
+                        field_address=hex(field_addr), wrote_hex=blob.hex())
+
+        if verify:
+            after = st.runtime.read_memory(hex(field_addr), width)
+            if after.get("ok"):
+                out["read_back_hex"] = after.get("hex")
+                out["read_back"] = _explain_bytes(after.get("hex") or "")
+                out["verified"] = (after.get("hex") or "").lower() == blob.hex().lower()
+                if not out["verified"]:
+                    # 写完不是自己写的内容 —— 必须说出来，不能报成功
+                    return _err(
+                        "写入后回读到的字节与写入值不一致（可能被游戏立刻覆盖，"
+                        "或地址不对）。**不要**当成成功。",
+                        **out,
+                    )
+            else:
+                out["verified"] = None
+                out["verify_error"] = after.get("error")
+        return _ok(**out)
+    except Exception as exc:
+        return _err(f"写入字段失败：{exc}")
+
+
+def _explain_bytes(hexs: str) -> dict:
+    """按**实际长度**解释一段小端字节，只给这个长度下有意义的解释。
+
+    与 `read_field_value` 用同一口径（那边是内联的），抽出来给
+    `set_field_value` 复用，避免两处对同一段字节给出不同解释。
+    """
+    import struct as _struct
+    out: dict[str, Any] = {}
+    try:
+        if len(hexs) >= 2:
+            b1 = bytes.fromhex(hexs[:2])
+            out["as_int8"] = _struct.unpack("<b", b1)[0]
+            out["as_uint8"] = _struct.unpack("<B", b1)[0]
+            out["as_bool"] = b1[0] != 0
+        if len(hexs) >= 4:
+            b2 = bytes.fromhex(hexs[:4])
+            out["as_int16"] = _struct.unpack("<h", b2)[0]
+            out["as_uint16"] = _struct.unpack("<H", b2)[0]
+        if len(hexs) >= 8:
+            b4 = bytes.fromhex(hexs[:8])
+            out["as_int32"] = _struct.unpack("<i", b4)[0]
+            out["as_uint32"] = _struct.unpack("<I", b4)[0]
+            out["as_float"] = round(_struct.unpack("<f", b4)[0], 6)
+        if len(hexs) >= 16:
+            b8 = bytes.fromhex(hexs[:16])
+            out["as_int64"] = _struct.unpack("<q", b8)[0]
+            out["as_double"] = _struct.unpack("<d", b8)[0]
+            out["as_pointer"] = hex(_struct.unpack("<Q", b8)[0])
+    except (ValueError, struct.error):  # pragma: no cover - 防御
+        pass
+    return out
 
 @mcp.tool(annotations=_ann("内存特征码扫描", read_only=True, open_world=True))
 @_cap_response

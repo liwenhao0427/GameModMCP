@@ -205,7 +205,13 @@ def main() -> int:
     section("6. 加了资源之后，工具层不受影响")
 
     tools = asyncio.run(S.mcp.list_tools())
-    check("工具数仍是 38", len(tools) == 38, f"实际 {len(tools)}")
+    # 工具数从**唯一真值**现算（原来写死 38）。这条断言的本意是
+    # 「加资源没把工具弄丢/弄多」，不是「恰好 38 个」—— 写死数值后，
+    # 每次新增工具都会在这里报红一次，制造与资源无关的噪声。
+    import verify_tool_inventory as _inv
+    _expected = len(_inv.code_tools())
+    check(f"工具数与代码一致（{_expected} 个）", len(tools) == _expected,
+          f"实际 {len(tools)}")
     check("资源没有混进工具清单",
           not [t for t in tools if "guide" in t.name or "resource" in t.name],
           f"疑似={[t.name for t in tools if 'guide' in t.name]}")

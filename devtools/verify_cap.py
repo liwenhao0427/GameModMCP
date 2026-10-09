@@ -369,8 +369,13 @@ def test_decorator() -> None:
     import inspect
 
     tools = {t.name: t for t in asyncio.run(S.mcp.list_tools())}
-    check("工具数与 server 模块里的工具数一致", len(tools) == 38,
-          f"list_tools 给出 {len(tools)} 个")
+    # 工具数从**唯一真值**（server.py 的 @mcp.tool）现算，不写死数值。
+    # 写死的清单必然漂移：实测新增 `set_field_value` 后这里报红，
+    # 而那条断言的**本意**是「装饰器没把工具弄丢」，不是「恰好 38 个」。
+    import verify_tool_inventory as _inv
+    expected = len(_inv.code_tools())
+    check("工具数与 server 模块里的工具数一致", len(tools) == expected,
+          f"list_tools 给出 {len(tools)} 个，代码里 {expected} 个")
 
     missing, mismatch, varargs = [], [], []
     for name, t in sorted(tools.items()):
@@ -392,10 +397,10 @@ def test_decorator() -> None:
         if var:
             varargs.append(f"{name}: {var}")
 
-    check("每个工具都登记了未套上限的原函数（RAW_TOOLS 覆盖 38/38）",
+    check("每个工具都登记了未套上限的原函数（RAW_TOOLS 全覆盖）",
           not missing and len(S.RAW_TOOLS) == len(tools),
           f"缺失：{missing}" if missing
-          else f"RAW_TOOLS 共 {len(S.RAW_TOOLS)} 个")
+          else f"RAW_TOOLS 共 {len(S.RAW_TOOLS)} 个 / 工具 {len(tools)} 个")
     check("每个工具注册出去的入参 schema 与其原函数签名完全一致",
           not mismatch,
           f"不一致：{mismatch[:3]}" if mismatch else "38 个工具逐个比对通过")

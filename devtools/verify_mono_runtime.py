@@ -886,6 +886,47 @@ else:
                     check("读回的正是写在真实偏移上的标记值",
                           (_rf.get("raw_hex") or "").lower() == "44332211",
                           f"raw_hex={_rf.get('raw_hex')!r} 期望=44332211")
+
+                # ---- set_field_value：**写**入口（read_field_value 的对称面）
+                #
+                # 这是动态覆盖率门禁要求的「真的调用过」证据，但它不只是为了
+                # 覆盖率 —— 这里同样验行为：写完要能**独立读回**同一个值。
+                # 用同一个伪造实例：初值 0x11223344，写一个新值再读回。
+                _sv = S.set_field_value(instance=_inst, name=_cls,
+                                        field=_pick["name"],
+                                        value="0x55667788")
+                print(f"     set_field_value: ok={_sv.get('ok')} "
+                      f"kind={_sv.get('write_kind')} "
+                      f"width={_sv.get('write_width')} "
+                      f"before={_sv.get('value_before_hex')} "
+                      f"after={_sv.get('read_back_hex')} "
+                      f"verified={_sv.get('verified')}")
+                check("set_field_value 返回 ok", _sv.get("ok") is True,
+                      str(_sv.get("error"))[:110])
+                if _sv.get("ok"):
+                    check("写入宽度按字段类型（4 字节字段 → write_width=4）",
+                          _sv.get("write_width") == 4,
+                          f"实际 {_sv.get('write_width')}")
+                    check("写前原值被如实记录（0x11223344）",
+                          (_sv.get("value_before_hex") or "").lower() == "44332211",
+                          f"value_before_hex={_sv.get('value_before_hex')!r}")
+                    check("写入后自校验 verified is True",
+                          _sv.get("verified") is True,
+                          f"read_back_hex={_sv.get('read_back_hex')!r}")
+                    # **独立**再读一次：不信工具自己的回读
+                    _rf2 = S.read_field_value(instance=_inst, name=_cls,
+                                              field=_pick["name"])
+                    check("独立读回的字节 == 写入值（0x55667788 → 88776655）",
+                          (_rf2.get("raw_hex") or "").lower() == "88776655",
+                          f"raw_hex={_rf2.get('raw_hex')!r} 期望=88776655")
+
+                # ---- 拒绝分支：超范围值不许静默截断
+                _ovf = S.set_field_value(instance=_inst, name=_cls,
+                                         field=_pick["name"], value=2 ** 40)
+                check("写超范围值被拒绝（不静默截断）",
+                      _ovf.get("ok") is False
+                      and "超出" in str(_ovf.get("error", "")),
+                      f"error={str(_ovf.get('error'))[:90]}")
         else:
             check("找到可用于 read_field_value 的实例字段", False,
                   f"{_cls} 没有带偏移的基础类型实例字段")

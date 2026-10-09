@@ -242,6 +242,28 @@ runtime_class_info(name="PresetLoaderV2")
 - 字段的字节偏移 → 可以用 `read_memory` / `read_field_value` 读写数值
 - 方法的绝对地址 → 可以用 `hook_address` 挂钩
 
+**读与写是对称的两个入口**（`read_field_value` / `set_field_value`）：
+两者都要「哪个对象的哪个字段」，都按**字段类型**决定宽度，都不需要你自己算偏移。
+区别只在 `write_memory` 是**原始字节**入口（要地址 + 十六进制串），
+上面两个是**字段**入口。改数值优先用 `set_field_value`：
+
+```python
+set_field_value(instance="0x...", name="UserData", field="gold", value=9999)
+# → {ok, offset, field_address, write_width, write_kind,
+#    value_before{as_int32}, read_back{as_int32}, verified: true}
+```
+
+它替你挡掉三类常见错误：
+
+| 情况 | 行为 |
+|---|---|
+| 值超出字段宽度（如 300 写进 1 字节） | **报错，不静默截断**（截成 44 会让你以为成功了） |
+| 字段类型认不出、宽度 8（多半是引用类型） | **拒绝**：换对象引用属于改逻辑，该用 `eval_script` / Hook |
+| 静态字段 | **拒绝**：那是 `il2cpp_field_static_set_value` 的事 |
+
+`verify=True`（默认）会在写完后**回读一次**并把实测值放进 `read_back`；
+回读与写入不一致时**报 `ok:false`**，不会给你一个「看着成功」的结果。
+
 ### 第 6 步：Hook 并观察
 
 ```python
@@ -572,8 +594,12 @@ hook_method(name="Object", method="get_name", namespace="UnityEngine",
 
 ### 写入内存是危险操作
 
-`write_memory` / `read_field_value` 写错地址会**立刻崩溃游戏**。
+`write_memory` / `set_field_value` 写错地址或写错值会**立刻崩溃游戏**。
 规矩：**先读、确认值符合预期、再写**。写之前把原值记下来。
+
+**改「某个对象的某个字段」请优先用 `set_field_value`**，别自己算地址：
+它按字段类型定宽度、按类型选整数/浮点/布尔编码、溢出直接报错、写完回读核对。
+只有要写**裸字节**（补丁、结构体数组、认不出的类型）时才用 `write_memory`。
 
 **绝不要写已装 Hook 的函数入口**：Frida 的 Interceptor 拥有那几字节
 （它在入口写了跳转指令），绕过它直接写同一块内存 —— **哪怕写回刚读到的
