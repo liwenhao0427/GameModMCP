@@ -100,6 +100,8 @@ NON_TOOL_IDENTIFIERS = {
     "class_name", "click_point", "coordinate_space", "best_match",
     # wait_for 的参数（与 field/instances 分支共用）
     "min_count", "equals", "timeout_ms", "interval_ms", "verdict",
+    # verify_state 的参数与返回字段
+    "require_independent", "checks", "independent_count", "verdict_reason",
     # SKILL.md 配方 8（模拟按键）里提到的 Win32 常量与「本项目**没有**的
     # 工具名」：`send_key` 是明说「本工具集没有它、所以走 eval_script」
     # 时提到的，不是引用一个存在的工具。INPUT_KEYBOARD 是 Win32 常量。
@@ -336,6 +338,33 @@ def main() -> int:
     if not nums:
         check("README 里找到了工具数量声明", False,
               "没找到「N 个工具」字样（工具清单应说明规模）")
+
+    # ------------------------------------------------- 2b. 生成式一致性
+    #
+    # 第 1 节是「表格里的工具名 vs 代码」—— 它能发现**名字**漂移。
+    # 但描述文字、层级归属、表格结构漂了它是看不出来的。
+    # 所以再加一条更强的：README 那一节必须**逐字节等于重新生成的结果**。
+    #
+    # 为什么这条比第 1 节更强：第 1 节是「校验」，只能发现漂移；
+    # 生成则**不会产生**漂移 —— 本表的工具数曾手工漂过 5 次以上。
+    show("2b. README「工具一览」必须等于 gen_docs.py 的生成结果（生成 > 校验）")
+    import subprocess
+    gen = ROOT / "devtools" / "gen_docs.py"
+    if not gen.is_file():
+        check("gen_docs.py 存在", False, "生成脚本不见了 —— 门禁无法执行")
+    else:
+        r = subprocess.run([_sys.executable, str(gen), "--check"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=180)
+        out = (r.stdout or "") + (r.stderr or "")
+        check("README 工具表与代码生成结果一致", r.returncode == 0,
+              out.strip().splitlines()[0] if out.strip() else f"exit={r.returncode}")
+        # 非空转：确认 README 里真的有生成区块标记
+        rtext2 = README.read_text(encoding="utf-8")
+        check("README 里有生成区块标记（否则上面那条是空转的）",
+              "<!-- BEGIN GENERATED: tools -->" in rtext2
+              and "<!-- END GENERATED: tools -->" in rtext2,
+              "缺标记则 replace_block 会直接报错，这里提前拦住")
 
     # ------------------------------------------------------------ 3. server docstring
     show("3. server.py 模块 docstring「工具分层」列表 vs 代码")

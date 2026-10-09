@@ -30,7 +30,7 @@ AiMod 是把「云 LLM + 本地 MCP 工具（26 个）」打包成一个 Tauri �
                      drain_events / read_memory / write_memory /
                      read_field_value / set_field_value / scan_pattern /
                      eval_script / gc_control
-    6. 弱视觉/UI层: capture_screen / ocr / probe_log / wait_for
+    6. 弱视觉/UI层: capture_screen / ocr / probe_log / wait_for / verify_state
     7. UE 层       : detect_ue / ue_profile / ue_list_entries /
                      ue_script_objects / ue_manifest
     8. 诊断层      : get_diagnostics
@@ -759,7 +759,7 @@ def open_game(
     cache_dir: str = "",
     force_rebuild: bool = False,
 ) -> dict:
-    """选定游戏，并构建（或复用）它的元数据索引。
+    """选定游戏，并构建（或复用）它的元数据索引（**跨引擎自动识别**）。
 
     之后所有查询工具都以这个游戏为上下文。切换游戏会重置会话
     （已注入的运行时会被安全卸载）。
@@ -906,7 +906,10 @@ def get_session() -> dict:
 @mcp.tool(annotations=_ann("关闭会话", read_only=False, destroy=False, idempotent=True))
 @_cap_response
 def close_session(close_runtime: bool = True, close_index: bool = True) -> dict:
-    """关闭当前会话：卸载所有 Hook、断开注入、关闭索引。
+    """关闭当前会话：卸载所有 Hook、断开注入、关闭索引。**只有真的恢复原状才 `ok=true`**。
+
+    任一步失败会 `ok=false` + `error`，并**保留会话**以便重试 —— 这是有意的：
+    本工具的语义是「游戏已恢复原状」，一个假成功会让你带着仍被篡改的游戏收工。
 
     做完了就调用它，把游戏恢复原状（卸载 Hook 后游戏行为回到未修改状态）。
 
@@ -957,7 +960,7 @@ def search_classes(
     only_enums: bool = False,
     exclude_compiler_generated: bool = True,
 ) -> dict:
-    """搜索游戏里的类、结构体、枚举 —— Mod 开发最主要的入口。
+    """搜索游戏里的类、结构体、枚举 —— Mod 开发最主要的入口。支持按基类与程序集过滤。
 
     返回结果里带 `handle`，结果集较大时可用 read_query_result 翻页，
     并可用它的 `pattern` 参数在结果内再过滤。
@@ -998,7 +1001,7 @@ def search_classes(
 @_cap_response
 def class_detail(full_name: str, include_inherited: bool = False,
                  method_name: str = "", assembly: str = "") -> dict:
-    """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链。
+    """查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链；给 `method_name` 可只看某方法的重载。
 
     **这是定位 Hook 落点的核心工具**：方法的 token 由这里给出，
     再配合 runtime_class_info / find_hook_target 就能拿到真实的运行时地址。
@@ -1101,9 +1104,10 @@ def search_fields(
     owner: str = "",
     assembly: str = "",
 ) -> dict:
-    """按名字搜索字段，返回所属类与字段类型。
+    """按名字搜索字段，返回所属类与字段类型。**按字段名搜**（定位「金币」「血量」这类目标的首选入口）。
 
-    找「存档里的金币」「血量」这类目标时很有效。
+    `total` 是**真实匹配总数**（不受 limit 影响），配合 `offset`/`limit` 翻页。
+    `owner` 限定单个类；同名类跨程序集时会**拒绝并给候选**，可用 `assembly=` 消歧。
 
     Args:
         pattern: 字段名子串（大小写不敏感）。
@@ -1147,7 +1151,7 @@ def search_methods(
     owner: str = "",
     assembly: str = "",
 ) -> dict:
-    """按名字搜索方法，返回所属类、返回类型与 token。
+    """按名字搜索方法，返回所属类、返回类型与 token。`owner` 语义与 `search_fields` 一致。
 
     Args:
         pattern: 方法名子串（大小写不敏感）。
@@ -1180,9 +1184,11 @@ def search_methods(
 @_cap_response
 def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
                     assembly: str = "") -> dict:
-    """查看类的继承体系（向上找基类、向下找派生类）。
+    """查看类的继承体系（向上找基类、向下找派生类）。`direction="down"` 是**逐层**的：`depth` 是所在层、`parent` 是**真实**直接父类；单层超 500 条时 `down_has_more=true`。
 
     同类名跨程序集时会拒绝并给出候选（与 `class_detail` 同一规则）。
+    （早期版本把传递式后代当成直接子类，`depth`/`parent` 是错的 —— 现在两者用途已分开，
+    想一次捞全所有脚本请用 `find_derived_classes`。）
 
     Args:
         full_name: 类完整名。
@@ -1205,7 +1211,9 @@ def class_hierarchy(full_name: str, direction: str = "both", depth: int = 6,
 @_cap_response
 def find_derived_classes(base_full_name: str, limit: int = 200,
                          assembly: str = "") -> dict:
-    """找出所有继承自某个基类的类型（含间接继承）。
+    """找出所有继承自某个基类的类型（含间接继承）；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。
+
+    `total` 是匹配总数，被 `limit` 截断时 `has_more=true`。
 
     两个最常见的用法：
 
@@ -1244,7 +1252,10 @@ def find_derived_classes(base_full_name: str, limit: int = 200,
 @mcp.tool(annotations=_ann("分析类型依赖", read_only=True))
 @_cap_response
 def analyze_dependency(full_name: str, assembly: str = "") -> dict:
-    """分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。
+    """分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。**近似，非精确调用图**。
+
+    `referenced_count` 是真实总数（不受 limit 影响）；
+    `referenced_types` 最多 100 条并带 `referenced_has_more`。
 
     用来判断「改这个类会不会牵连很多地方」。
 
@@ -1267,7 +1278,7 @@ def analyze_dependency(full_name: str, assembly: str = "") -> dict:
 @mcp.tool(annotations=_ann("列出程序集", read_only=True))
 @_cap_response
 def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
-    """列出游戏里的程序集（dll）及各自的类型数量。
+    """列出游戏里的程序集（dll）及各自的类型数量。支持 `offset`/`limit` 翻页并如实给 `has_more`。
 
     用来判断「游戏逻辑主要在哪个 dll」，从而缩小搜索范围。
 
@@ -1310,7 +1321,13 @@ def list_images(pattern: str = "", offset: int = 0, limit: int = 200) -> dict:
 @_cap_response
 def decompile(assembly: str = "", type_name: str = "", output_dir: str = "",
               split_files: bool = True) -> dict:
-    """反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（外部工具 ilspycmd）。
+    """反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。
+
+    给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir`
+    反编译整个程序集（只落盘 + 返回文件清单，**不内联源码**）。
+    **嵌套类型会退让到最外层**并写 `nested_note`，`decompiled_type` 如实报
+    **实际产出**的类型名。**只支持 Mono**，IL2CPP 会明确报错。
+    依赖是**可选**的，见 `get_diagnostics` 的 `decompiler.available`。
 
     为什么需要它：静态元数据只能给出「有哪些类/字段/方法、签名如何」，
     但给不出**方法体逻辑**。想知道「这个方法到底怎么算伤害的」，
@@ -1395,6 +1412,8 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
     """按句柄翻页读取之前某次查询的完整结果；给了 `pattern` 就在结果内再过滤。
 
     列表类工具单次只返回一页，但完整结果留在句柄里。
+    （原先独立的 `search_query_result` 已按契约第 3 条合并进来 ——
+    它就是本工具在 `pattern=""` 时的特例。）
     两个用途共用本工具：
 
     - 只看第 500~550 条 → 只给 `offset`/`limit`；
@@ -1479,7 +1498,7 @@ def read_query_result(handle: str, offset: int = 0, limit: int = 50,
 @_cap_response
 def inject_process(pid: int = 0, auto_find: bool = True,
                    preferred_module: str = "") -> dict:
-    """把运行时探针注入正在运行的游戏进程。
+    """把运行时探针注入正在运行的游戏进程。目标换了游戏时会**把会话身份与索引一起换过去**，并在返回里给 `context_switched`。
 
     注入后才能使用 runtime_* / hook_* / drain_events 等在线工具。
     同一个进程只会注入一次（重复调用会复用，不会重复 Hook）。
@@ -1535,7 +1554,11 @@ def inject_process(pid: int = 0, auto_find: bool = True,
 @mcp.tool(annotations=_ann("启动并注入游戏", read_only=False, destroy=False, open_world=True))
 @_cap_response
 def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> dict:
-    """启动游戏并**在游戏初始化之前**注入探针。
+    """启动游戏并**在游戏初始化之前**注入探针（**能抢在初始化前挂钩**）。
+
+    **同名进程已在跑时直接拒绝**（避免白等 60 秒再报「IL2CPP 未就绪」）；
+    `exe` 指向另一个游戏时会自动切换会话上下文（建新索引），
+    返回里给 `context_switched` 说明换了哪个。
 
     比先手动开游戏再 inject_process 更强：能在对象被创建之前就装好 Hook，
     适合拦截只执行一次的初始化逻辑。
@@ -1613,7 +1636,7 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
 @mcp.tool(annotations=_ann("查看运行时概况", read_only=True, open_world=True))
 @_cap_response
 def runtime_info() -> dict:
-    """查看已注入游戏的运行时概况：IL2CPP 模块、映像数量、可用 API。
+    """查看已注入游戏的**探针状态**：IL2CPP 模块、映像数量、可用 API。含静态/运行时一致性自检（`image_count_matches`）。
 
     **一致性自检**：`image_count` 应与静态索引里的程序集数量吻合；
     不吻合说明探针挂到的可能不是同一个游戏实例，需要排查。
@@ -1649,7 +1672,10 @@ def runtime_class_info(
     methods: bool = True,
     method_filter: str = "",
 ) -> dict:
-    """查类的**运行时**实况：字段的真实偏移与方法真实代码地址（RVA）。
+    """查类的**运行时**实况：**真实字段偏移**与**方法真实地址**（RVA）。
+
+    嵌套类型请传**完整嵌套名**（`search_classes` 的 `nested_name`）；
+    短名命中多个时**拒绝并给 `candidates`**，不替你猜。
 
     与静态 class_detail 的区别（很重要）：
         · 静态元数据里的字段**没有偏移**（偏移是运行时泛型实例化后才定的）
@@ -1702,7 +1728,7 @@ def find_instances(
     image: str = "",
     max_count: int = 100,
 ) -> dict:
-    """枚举某个类的**活对象实例**（拿到 `instance` 指针的正路）。
+    """**枚举类的活对象实例**（拿 `instance` 指针的正路 —— 此前只能靠 Hook 碰运气）。走 GC liveness；**IL2CPP 可用（实测毫秒级）**、Mono 受官方限制会如实报 `unsupported`（**不用空列表冒充「没有实例」**），值类型无堆实例则明确报错。
 
     为什么需要它：`read_field_value` / `set_field_value` / `hook_method`
     都要一个对象指针，而在此之前**唯一的办法**是「Hook 一个恰好会收到
@@ -1783,7 +1809,7 @@ def find_instances(
 @_cap_response
 def find_hook_target(name: str, method: str, namespace: str = "",
                      image: str = "") -> dict:
-    """定位某个方法可 Hook 的地址（含 RVA 与 token）。
+    """定位某个方法可 Hook 的地址（含 RVA 与 token）。同样支持完整嵌套名，歧义时拒绝。
 
     这是「从静态元数据到 Hook 落点」的关键一步：
     先用 search_classes/class_detail 从元数据确认目标方法（拿到 token），
@@ -1837,7 +1863,7 @@ def hook_method(
     param_count: int = -1,
     retval_type: str = "",
 ) -> dict:
-    """在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。
+    """在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。用 `token` 指定重载；多候选未指定则**拒绝**。
 
     **风险**：Hook 会改变游戏运行行为，且错误的参数类型可能崩溃游戏。
     建议先用 find_hook_target 确认落点与 token。
@@ -1908,7 +1934,7 @@ def hook_address(
     retval_type: str = "ptr",
     backtrace: bool = False,
 ) -> dict:
-    """在**任意地址**安装 Hook（不限于托管方法）。
+    """在**任意地址**安装 Hook（不限于托管方法）。适用于原生函数、系统 API、以及「模块基址 + RVA」算出的地址。
 
     适用于：原生游戏函数、系统 API、以及从静态分析里算出的地址
     （模块基址 + RVA）。
@@ -1992,7 +2018,9 @@ def hook_status() -> dict:
 @mcp.tool(annotations=_ann("读取 Hook 事件", read_only=False, destroy=True, open_world=True))
 @_cap_response
 def drain_events(limit: int = 200, kind: str = "") -> dict:
-    """取走探针缓冲的 Hook 事件（调用记录）。
+    """取走探针缓冲的 Hook 事件（调用记录）。`kind` 过滤作用于**整条队列**（不是只看队首）。
+
+    不匹配的事件会原序留在队列里，**不会被吞**；超出 `limit` 的匹配事件同样留下。
 
     语义与 AiMod 的 /v1/events?after= 一致：**取走即消费**。
     想持续观察就每隔一会儿调用一次，累加统计即可。
@@ -2098,7 +2126,7 @@ def read_field_value(
     namespace: str = "",
     image: str = "",
 ) -> dict:
-    """读取某个对象实例上某个字段的原始值。
+    """读取某个对象实例上某个字段的原始值。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。
 
     自动完成三步：运行时查字段偏移 → 算出字段地址 → 读内存。
 
@@ -2211,7 +2239,7 @@ def set_field_value(
     image: str = "",
     verify: bool = True,
 ) -> dict:
-    """写入某个对象实例上某个字段的值（`read_field_value` 的对称入口）。
+    """**写对象字段值**（`read_field_value` 的对称入口）：自动查偏移、按类型定宽度与编码、写完回读核对。**溢出直接报错不截断**；**引用类型字段拒绝**（改引用属改逻辑，请用 `eval_script`/Hook）。
 
     ⚠️ **危险操作**：写错地址或写错值会立刻让游戏崩溃或行为异常。
     写之前**务必先 `read_field_value` 读一次**，确认偏移与当前值符合预期。
@@ -2378,7 +2406,7 @@ def _explain_bytes(hexs: str) -> dict:
 @mcp.tool(annotations=_ann("内存特征码扫描", read_only=True, open_world=True))
 @_cap_response
 def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
-    """在游戏模块里做 AOB（特征码）扫描。
+    """在游戏模块里做 AOB（特征码）扫描。**这是兜底手段** —— 优先用元数据 + RVA 定位。
 
     ⚠️ **这是兜底手段**。优先用元数据 + RVA 定位：
     本工具集的核心优势就是「不用扫内存也能找到 Hook 落点」。
@@ -2406,7 +2434,7 @@ def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
 @mcp.tool(annotations=_ann("在游戏内执行 JS", read_only=False, destroy=True, open_world=True))
 @_cap_response
 def eval_script(code: str) -> dict:
-    """在游戏进程内执行 Frida JS 代码 —— 应急逃生舱。
+    """在游戏进程内执行**任意** Frida JS 代码 —— 应急逃生舱。
 
     与 AiMod 的 eval_script 同定位：当预置工具不够用时，
     直接下发 JS 探测。
@@ -2484,7 +2512,7 @@ def gc_control(disable: bool = True) -> dict:
 @_cap_response
 def capture_screen(region: str = "", window: str = "", save_path: str = "",
                    max_side: int = 1920) -> dict:
-    """截取屏幕（或某个窗口 / 某块区域）并存成 PNG，**返回文件路径**。
+    """截屏 / 截窗口**存盘并返回路径**（不回 base64）。**截图是证据、不是判据**；窗口找不到会如实失败，不静默改截整屏。
 
     ⚠️ **截图不是判据，只是证据**。要判断「现在在哪个界面」请用 `ocr`。
     这条规矩来自同类项目的教训（`podium-mcp` 源码原文：
@@ -2534,7 +2562,10 @@ def ocr(region: str = "", window: str = "", expected: str = "",
         match: str = "contains", threshold: float = 0.3,
         case_sensitive: bool = False, max_items: int = 200,
         save_on_failure: str = "") -> dict:
-    """对屏幕（或其中一块区域）做 OCR，返回**文本 + 可用于点击的绝对坐标**。
+    """**OCR 识别文本并给屏幕绝对坐标**（可直接用于点击）。只对给定 ROI 做（实测整屏 4.1s vs ROI 数十 ms）。
+
+    `matched_count==0` 是「**本次没找到**」而**非**「不存在」；
+    `save_on_failure` 可在没匹配到时留下截图证据。
 
     这是「弱视觉」的主力：验收时绝大多数判断只需要
     「屏幕上有没有这几个字、它在哪」。
@@ -2597,7 +2628,9 @@ def ocr(region: str = "", window: str = "", expected: str = "",
 @_cap_response
 def probe_log(path: str, pattern: str = "", max_lines: int = 200,
               tail_bytes: int = 262144) -> dict:
-    """读游戏日志（或任意文本日志）的尾部，可按正则过滤。
+    """读游戏日志**尾部**并按正则过滤（编码自动 utf-8/gbk）。**只读、不消费**，可反复轮询。
+
+    同类 Bot 项目普遍没有这条「用日志确认结果」的通道。
 
     **为什么单独做这件事**：调研的 7 个游戏自动化 Bot 项目里，
     **没有一个**用游戏日志判断结果 —— 它们靠视觉、注册表或 CDP。
@@ -2662,6 +2695,135 @@ def _parse_region(region: str) -> Any:
     return vals
 
 
+def _eval_condition(kind: str, *, target: str = "", region: str = "",
+                    window: str = "", name: str = "", namespace: str = "",
+                    image: str = "", field: str = "", equals: str = "",
+                    pattern: str = "", min_count: int = 1,
+                    log_baseline: int | None = None) -> dict:
+    """**单次**求值一个验收条件。返回 `{hit, detail, error, unverifiable, baseline}`。
+
+    为什么抽成独立函数：`wait_for`（轮询等待）与 `verify_state`（多条件验收）
+    需要**同一套**条件语义。写两份实现必然漂移 —— 那样「同一个条件在两处
+    给出不同结论」就会成为一个新的假信息源。AGENTS.md §3 要求一个能力
+    只有一个实现。
+
+    这里不做任何循环、不睡、不记证据 —— 那些是调用方的事。
+    """
+    hit = False
+    detail: dict[str, Any] = {}
+    error = ""
+    unverifiable = ""
+    baseline = log_baseline
+
+    try:
+        return _eval_condition_inner(
+            kind, target=target, region=region, window=window, name=name,
+            namespace=namespace, image=image, field=field, equals=equals,
+            pattern=pattern, min_count=min_count, baseline=baseline)
+    except Exception as exc:                                  # noqa: BLE001
+        # 单次求值失败**不该**让整个等待崩掉 —— 记进 error 继续轮询。
+        return {"hit": False, "detail": detail, "error": str(exc)[:200],
+                "unverifiable": "", "baseline": baseline}
+
+
+def _eval_condition_inner(kind: str, *, target: str = "", region: str = "",
+                          window: str = "", name: str = "", namespace: str = "",
+                          image: str = "", field: str = "", equals: str = "",
+                          pattern: str = "", min_count: int = 1,
+                          baseline: int | None = None) -> dict:
+    """`_eval_condition` 的实际实现（外面那层只负责兜异常）。"""
+    hit = False
+    detail: dict[str, Any] = {}
+    error = ""
+    unverifiable = ""
+    log_baseline = baseline
+
+    if kind == "instances":
+        r = RAW_TOOLS["find_instances"](
+            name=name, namespace=namespace, image=image, max_count=200)
+        if r.get("ok"):
+            cnt = int(r.get("count") or 0)
+            detail = {"count": cnt, "min_count": min_count}
+            hit = cnt >= max(1, int(min_count))
+        elif r.get("unsupported"):
+            # 「本时机不可用」不是「没成立」
+            unverifiable = str(r.get("error", ""))[:200]
+            detail = {"unsupported": True}
+        else:
+            error = str(r.get("error", ""))[:200]
+
+    elif kind == "field":
+        fi = RAW_TOOLS["find_instances"](
+            name=name, namespace=namespace, image=image, max_count=8)
+        if not fi.get("ok"):
+            if fi.get("unsupported"):
+                unverifiable = str(fi.get("error", ""))[:200]
+                detail = {"unsupported": True}
+            else:
+                error = str(fi.get("error", ""))[:200]
+                detail = {"instances_ok": False}
+        else:
+            ptrs = [x.get("pointer") for x in (fi.get("instances") or [])]
+            if not ptrs:
+                detail = {"count": 0}
+            else:
+                rf = RAW_TOOLS["read_field_value"](
+                    instance=ptrs[0], name=name, field=field,
+                    namespace=namespace, image=image)
+                if rf.get("ok"):
+                    got = _field_value_as_text(rf)
+                    detail = {"field": field, "actual": got, "expected": equals,
+                              "pointer": ptrs[0]}
+                    hit = _values_equal(got, equals, rf)
+                else:
+                    error = str(rf.get("error", ""))[:200]
+                    detail = {"read_ok": False}
+
+    elif kind == "ocr":
+        o = RAW_TOOLS["ocr"](region=region, window=window, expected=target,
+                             match="contains", max_items=50)
+        if o.get("ok"):
+            n = int(o.get("matched_count") or 0)
+            detail = {"matched_count": n, "expected": target,
+                      "texts_seen": len(o.get("texts") or [])}
+            hit = n > 0
+        else:
+            error = str(o.get("error", ""))[:200]
+
+    elif kind == "log":
+        if not pattern:
+            return {"hit": False, "detail": {}, "error": "kind='log' 需要 pattern",
+                    "unverifiable": "", "baseline": baseline}
+        if not target:
+            # target 在 log 分支里是**日志路径**（与 ocr/window 的语义不同）
+            return {"hit": False, "detail": {},
+                    "error": "kind='log' 时请把日志路径放进 target",
+                    "unverifiable": "", "baseline": baseline}
+        lr = RAW_TOOLS["probe_log"](path=target, pattern=pattern, max_lines=20)
+        if lr.get("ok"):
+            n = int(lr.get("matched_count") or 0)
+            if baseline is None:
+                baseline = n
+                detail = {"matched_count": n, "pattern": pattern,
+                          "baseline": n, "baseline_note": "首次求值记基线，等增量"}
+                hit = False
+            else:
+                detail = {"matched_count": n, "pattern": pattern,
+                          "baseline": baseline, "delta": n - baseline}
+                hit = n > baseline
+        else:
+            error = str(lr.get("error", ""))[:200]
+
+    elif kind == "window":
+        from .engine import screen as _screen
+        w = _screen.find_window_rect(target)
+        detail = {"window_found": bool(w.get("ok")), "title": w.get("title")}
+        hit = bool(w.get("ok"))
+
+    return {"hit": hit, "detail": detail, "error": error,
+            "unverifiable": unverifiable, "baseline": baseline}
+
+
 @mcp.tool(annotations=_ann("轮询等待一个条件成立（带证据）",
                            read_only=False, open_world=True,
                            destroy=False, idempotent=True))
@@ -2671,7 +2833,7 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
              field: str = "", equals: str = "", pattern: str = "",
              timeout_ms: int = 20000, interval_ms: int = 500,
              min_count: int = 1) -> dict:
-    """**轮询等待**某个条件成立，返回证据。验收闭环里「等到可以判了」的那一步。
+    """**轮询等待条件成立并给出证据包**（验收闭环里「等到可以判了」那一步）。五种条件：`field` / `instances` / `ocr` / `log` / `window`。返回三态 `verdict`（`pass` / `fail` / **`unverifiable`** —— 把「没法判」与「没通过」严格区分）+ `polls` / `evidence`；**超时如实报 fail，不静默当通过**。注意 `kind="log"` 等的是**新增**（先记基线再等增量），不是「当前存在」。
 
     为什么必须有它：游戏是**异步**的 —— 点完按钮要等界面出来、场景加载要
     等几秒。不等待就直接断言，会得到大量**假失败**（其实只是还没加载完）。
@@ -2725,127 +2887,33 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
     kinds = ("field", "instances", "ocr", "log", "window")
     if kind not in kinds:
         return _err(f"kind 只能是 {'/'.join(kinds)}，收到 {kind!r}")
+    if kind == "log" and not target:
+        return _err("kind='log' 时请把日志路径放进 target")
     timeout_ms = max(0, int(timeout_ms))
     interval_ms = max(50, int(interval_ms))
     deadline = time.time() + timeout_ms / 1000.0
-
-    # `log` 需要 path —— 复用 pattern 之外的 path 参数会与别的 kind 混淆，
-    # 所以约定用 target 传路径（target 在 log 分支里本就是空的）。
-    log_path = target if kind == "log" else ""
 
     evidence: list[dict] = []
     polls = 0
     started = time.time()
     last_err = ""
     unverifiable_reason = ""
-    #: `kind='log'` 的基线匹配数（见该分支里「基线语义」的说明）
+    #: `kind='log'` 的基线匹配数（见 `_eval_condition` 里「基线语义」的说明）
     log_baseline: int | None = None
 
     while True:
         polls += 1
-        hit = False
-        detail: dict[str, Any] = {}
-
-        try:
-            if kind == "instances":
-                r = RAW_TOOLS["find_instances"](
-                    name=name, namespace=namespace, image=image, max_count=200)
-                if r.get("ok"):
-                    cnt = int(r.get("count") or 0)
-                    detail = {"count": cnt, "min_count": min_count}
-                    hit = cnt >= max(1, int(min_count))
-                elif r.get("unsupported"):
-                    # 「本时机不可用」不是「没成立」—— 继续等（可能只是
-                    # 程序集还没加载），但记下来，超时时如实说明
-                    unverifiable_reason = str(r.get("error", ""))[:200]
-                    detail = {"unsupported": True}
-                else:
-                    last_err = str(r.get("error", ""))[:200]
-
-            elif kind == "field":
-                fi = RAW_TOOLS["find_instances"](
-                    name=name, namespace=namespace, image=image, max_count=8)
-                if not fi.get("ok"):
-                    last_err = str(fi.get("error", ""))[:200]
-                    detail = {"instances_ok": False}
-                else:
-                    ptrs = [x.get("pointer") for x in (fi.get("instances") or [])]
-                    if not ptrs:
-                        detail = {"count": 0}
-                    else:
-                        rf = RAW_TOOLS["read_field_value"](
-                            instance=ptrs[0], name=name, field=field,
-                            namespace=namespace, image=image)
-                        if rf.get("ok"):
-                            got = _field_value_as_text(rf)
-                            detail = {"field": field, "actual": got,
-                                      "expected": equals}
-                            hit = _values_equal(got, equals, rf)
-                        else:
-                            last_err = str(rf.get("error", ""))[:200]
-                            detail = {"read_ok": False}
-
-            elif kind == "ocr":
-                o = RAW_TOOLS["ocr"](region=region, window=window,
-                                     expected=target, match="contains",
-                                     max_items=50)
-                if o.get("ok"):
-                    n = int(o.get("matched_count") or 0)
-                    detail = {"matched_count": n, "expected": target,
-                              "texts_seen": len(o.get("texts") or [])}
-                    hit = n > 0
-                else:
-                    last_err = str(o.get("error", ""))[:200]
-
-            elif kind == "log":
-                if not log_path:
-                    return _err("kind='log' 时请把日志路径放进 target")
-                lr = RAW_TOOLS["probe_log"](path=log_path, pattern=pattern,
-                                            max_lines=20)
-                if lr.get("ok"):
-                    n = int(lr.get("matched_count") or 0)
-                    # ⚠️ **基线语义**（真机实战踩出来的缺陷，改前会假阳性）
-                    #
-                    # 这一条判的是「日志里**有没有**匹配行」。但用它来等
-                    # 「某个动作发生」时，**旧日志里早就有的匹配行会立刻命中**
-                    # —— 实测：日志里已有 5 条「已修改 精核」，调
-                    # wait_for(kind='log', pattern='已修改 精核') 在 **1ms** 内
-                    # 返回 pass，而本次操作**根本没发生**。
-                    #
-                    # 所以第一次轮询先记下基线，之后要求**超过基线**才算成立。
-                    # 这才符合「等一个**新**事件发生」的直觉用法。
-                    # 想判「当前是否已有」应直接用 probe_log，而不是 wait_for。
-                    if log_baseline is None:
-                        log_baseline = n
-                        detail = {"matched_count": n, "pattern": pattern,
-                                  "baseline": n,
-                                  "baseline_note": "首次轮询记基线，等增量"}
-                        hit = False
-                        # 本轮不算命中，但仍要把基线记进证据后继续
-                        evidence.append({"poll": polls, **detail})
-                        if len(evidence) > 30:
-                            evidence = evidence[-30:]
-                        if time.time() >= deadline:
-                            break
-                        time.sleep(interval_ms / 1000.0)
-                        continue
-                    detail = {"matched_count": n, "pattern": pattern,
-                              "baseline": log_baseline,
-                              "delta": n - log_baseline}
-                    hit = n > log_baseline
-                else:
-                    last_err = str(lr.get("error", ""))[:200]
-
-            elif kind == "window":
-                from .engine import screen as _screen
-                w = _screen.find_window_rect(target)
-                detail = {"window_found": bool(w.get("ok")),
-                          "title": w.get("title")}
-                hit = bool(w.get("ok"))
-                if not w.get("ok"):
-                    last_err = ""      # 「还没有这个窗口」是正常中间态
-        except Exception as exc:
-            last_err = str(exc)[:200]
+        res = _eval_condition(
+            kind, target=target, region=region, window=window, name=name,
+            namespace=namespace, image=image, field=field, equals=equals,
+            pattern=pattern, min_count=min_count, log_baseline=log_baseline)
+        hit = bool(res["hit"])
+        detail = res["detail"]
+        log_baseline = res["baseline"]
+        if res["error"]:
+            last_err = res["error"]
+        if res["unverifiable"]:
+            unverifiable_reason = res["unverifiable"]
 
         evidence.append({"poll": polls, **detail})
         if len(evidence) > 30:            # 只留最近若干条，别把返回撑爆
@@ -2882,6 +2950,186 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
             out["hint"] = ("超时可能因为：界面还没加载完 / 条件本身没被满足。"
                            "先看 evidence 里每次轮询的实测值再决定；"
                            "**不要**据此断定 Mod 无效。")
+    return out
+
+
+@mcp.tool(annotations=_ann("验收：多条件 + **≥2 条独立证据**才判成立",
+                           read_only=False, open_world=True,
+                           destroy=False, idempotent=True))
+@_cap_response
+def verify_state(checks: str, require_independent: int = 2) -> dict:
+    """**出一份可证伪的验收结论**：每条断言独立求值，并要求**足够多的独立证据**才判成立。
+
+    为什么必须有它（这是从 `reverse-skill` 的证据链契约学来的一条硬规则）
+    ----------------------------------------------------------------
+    单条证据**不得**静默提升为「已验证」。它那条契约的原文是：
+
+    > `validated` 需要 **>=2 independent** Evidence（最好 1 静态 + 1 动态）；
+    > 单条证据不得静默提升为 validated。
+
+    我们自己的实战正好印证了这条：在 CatapultHero 验收 Mod 时，
+    我同时看了**日志**（`已修改 精核 = 108`）与**屏幕 OCR**（`精核：108`）——
+    两个**互相独立**的来源给出同一个结论，才敢说「Mod 真的生效了」。
+    只看日志的话，日志本身是 Mod 打的，Mod 写错了照样打日志。
+
+    所以本工具把「要几条独立证据」变成**显式参数**，而不是留给 Agent 的直觉。
+
+    参数 `checks` 怎么传
+    ----------------------------------------------------------------
+    逗号分隔的条目，每条形如 `kind:参数`，与 `wait_for` 共用同一套条件语义
+    （`_eval_condition`，所以两处结论必然一致）：
+
+    | 写法 | 含义 |
+    |---|---|
+    | `log=<路径>#<正则>` | 日志里有匹配行（**只读不消费**） |
+    | `ocr=<期望文本>` | 屏幕上 OCR 到该文本 |
+    | `window=<标题子串>` | 存在该窗口 |
+    | `field=<类>.<字段>=<期望值>` | 该字段当前等于期望值 |
+    | `instances=<类>>=<最小个数>` | 该类活实例数达到下限 |
+
+    示例（双证据验收 Mod 生效）：
+
+        verify_state(checks="log=D:\\\\Game\\\\UE4SS.log#已修改 精核,"
+                            "ocr=精核")
+
+    返回
+    ----------------------------------------------------------------
+    · `verdict` —— `pass` / `fail` / **`unverifiable`**（三态，与 `wait_for` 同源）
+      - `pass` 要求：**成立的条件数 >= require_independent**（默认 2）
+      - 全部条件都成立但只有 1 条 → 判 **`fail`** 并说明「证据不足」，
+        **不是** pass —— 这正是「单条证据不得静默提升」
+    · `evidence` —— 每条断言各自的 `{check, hit, detail}`
+    · `independent_count` / `require_independent`
+    · `verdict_reason` —— **为什么**是这个结论（便于人工复核）
+
+    Args:
+        checks: 逗号分隔的断言列表，见上表。
+        require_independent: 判 `pass` 所需的**成立条数**下限（默认 2）。
+            设 1 会退化成「单条证据即通过」—— 只在确实只有一个可靠来源时用。
+
+    Returns:
+        {ok, verdict, verdict_reason, evidence, independent_count,
+         require_independent, passed, unverifiable_count}
+    """
+    if not checks or not str(checks).strip():
+        return _err("checks 不能为空。写法见工具文档，"
+                    "例如 checks=\"log=D:\\\\x.log#ERROR,ocr=开始游戏\"")
+
+    items = [x.strip() for x in str(checks).split(",") if x.strip()]
+    require = max(1, int(require_independent))
+
+    results: list[dict] = []
+    for raw in items:
+        if "=" not in raw:
+            results.append({"check": raw, "hit": False, "kind": "",
+                            "detail": {}, "error": "写法不对：应是 kind:参数"})
+            continue
+        kind, spec = raw.split("=", 1)
+        kind = kind.strip().lower()
+        spec = spec.strip()
+        if kind not in ("log", "ocr", "window", "field", "instances"):
+            results.append({"check": raw, "hit": False, "kind": kind,
+                            "detail": {}, "error": f"未知的 kind {kind!r}"})
+            continue
+
+        kw: dict[str, Any] = {}
+        note = ""
+        try:
+            if kind == "log":
+                # log=<路径>#<正则>（用 # 分隔，避免正则里的逗号被当条目分隔符）
+                if "#" not in spec:
+                    raise ValueError("log 写法应是 log=<路径>#<正则>")
+                path, pat = spec.split("#", 1)
+                kw = {"target": path.strip(), "pattern": pat.strip()}
+            elif kind == "ocr":
+                kw = {"target": spec}
+            elif kind == "window":
+                kw = {"target": spec}
+            elif kind == "field":
+                # field=类.字段=期望值
+                if "=" not in spec or "." not in spec.split("=", 1)[0]:
+                    raise ValueError("field 写法应是 field=<类>.<字段>=<期望值>")
+                lhs, want = spec.split("=", 1)
+                cls, fname = lhs.rsplit(".", 1)
+                # 类名可能带命名空间：最后一段是短名，前面是 namespace
+                if "." in cls:
+                    ns, short = cls.rsplit(".", 1)
+                else:
+                    ns, short = "", cls
+                kw = {"name": short, "namespace": ns, "field": fname,
+                      "equals": want.strip()}
+            elif kind == "instances":
+                # instances=类>=个数
+                if ">=" not in spec:
+                    raise ValueError("instances 写法应是 instances=<类>>=<个数>")
+                cls, n = spec.split(">=", 1)
+                cls = cls.strip()
+                if "." in cls:
+                    ns, short = cls.rsplit(".", 1)
+                else:
+                    ns, short = "", cls
+                kw = {"name": short, "namespace": ns,
+                      "min_count": max(1, int(n.strip()))}
+        except Exception as exc:                              # noqa: BLE001
+            results.append({"check": raw, "hit": False, "kind": kind,
+                            "detail": {}, "error": f"解析失败：{exc}"})
+            continue
+
+        # 复用 wait_for 的**同一套**条件语义（`_eval_condition`），
+        # 这样两处对同一条件不会给出不同结论。
+        # 注意 `kind='log'` 在这里传 baseline=0：verify_state 判的是
+        # 「日志里**有没有**该行」（当前状态），不是「有没有新增」
+        # —— 与 wait_for 的等待语义不同，所以显式给 baseline。
+        res = _eval_condition(kind, log_baseline=0 if kind == "log" else None,
+                              **kw)
+        rec = {"check": raw, "kind": kind, "hit": bool(res["hit"]),
+               "detail": res["detail"]}
+        if res["error"]:
+            rec["error"] = res["error"]
+        if res["unverifiable"]:
+            rec["unverifiable"] = True
+            rec["error"] = res["unverifiable"]
+        if note:
+            rec["note"] = note
+        results.append(rec)
+
+    passed = sum(1 for r in results if r["hit"])
+    unver = sum(1 for r in results if r.get("unverifiable"))
+    total = len(results)
+
+    # ---- 三态判定（与 wait_for 同源的纪律）
+    if passed >= require:
+        verdict = "pass"
+        reason = f"{passed}/{total} 条成立，达到要求的 {require} 条独立证据"
+    elif unver >= 1 and passed + unver == total:
+        # 没有一条明确不成立，但至少有没法判的 → 「没法判」而非「没通过」
+        verdict = "unverifiable"
+        reason = (f"成立 {passed} 条、**没法判** {unver} 条，"
+                  f"达不到 {require} 条独立证据。这是「尺子坏了」而不是"
+                  f"「量出来是坏的」—— 别据此改 Mod。")
+    elif passed == 0:
+        verdict = "fail"
+        reason = f"0/{total} 条成立"
+    else:
+        # 有成立、但不够独立证据数 → **不许**提升为 pass
+        verdict = "fail"
+        reason = (f"只有 {passed} 条成立、需要 {require} 条**独立**证据 —— "
+                  f"**证据不足，不判通过**。单条证据不得静默提升；"
+                  f"请再加一条**互相独立**的来源（例如日志 + 屏幕 OCR）。")
+
+    out: dict[str, Any] = {
+        "ok": verdict == "pass",
+        "verdict": verdict,
+        "verdict_reason": reason,
+        "passed": passed,
+        "total": total,
+        "independent_count": passed,
+        "require_independent": require,
+        "unverifiable_count": unver,
+        "evidence": results,
+    }
+    if verdict != "pass":
+        out["error"] = reason
     return out
 
 
@@ -2972,7 +3220,7 @@ def _ue_exe(exe: str) -> tuple[str, dict | None]:
 @mcp.tool(annotations=_ann("识别 Unreal 游戏", read_only=True))
 @_cap_response
 def detect_ue(exe: str = "") -> dict:
-    """判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据。
+    """判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据与置信度。
 
     只判定**这一个**程序，不做全机扫描。
 
@@ -2996,7 +3244,7 @@ def detect_ue(exe: str = "") -> dict:
 @mcp.tool(annotations=_ann("提取 Unreal 游戏概况", read_only=False, destroy=False, idempotent=True))
 @_cap_response
 def ue_profile(exe: str = "", output_path: str = "") -> dict:
-    """汇总一个 Unreal 游戏的可提取信息（资源容器、清单、脚本对象）。
+    """**UE 游戏概况**：容器、清单、**脚本模块**。汇总一个 Unreal 游戏的可提取信息（资源容器、清单、脚本对象）。
 
     包含每个 .pak/.utoc 的文件数、目录数、以及条目样例。
     全量条目可能非常大（实测某样本 18,956 条 → JSON 15.8 MB），
@@ -3024,7 +3272,7 @@ def ue_profile(exe: str = "", output_path: str = "") -> dict:
 def ue_list_entries(container: str, kind: str = "auto",
                     pattern: str = "", limit: int = 200,
                     offset: int = 0) -> dict:
-    """列出 .pak / .utoc 容器里的文件清单（可按名字过滤）。
+    """列出 .pak / .utoc 里**打包了哪些资产**（可按名字过滤、翻页）。返回 `returned`/`has_more`；翻页空页会说明是哪一种「空」。
 
     这是 UE 游戏上最实用的一步：想知道「这游戏有哪些资源、
     本地化文本在哪个文件里」，就靠它。
@@ -3113,7 +3361,7 @@ def ue_list_entries(container: str, kind: str = "auto",
 @mcp.tool(annotations=_ann("列出 Unreal 脚本对象", read_only=True))
 @_cap_response
 def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
-    """从 UE 游戏 exe 里提取 /Script/ 模块名与对象路径。
+    """从 UE 游戏 exe 里提取 /Script/ 模块名与对象路径。失败时按契约给 `ok=false` + `error`。
 
     这是**字符串证据**，不是反射元数据：能告诉你游戏大致有哪些系统
     （如 /Script/Engine、/Script/GameplayAbilities），
@@ -3159,7 +3407,7 @@ def ue_script_objects(exe: str = "", limit: int = 200) -> dict:
 @_cap_response
 def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
                 offset: int = 0, limit: int = 200) -> dict:
-    """读取 UE 的打包清单 Manifest_UFSFiles_*.txt。
+    """读取 UE 的打包清单 `Manifest_*Files*.txt`。支持 `offset`/`limit` 并有 `has_more`。
 
     清单是打包时生成的「应该有哪些文件」的真值，
     常用来校验从 pak/utoc 解析出的文件清单是否正确。
@@ -3246,7 +3494,7 @@ def ue_manifest(path: str = "", game_dir: str = "", pattern: str = "",
 @mcp.tool(annotations=_ann("环境与能力诊断", read_only=True))
 @_cap_response
 def get_diagnostics(scan_processes: bool = False) -> dict:
-    """检查运行环境：Python、Frida、各引擎解析器是否可用。
+    """检查运行环境：Python、Frida、各引擎解析器是否可用。**默认不扫本机进程**（见 `scan_processes`）。
 
     开始工作前建议先调一次，明确「这台机器上能做什么」。
     如果某项显示不可用，对应的工具会失败——这是环境问题，不是工具 bug。

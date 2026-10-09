@@ -2,7 +2,7 @@
 
 **用元数据定位 Hook 落点的游戏 Mod 工具集** —— 一个 MCP 服务器，让任意通用 Agent（Claude Code / Codex / Cursor / …）都能做游戏 Mod。
 
-支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，44 个工具覆盖
+支持 **IL2CPP**、**Mono (.NET)**、**Unreal** 三类引擎，45 个工具覆盖
 「找游戏 → 建索引 → 查类/字段/方法 → 注入 → Hook → 读内存」全流程。
 
 ---
@@ -103,48 +103,97 @@ Agent 会自动：
 
 ---
 
-## 工具一览（44 个）
+<!-- BEGIN GENERATED: tools -->
+## 工具一览（45 个）
 
-> 本清单由 `python devtools/verify_tool_inventory.py` 与代码强制对齐（**9 处**检查）：
-> 数量或名字对不上就会非零退出。改工具请同步这张表。
-> 它还管两件容易被忽略的事：
-> ① **已删除/已合并的工具名不许以「还在」的姿态出现在任何 `*.md` 里** ——
-> 历史记录可以留，但同一行必须能看出它已经没了，否则 Agent 会照着去调
-> （`docs/` 曾长期写着已删除的 `detect_games()`）；
-> ② **已安装的 skill 副本**（`~/.dsh/skills/`）必须与仓库内逐字节相同 ——
-> 运行时被 Agent 加载的是那份副本，它曾落后 139 行、开头还在教已删除的工具。
+> **本清单由 `python devtools/gen_docs.py` 从代码生成**（来源：各工具函数的 docstring 首段 + `server.py` 的层节注释）。
+> **不要手工编辑这一节** —— 下次 `--check` 会报红。
+> 要改描述就改该工具的 docstring 首段，再跑 `python devtools/gen_docs.py --write`。
+>
+> 为什么改成生成：校验只能**发现**漂移，生成本**不会产生**漂移 —— 本表的工具数曾手工漂过 5 次以上。
+> 改造前做过「知识上移」核对：原单元格里有 **402 个特征词**是 docstring 没有的，
+> 直接生成会丢掉那些手写事实，所以先把它们补进了 docstring 首段。
 
 ### 发现层
 | 工具 | 作用 |
 |---|---|
-| `find_game_processes` | 找正在运行的游戏进程 |
-| `inspect_game` | 探测游戏目录：引擎类型、主程序、关键文件 |
-| `inspect_binary` | 分析 PE 文件：架构、节区、导出/导入表、运行时类型 |
+| `find_game_processes` | 列出正在运行的游戏进程，并识别其运行时（il2cpp / mono / 其它）。 |
+| `inspect_binary` | 分析 PE 文件（exe/dll）：架构、节区、导出表、导入表、运行时类型。 |
+| `inspect_game` | 探测一个游戏目录：识别引擎、找出主程序与关键文件。 |
 
 ### 会话层
 | 工具 | 作用 |
 |---|---|
-| `open_game` | 选定游戏并建索引（**跨引擎自动识别**） |
-| `get_session` | 查看当前会话状态（排查问题先看这个） |
-| `close_session` | 卸载 Hook、断开注入、关闭索引。**只有真的恢复原状才 `ok=true`**；任一步失败会 `ok=false` + `error` 并保留会话以便重试 |
+| `close_session` | 关闭当前会话：卸载所有 Hook、断开注入、关闭索引。**只有真的恢复原状才 `ok=true`**。 |
+| `get_session` | 查看当前会话状态：选中的游戏、索引统计、运行时注入情况。 |
+| `open_game` | 选定游戏，并构建（或复用）它的元数据索引（**跨引擎自动识别**）。 |
 
 ### 静态查询层（**不需要游戏在运行**）
 | 工具 | 作用 |
 |---|---|
-| `search_classes` | 搜类/结构/枚举，支持按基类与程序集过滤 |
-| `class_detail` | 类的字段、方法、参数、继承链；给 `method_name` 可只看某方法的重载 |
-| `search_fields` | 按字段名搜（定位「金币」「血量」这类目标）。`total` 是真实匹配总数，配合 `offset`/`limit` 翻页。`owner` 限定单个类，同名类跨程序集时会**拒绝并给候选**，可用 `assembly=` 消歧 |
-| `search_methods` | 按方法名搜，返回 token。`owner` 语义与 `search_fields` 一致 |
-| `class_hierarchy` | 继承体系（向上找基类 / 向下找派生类）。`direction="down"` 是**逐层**的：每条给的 `depth` 是它所在层、`parent` 是它**真实**的直接父类（早期版本把传递式后代当成直接子类，`depth`/`parent` 是错的）。单层超 500 条时 `down_has_more=true` |
-| `find_derived_classes` | 所有继承自某类的类型；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。`total` 是匹配总数，被 `limit` 截断时 `has_more=true` |
-| `analyze_dependency` | 类型依赖概览（近似，非精确调用图）。`referenced_count` 是真实总数，`referenced_types` 最多 100 条并带 `referenced_has_more` |
-| `list_images` | 列出所有程序集/映像，支持 `offset`/`limit` 翻页并如实给 `has_more` |
-| `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。给 `type_name` 反编译单个类型（小结果内联在 `source`）；给 `output_dir` 反编译整个程序集（只落盘 + 返回文件清单，不内联源码）。**嵌套类型会退让到最外层**并写 `nested_note`，`decompiled_type` 如实报**实际产出**的类型名。**只支持 Mono**，IL2CPP 会明确报错。依赖可选，见 `get_diagnostics` 的 `decompiler.available` |
+| `analyze_dependency` | 分析一个类型引用了哪些其它类型（字段/父类/方法返回类型）。**近似，非精确调用图**。 |
+| `class_detail` | 查看一个类的完整信息：字段（含类型）、方法（含 token）、继承链；给 `method_name` 可只看某方法的重载。 |
+| `class_hierarchy` | 查看类的继承体系（向上找基类、向下找派生类）。`direction="down"` 是**逐层**的：`depth` 是所在层、`parent` 是**真实**直接父类；单层超 500 条时 `down_has_more=true`。 |
+| `decompile` | 反编译 Mono/.NET 程序集，拿到**真正的 C# 源码**（薄封装 `ilspycmd`）。 |
+| `find_derived_classes` | 找出所有继承自某个基类的类型（含间接继承）；配 `assembly=` 可筛出游戏自己的 MonoBehaviour 脚本（**找脚本的必备工具**）。 |
+| `list_images` | 列出游戏里的程序集（dll）及各自的类型数量。支持 `offset`/`limit` 翻页并如实给 `has_more`。 |
+| `search_classes` | 搜索游戏里的类、结构体、枚举 —— Mod 开发最主要的入口。支持按基类与程序集过滤。 |
+| `search_fields` | 按名字搜索字段，返回所属类与字段类型。**按字段名搜**（定位「金币」「血量」这类目标的首选入口）。 |
+| `search_methods` | 按名字搜索方法，返回所属类、返回类型与 token。`owner` 语义与 `search_fields` 一致。 |
 
-### 结果句柄（大结果集翻页）
+### 结果句柄层（大结果集翻页）
 | 工具 | 作用 |
 |---|---|
-| `read_query_result` | 按句柄翻页读取上次查询的结果；给 `pattern` 即在结果集内二次过滤（原先独立的 `search_query_result` 已按契约第 3 条合并进来） |
+| `read_query_result` | 按句柄翻页读取之前某次查询的完整结果；给了 `pattern` 就在结果内再过滤。 |
+
+### 运行时层
+| 工具 | 作用 |
+|---|---|
+| `drain_events` | 取走探针缓冲的 Hook 事件（调用记录）。`kind` 过滤作用于**整条队列**（不是只看队首）。 |
+| `eval_script` | 在游戏进程内执行**任意** Frida JS 代码 —— 应急逃生舱。 |
+| `find_hook_target` | 定位某个方法可 Hook 的地址（含 RVA 与 token）。同样支持完整嵌套名，歧义时拒绝。 |
+| `find_instances` | **枚举类的活对象实例**（拿 `instance` 指针的正路 —— 此前只能靠 Hook 碰运气）。走 GC liveness；**IL2CPP 可用（实测毫秒级）**、Mono 受官方限制会如实报 `unsupported`（**不用空列表冒充「没有实例」**），值类型无堆实例则明确报错。 |
+| `gc_control` | 暂停/恢复游戏的 GC（垃圾回收）。 |
+| `hook_address` | 在**任意地址**安装 Hook（不限于托管方法）。适用于原生函数、系统 API、以及「模块基址 + RVA」算出的地址。 |
+| `hook_method` | 在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。用 `token` 指定重载；多候选未指定则**拒绝**。 |
+| `hook_status` | 列出当前所有 Hook 及其触发次数。 |
+| `inject_process` | 把运行时探针注入正在运行的游戏进程。目标换了游戏时会**把会话身份与索引一起换过去**，并在返回里给 `context_switched`。 |
+| `launch_game` | 启动游戏并**在游戏初始化之前**注入探针（**能抢在初始化前挂钩**）。 |
+| `read_field_value` | 读取某个对象实例上某个字段的原始值。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。 |
+| `read_memory` | 读取游戏进程内存（十六进制返回）。 |
+| `runtime_class_info` | 查类的**运行时**实况：**真实字段偏移**与**方法真实地址**（RVA）。 |
+| `runtime_info` | 查看已注入游戏的**探针状态**：IL2CPP 模块、映像数量、可用 API。含静态/运行时一致性自检（`image_count_matches`）。 |
+| `scan_pattern` | 在游戏模块里做 AOB（特征码）扫描。**这是兜底手段** —— 优先用元数据 + RVA 定位。 |
+| `set_field_value` | **写对象字段值**（`read_field_value` 的对称入口）：自动查偏移、按类型定宽度与编码、写完回读核对。**溢出直接报错不截断**；**引用类型字段拒绝**（改引用属改逻辑，请用 `eval_script`/Hook）。 |
+| `unhook` | 卸载 Hook。hook_id 留空则卸载全部。 |
+| `write_memory` | 写游戏进程内存。 |
+
+### 弱视觉 / UI 层（截图 · OCR · 日志 · 等待）
+| 工具 | 作用 |
+|---|---|
+| `capture_screen` | 截屏 / 截窗口**存盘并返回路径**（不回 base64）。**截图是证据、不是判据**；窗口找不到会如实失败，不静默改截整屏。 |
+| `ocr` | **OCR 识别文本并给屏幕绝对坐标**（可直接用于点击）。只对给定 ROI 做（实测整屏 4.1s vs ROI 数十 ms）。 |
+| `probe_log` | 读游戏日志**尾部**并按正则过滤（编码自动 utf-8/gbk）。**只读、不消费**，可反复轮询。 |
+| `verify_state` | **出一份可证伪的验收结论**：每条断言独立求值，并要求**足够多的独立证据**才判成立。 |
+| `wait_for` | **轮询等待条件成立并给出证据包**（验收闭环里「等到可以判了」那一步）。五种条件：`field` / `instances` / `ocr` / `log` / `window`。返回三态 `verdict`（`pass` / `fail` / **`unverifiable`** —— 把「没法判」与「没通过」严格区分）+ `polls` / `evidence`；**超时如实报 fail，不静默当通过**。注意 `kind="log"` 等的是**新增**（先记基线再等增量），不是「当前存在」。 |
+
+### Unreal 引擎层
+| 工具 | 作用 |
+|---|---|
+| `detect_ue` | 判断一个 exe 是否为 Unreal 引擎游戏，并给出可核查的证据与置信度。 |
+| `ue_list_entries` | 列出 .pak / .utoc 里**打包了哪些资产**（可按名字过滤、翻页）。返回 `returned`/`has_more`；翻页空页会说明是哪一种「空」。 |
+| `ue_manifest` | 读取 UE 的打包清单 `Manifest_*Files*.txt`。支持 `offset`/`limit` 并有 `has_more`。 |
+| `ue_profile` | **UE 游戏概况**：容器、清单、**脚本模块**。汇总一个 Unreal 游戏的可提取信息（资源容器、清单、脚本对象）。 |
+| `ue_script_objects` | 从 UE 游戏 exe 里提取 /Script/ 模块名与对象路径。失败时按契约给 `ok=false` + `error`。 |
+
+### 诊断层
+| 工具 | 作用 |
+|---|---|
+| `get_diagnostics` | 检查运行环境：Python、Frida、各引擎解析器是否可用。**默认不扫本机进程**（见 `scan_processes`）。 |
+
+<!-- END GENERATED: tools -->
+
+### 句柄格式与作用域
 
 句柄形如 `il2cpp-g3-classes-1`（`{引擎}-g{代次}-{种类}-{序号}`）。
 **代次段是正确性要求**：句柄表是每个索引实例各自的、序号从 0 重来，
@@ -153,6 +202,7 @@ Agent 会自动：
 见 `devtools/verify_handle_scope.py`。
 
 ### 响应体积上限（256 KB）
+
 **任何**工具返回都不会超过 256 KB —— 这不是各工具自觉，而是
 `src/gamemod_mcp/cap.py` 在**所有**工具外面统一兜底（`@_cap_response`）。
 
@@ -169,50 +219,6 @@ Agent 会自动：
 2000，Agent 完全可以合法地要 2000 条 —— 实测 `search_classes('', limit=2000)`
 的线上文本是 **856 KB**。截断后同一调用是 260 KB。
 见 `devtools/verify_cap.py`（机制）与 `devtools/verify_response_size.py`（体积）。
-
-### Unreal 引擎层
-| 工具 | 作用 |
-|---|---|
-| `detect_ue` | 判断一个 exe 是不是 UE 游戏（带证据与置信度） |
-| `ue_profile` | UE 游戏概况：容器、清单、脚本模块 |
-| `ue_list_entries` | **列出 .pak/.utoc 里打包了哪些资产**（可按名字过滤、翻页）。返回 `returned`/`has_more`；翻页空页会说明是哪一种「空」 |
-| `ue_script_objects` | exe 内的 `/Script/` 模块与对象路径。失败时按契约给 `ok=false` + `error` |
-| `ue_manifest` | 读取打包清单 `Manifest_*Files*.txt`，支持 `offset`/`limit` 并有 `has_more` |
-
-### 运行时层（需要注入游戏）
-| 工具 | 作用 |
-|---|---|
-| `inject_process` | 注入已在运行的进程。目标换了游戏时会**把会话身份与索引一起换过去**，并在返回里给 `context_switched` |
-| `launch_game` | 启动游戏并注入（**能抢在初始化前挂钩**；同名进程已在跑时直接拒绝，避免白等 60 秒）。`exe` 指向另一个游戏时会自动切换会话上下文（建新索引），返回里给 `context_switched` 说明换了哪个 |
-| `runtime_info` | 探针状态、可用 API、静态/运行时一致性自检（`image_count_matches`） |
-| `runtime_class_info` | **真实字段偏移**与**方法真实地址**。嵌套类型请传完整嵌套名（`search_classes` 的 `nested_name`）；短名命中多个时拒绝并给 `candidates` |
-| `find_instances` | **枚举类的活对象实例**（拿 `instance` 指针的正路，此前只能靠 Hook 碰运气）。走 GC liveness。**IL2CPP 可用（实测毫秒级）**；Mono 受官方限制，拿不到时如实报 `unsupported` 而不用空列表冒充。值类型无堆实例会明确报错 |
-| `find_hook_target` | 定位 Hook 落点并比对 token（同样支持完整嵌套名，歧义时拒绝） |
-| `hook_method` | 按类名+方法名装 Hook（用 `token` 指定重载；多候选未指定则拒绝） |
-| `hook_address` | 按绝对地址装 Hook |
-| `unhook` / `hook_status` | 卸载与查看 Hook（`unhook` 不带参数即卸载全部） |
-| `drain_events` | 取走捕获到的调用事件。`kind` 过滤作用于**整条队列**（不是只看队首）；不匹配的事件会原序留在队列里，不会被吞 |
-| `read_memory` / `write_memory` | 读写内存 |
-| `read_field_value` | 按字段偏移读值（读几个字节由字段类型决定） |
-| `set_field_value` | **写对象字段值**（`read_field_value` 的对称入口）：自动查偏移、按类型定宽度与编码、写完回读核对。**溢出直接报错不截断**；引用类型字段拒绝（改引用属改逻辑，请用 `eval_script`/Hook） |
-| `scan_pattern` | AOB 特征码扫描（兜底手段） |
-| `eval_script` | 下发任意 Frida JS |
-| `gc_control` | GC 控制（触发/禁用） |
-
-### 弱视觉 / UI（截图 · OCR · 日志）
-| 工具 | 作用 |
-|---|---|
-| `capture_screen` | 截屏/截窗口**存盘并返回路径**（不回 base64）。**截图是证据、不是判据**；窗口找不到会如实失败，不静默改截整屏 |
-| `ocr` | **OCR 识别文本并给屏幕绝对坐标**（可直接用于点击）。只对给定 ROI 做（实测整屏 4.1s vs ROI 数十 ms）；`matched_count==0` 是「本次没找到」而**非**「不存在」；`save_on_failure` 失败留证据 |
-| `probe_log` | 读游戏日志**尾部**并按正则过滤（编码自动 utf-8/gbk）。**只读、不消费**，可反复轮询；同类 Bot 项目普遍没有这条「用日志确认结果」的通道 |
-| `wait_for` | **轮询等待条件成立并给出证据包**（验收闭环里「等到可以判了」那一步）。五种条件：`field` / `instances` / `ocr` / `log` / `window`。返回三态 `verdict`（`pass` / `fail` / **`unverifiable`** —— 把「没法判」与「没通过」严格区分）+ `polls` / `evidence`；**超时如实报 fail，不静默当通过** |
-
-### 诊断
-| 工具 | 作用 |
-|---|---|
-| `get_diagnostics` | 环境自检：Frida、各解析器、缓存（默认不扫本机进程，见 `scan_processes`） |
-
----
 
 ## 资源（MCP resources）
 
@@ -260,7 +266,7 @@ GameModMCP/
 ├── install.ps1 / install.sh     一键安装 + 冒烟测试
 │
 ├── src/gamemod_mcp/
-│   ├── server.py                MCP 服务器（44 个工具）
+│   ├── server.py                MCP 服务器（45 个工具）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
@@ -367,7 +373,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 48 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 49 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -404,7 +410,8 @@ GameModMCP/
 | `verify_field_write.py` | **字段写入的编码**（`set_field_value`）：宽度按类型、溢出必须报错不截断、浮点/整数不混、引用类型被拒。含**非空转反证**（改回「一律 8 字节」或去掉范围检查，断言必须报红） |
 | `verify_find_instances.py` | **实例枚举的语义**（`find_instances`）：`max_count`/`namespace` 真的传下去、**派生类混入可核查**（`exact+derived==count`；实测 `Transform` 全返回 `RectTransform`）、「拿不到」不许冒充「没有」（Mono 时机限制必须 `unsupported`）、只读标注。含非空转反证 |
 | `verify_screen.py` | **弱视觉/UI 层**（`capture_screen`/`ocr`/`probe_log`）：**ROI 原点加回坐标**（用固定 OCR 桩做到确定性）、「没找到 ≠ 不存在」的语义、失败留证据、日志 GBK 自动探测与**只读不消费**、region 畸形输入。含非空转反证；缺可选依赖时记为「无法验证」而非通过 |
-| `verify_wait_for.py` | **轮询等待与三态判定**（`wait_for`）：超时如实报 `fail`（不静默当通过）、**`unverifiable` 与 `fail` 严格区分**、`timeout_ms`/`interval_ms` 真的影响行为、条件**后来**成立时能等到、`evidence` 有上限但 `polls` 计数完整。含非空转反证 |
+| `verify_wait_for.py` | **轮询等待与三态判定**（`wait_for`）：超时如实报 `fail`（不静默当通过）、**`unverifiable` 与 `fail` 严格区分**、`timeout_ms`/`interval_ms` 真的影响行为、条件**后来**成立时能等到、`evidence` 有上限但 `polls` 计数完整、**`kind="log"` 等的是增量而非存在**（旧日志已有时不许秒过）。含非空转反证 |
+| `verify_verify_state.py` | **证据充分性契约**（`verify_state`）：**单条证据不得判 `pass`**（`require_independent` 默认 2）、三态区分、`checks` 写法校验、与 `wait_for` 共用同一套条件语义（`_eval_condition`）。含非空转反证（把要求降到 1 则同一输入变 `pass`） |
 | `verify_response_size.py` | **响应体积**：P2-4 前后对比（用 `S.RAW_TOOLS` 调未套上限的原函数）、上限不变量、旧记录订正 |
 | `verify_cap.py` | **体积上限的机制**：截断/句柄/字段诚实性/不丢数据（纯函数 + 端到端两层） |
 | `verify_mcp_resources.py` | **MCP 资源层**：`gamemod://guide` 与磁盘 SKILL.md 逐字节相同、资源清单恰好只有它、找不到文件时如实说明 |
@@ -418,7 +425,7 @@ GameModMCP/
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
-| `verify_tool_annotations.py` | 44 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
+| `verify_tool_annotations.py` | 45 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
 
@@ -461,7 +468,7 @@ python devtools\report_runtime_matrix.py      # 运行时：真的启动/注入/
 ```
 
 `report_runtime_matrix.py` 会**真的**启动每个游戏、注入探针、装 Hook、
-强制调用并读回参数与返回值，最后按「游戏 × 44 个工具」输出
+强制调用并读回参数与返回值，最后按「游戏 × 45 个工具」输出
 `ok / 不适用 / 失败` 三态（`--json` 落盘 + `--md` 出报告）。
 最近一次全量结果见 [`docs/多游戏运行时兼容性报告.md`](docs/多游戏运行时兼容性报告.md)。
 

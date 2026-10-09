@@ -109,6 +109,9 @@ MUTATING: dict[str, tuple[bool, bool, bool]] = {
     # wait_for 会**消费时间**并可能落盘（ocr 分支），但重复等待同一条件
     # 等价（条件成立就一直成立）；它不写内存、不装 Hook。
     "wait_for":       (False, True, True),
+    # verify_state 与 wait_for 同源：只读求值多个条件，不写内存、不装 Hook；
+    # 重复验收同一状态等价。
+    "verify_state":   (False, True, True),
     # 每次调用都产生新的东西，重复调不等价
     "launch_game":    (False, False, True),   # 每次都是新进程
     "hook_method":    (False, False, True),
