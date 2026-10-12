@@ -102,6 +102,7 @@ from mcp.server.fastmcp.tools.base import Tool
 if __package__ in (None, ""):  # 直接当脚本跑
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from gamemod_mcp import __version__, cap
+    from gamemod_mcp import debuglog as dlog
     from gamemod_mcp.engine import decompile as dc
     from gamemod_mcp.engine import discovery, state
     from gamemod_mcp.engine import ue as ue_mod
@@ -109,6 +110,7 @@ if __package__ in (None, ""):  # 直接当脚本跑
     from gamemod_mcp.logutil import progress, warn
 else:  # 正常作为包被导入
     from . import __version__, cap
+    from . import debuglog as dlog
     from .engine import decompile as dc
     from .engine import discovery, state
     from .engine import ue as ue_mod
@@ -354,6 +356,37 @@ def _cap_response(fn: Any) -> Any:
 #     所以不是只读（但它们只写自己的产物、可覆盖，不算破坏）。
 #   · 纯查索引的工具只读本地 SQLite，既不碰游戏进程也不联网
 #     → openWorldHint=False；一碰活着的游戏进程就是 True。
+
+
+def _screen_mod() -> Any:
+    """拿到 `engine.screen` 模块，**两种启动方式都要能用**。
+
+    为什么需要这个函数（这不是洁癖，是一个真实缺陷的修复）
+    ------------------------------------------------------------
+    原来四处调用点写的是 `from .engine import screen as _screen`（函数体内的
+    **相对**导入）。以「脚本形式」启动时（`python <repo>/src/gamemod_mcp/server.py`）
+    没有父包，`__package__` 是空串，于是这句会在**调用那一刻**才炸：
+
+        {"ok": false, "error": "加载截图模块失败：attempted relative import
+                                with no known parent package"}
+
+    它影响 4 个工具：`capture_screen` / `ocr` / `probe_log` / `wait_for`。
+    隐蔽之处在于：握手、`tools/list`、其它工具**全都正常**，只有这四个一用
+    就报一句与真实原因无关的话 —— 而且 `verify_stdio_entry.py` 当时只真调了
+    `ue_*` / `decompile`，所以没照到这四处。
+
+    本文件开头（第 94~123 行）已经为「两种入口」专门改过一次导入，道理
+    完全一样；这里把那次的结论应用到函数体内的导入上：**不在函数体里做
+    相对导入**，统一由本函数按包名绝对导入。
+
+    实测：模块形式与脚本形式下 `capture_screen` 都返回真实的窗口查找结果，
+    不再出现 relative import 报错。
+    """
+    try:
+        from gamemod_mcp.engine import screen as mod   # 脚本形式
+    except ImportError:                                # 模块形式
+        from .engine import screen as mod              # type: ignore[no-redef]
+    return mod
 
 
 def _ann(title: str, *, read_only: bool, open_world: bool = False,
@@ -2542,7 +2575,7 @@ def capture_screen(region: str = "", window: str = "", save_path: str = "",
         {ok, path, width, height, backend, region, coordinate_space, ...}
     """
     try:
-        from .engine import screen as _screen
+        _screen = _screen_mod()
     except Exception as exc:  # pragma: no cover
         return _err(f"加载截图模块失败：{exc}")
 
@@ -2605,7 +2638,7 @@ def ocr(region: str = "", window: str = "", expected: str = "",
          coordinate_space: "screen_absolute", image, ...}
     """
     try:
-        from .engine import screen as _screen
+        _screen = _screen_mod()
     except Exception as exc:  # pragma: no cover
         return _err(f"加载 OCR 模块失败：{exc}")
 
@@ -2664,7 +2697,7 @@ def probe_log(path: str, pattern: str = "", max_lines: int = 200,
          lines: [{line_no, text}], matched_count?, has_more?, truncated_head}
     """
     try:
-        from .engine import screen as _screen
+        _screen = _screen_mod()
     except Exception as exc:  # pragma: no cover
         return _err(f"加载日志模块失败：{exc}")
     if not path:
@@ -2821,7 +2854,7 @@ def _eval_condition_inner(kind: str, *, target: str = "", region: str = "",
             error = str(lr.get("error", ""))[:200]
 
     elif kind == "window":
-        from .engine import screen as _screen
+        _screen = _screen_mod()
         w = _screen.find_window_rect(target)
         detail = {"window_found": bool(w.get("ok")), "title": w.get("title")}
         hit = bool(w.get("ok"))
@@ -3687,6 +3720,108 @@ def _install_event_loop_guard() -> bool:
 #: 注意：**不改** `server.<工具>` 这些模块属性，所以
 #: `devtools/verify_*.py` 里 `S.open_game(...)` 那 64 处同步调用照旧工作。
 _EVENT_LOOP_GUARD = _install_event_loop_guard()
+
+
+def _install_call_logger() -> bool:
+    """把「工具调用流水」挂到分发层，供人工调试前端回溯。
+
+    为什么挂在**这里**而不是前端里（这条很关键）
+    ------------------------------------------------------------
+    调试前端（`debug_ui.py`）只能看见「经它发出的调用」。而 AI 客户端
+    （DSH / Claude Code …）会**自己拉起一个 MCP 服务器进程**，那个进程
+    前端根本看不见 —— 于是「AI 到底调了什么」就永远回溯不到。
+
+    挂在 `ToolManager.call_tool`（FastMCP 分发工具的唯一入口）上，人工手调的
+    与 AI 调的会落进**同一份流水**，用 `source`（`ui` / `mcp`）与 `pid` 区分。
+    这正是 `_install_event_loop_guard` 用过的同一个挂点，机制已经验证过。
+
+    **默认关闭**（`GAMEMOD_DEBUG_LOG` 未设时 `dlog.record` 直接返回），
+    所以不设环境变量时这份钩子完全不改变行为，也没有磁盘写入。
+    `dlog.record` 自身承诺永不抛异常，这里再兜一层，确保**任何**日志问题
+    都不会让一个本来正常的工具失败。
+    """
+    try:
+        from mcp.server.fastmcp.tools.tool_manager import ToolManager
+    except Exception as exc:  # noqa: BLE001 - mcp 结构变了
+        warn(f"无法安装调用流水钩子（import ToolManager 失败）：{exc}")
+        return False
+
+    original = getattr(ToolManager, "call_tool", None)
+    if original is None or getattr(original, "_gamemod_logged", False):
+        return False
+
+    async def call_tool_logged(self: Any, name: str, arguments: dict,
+                               context: Any = None,
+                               convert_result: bool = False) -> Any:
+        """与上游 `call_tool` 等价，只在前后加一层流水记录。"""
+        if not dlog.is_enabled():
+            return await original(self, name, arguments, context,
+                                  convert_result)
+
+        started = time.time()
+        try:
+            result = await original(self, name, arguments, context,
+                                    convert_result)
+        except BaseException as exc:      # 记录后原样抛出
+            try:
+                dlog.record(name, arguments, None, ok=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                            elapsed_ms=(time.time() - started) * 1000)
+            except BaseException:         # noqa: BLE001 - 见 docstring
+                pass
+            raise
+
+        try:
+            payload = _tool_payload(result)
+            dlog.record(name, arguments, payload,
+                        ok=payload.get("ok") if isinstance(payload, dict)
+                        else None,
+                        error=(payload.get("error", "")
+                               if isinstance(payload, dict) else ""),
+                        elapsed_ms=(time.time() - started) * 1000)
+        except BaseException:             # noqa: BLE001 - 见 docstring
+            pass
+        return result
+
+    call_tool_logged._gamemod_logged = True        # type: ignore[attr-defined]
+    #: **把内层的标记透传出来**。事件循环保护是靠
+    #: `getattr(ToolManager.call_tool, "_gamemod_offload", False)` 自省的，
+    #: 而本钩子包在它**外面**（顺序：`logged(offloaded(上游))`）。
+    #: 不透传的话，那个自省看到的是本包装函数、拿不到标记，
+    #: `verify_report_fixes` 会报「事件循环保护没装上」—— 而它其实装着呢。
+    #: 实测踩过：漏了这一行，那条断言就从 ✅ 变 ❌。
+    call_tool_logged._gamemod_offload = getattr(      # type: ignore[attr-defined]
+        original, "_gamemod_offload", False)
+    ToolManager.call_tool = call_tool_logged       # type: ignore[method-assign]
+    return True
+
+
+def _tool_payload(result: Any) -> Any:
+    """把 FastMCP 的返回（`[TextContent(...)]` 或 dict）还原成纯 Python 值。
+
+    上游把工具返回的 dict 序列化进 `TextContent.text` 的 JSON 里；
+    流水里存回**结构**比存一坨转义 JSON 好读得多。解析不出来就退回原样，
+    绝不为了「好看」丢信息。
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, (list, tuple)) and len(result) == 1:
+        text = getattr(result[0], "text", None)
+        if isinstance(text, str):
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError):
+                return text
+            return parsed
+    return result
+
+
+#: 模块导入时装上。与 `_EVENT_LOOP_GUARD` 同理：两种启动方式都要覆盖。
+#: 它排在事件循环保护**之后**，于是包装顺序是
+#: `logged(offloaded(上游))` —— 记录拿到的是工具真实返回值，
+#: 且耗时包含了真正的执行时间（包括被 offload 到线程的那部分）。
+_CALL_LOGGER = _install_call_logger()
+
 
 
 # ================================================================

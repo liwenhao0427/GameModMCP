@@ -55,6 +55,12 @@ devtools/_probe_*.py
 devtools/archive/probes/*.log
 devtools/archive/probes/*.jsonl
 
+# ---- 调试前端 / 调用流水（debuglog 的产物）----
+# 默认落在 ~/.gamemod/debug/（本来就不在库里）；这几行是兜底：
+# 有人用 GAMEMOD_DEBUG_LOG_PATH 指到仓库内时也不会误入库。
+debug/
+*.jsonl
+
 # ---- 编辑器 / 操作系统杂项 ----
 .vscode/
 .idea/

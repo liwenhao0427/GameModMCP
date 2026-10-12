@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GameMod MCP 调试前端</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a22; --panel2:#1d222c; --line:#2a3140;
+    --fg:#e6e9ef; --dim:#98a1b3; --accent:#4c8dff; --ok:#3fb950;
+    --bad:#f85149; --warn:#d29922; --mono:ui-monospace,"Cascadia Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 "Segoe UI",system-ui,sans-serif;
+       display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .grow{flex:1}
+  .pill{font-size:12px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
+        border-radius:999px;padding:3px 10px;white-space:nowrap}
+  .pill b{color:var(--fg);font-weight:600}
+  main{display:grid;grid-template-columns:320px 1fr;min-height:0}
+  aside{background:var(--panel);border-right:1px solid var(--line);
+        display:grid;grid-template-rows:auto 1fr;min-height:0}
+  .search{padding:10px;border-bottom:1px solid var(--line)}
+  .search input{width:100%;background:var(--panel2);border:1px solid var(--line);
+                color:var(--fg);border-radius:6px;padding:7px 9px;font-size:13px}
+  .tools{overflow:auto;padding:4px 0 20px}
+  .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;
+       padding:10px 12px 4px;position:sticky;top:0;background:var(--panel);z-index:1}
+  .tool{padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:7px;
+        border-left:3px solid transparent}
+  .tool:hover{background:var(--panel2)}
+  .tool.sel{background:var(--panel2);border-left-color:var(--accent)}
+  .tool .nm{font-family:var(--mono);font-size:12.5px;overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap}
+  .dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+  .dot.ro{background:var(--ok)} .dot.ds{background:var(--bad)} .dot.ow{background:var(--warn)}
+  section{display:grid;grid-template-rows:auto 1fr;min-height:0;min-width:0}
+  .tabs{display:flex;gap:2px;background:var(--panel);border-bottom:1px solid var(--line);
+        padding:0 10px}
+  .tab{padding:9px 14px;cursor:pointer;color:var(--dim);font-size:13px;border-bottom:2px solid transparent}
+  .tab.on{color:var(--fg);border-bottom-color:var(--accent)}
+  .pane{overflow:auto;padding:16px;min-height:0;display:none}
+  .pane.on{display:block}
+  h2{font-size:16px;margin:0 0 6px;font-family:var(--mono)}
+  .desc{color:var(--dim);font-size:12.5px;white-space:pre-wrap;margin:0 0 14px;
+        max-height:150px;overflow:auto;background:var(--panel);border:1px solid var(--line);
+        border-radius:8px;padding:10px}
+  .badges{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+  .badge{font-size:11.5px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);
+         background:var(--panel)}
+  .badge.ro{color:var(--ok);border-color:#23502e}
+  .badge.ds{color:var(--bad);border-color:#5c2320}
+  .badge.ow{color:var(--warn);border-color:#5a4413}
+  .field{margin-bottom:11px}
+  .field label{display:block;font-size:12.5px;margin-bottom:4px}
+  .field .req{color:var(--bad)}
+  .field .ty{color:var(--dim);font-family:var(--mono);font-size:11.5px;margin-left:6px}
+  .field .hint{color:var(--dim);font-size:11.5px;margin-top:3px;white-space:pre-wrap}
+  input[type=text],input[type=number],select,textarea{
+    width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    border-radius:6px;padding:7px 9px;font-size:13px;font-family:var(--mono)}
+  textarea{min-height:74px;resize:vertical}
+  button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 16px;
+         font-size:13px;cursor:pointer;font-weight:600}
+  button:hover{filter:brightness(1.1)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg);font-weight:500}
+  button.danger{background:#7d2b28}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 8px}
+  .chip{font-size:12px;padding:3px 10px;border-radius:6px;background:var(--panel);
+        border:1px solid var(--line);font-family:var(--mono)}
+  .chip.ok{color:var(--ok)} .chip.bad{color:var(--bad)} .chip.warn{color:var(--warn)}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;
+      overflow:auto;max-height:52vh;font-family:var(--mono);font-size:12.5px;margin:0;
+      white-space:pre-wrap;word-break:break-word}
+  .empty{color:var(--dim);padding:24px;text-align:center;font-size:13px}
+  /* 日志 */
+  .logbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+          background:var(--panel);border:1px solid var(--line);border-radius:8px;
+          padding:10px 12px;margin-bottom:12px}
+  .switch{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;font-size:13px}
+  .switch input{display:none}
+  .track{width:38px;height:20px;background:#39414f;border-radius:999px;position:relative;
+         transition:.15s;flex:0 0 auto}
+  .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;
+                background:#fff;border-radius:50%;transition:.15s}
+  .switch input:checked + .track{background:var(--ok)}
+  .switch input:checked + .track::after{transform:translateX(18px)}
+  .rec{border:1px solid var(--line);border-radius:7px;margin-bottom:6px;background:var(--panel)}
+  .rec summary{padding:7px 11px;cursor:pointer;display:flex;gap:9px;align-items:center;
+               font-size:12.5px;list-style:none;flex-wrap:wrap}
+  .rec summary::-webkit-details-marker{display:none}
+  .rec .t{color:var(--dim);font-family:var(--mono);font-size:11.5px}
+  .rec .tool{font-family:var(--mono);color:var(--fg);font-weight:600}
+  .src{font-size:10.5px;padding:1px 7px;border-radius:999px;border:1px solid var(--line)}
+  .src.ui{color:var(--accent);border-color:#26406e}
+  .src.mcp{color:var(--warn);border-color:#5a4413}
+  .rec .body{padding:0 11px 11px}
+  .rec .body h4{margin:9px 0 5px;font-size:11.5px;color:var(--dim);font-weight:600;
+                text-transform:uppercase;letter-spacing:.5px}
+  .rec .body pre{max-height:34vh}
+  .sum{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);
+         border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;
+         padding:10px 14px;font-size:13px;box-shadow:0 6px 24px #0008;max-width:380px;z-index:9}
+  .toast.bad{border-left-color:var(--bad)}
+  .toast.ok{border-left-color:var(--ok)}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid #fff5;
+        border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;
+        vertical-align:-1px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>GameMod MCP 调试前端</h1>
+  <span class="pill" id="p-tools">工具 <b>…</b></span>
+  <span class="pill" id="p-session">会话 <b>未识别</b></span>
+  <span class="grow"></span>
+  <span class="pill" id="p-log">流水 <b>关</b></span>
+</header>
+
+<main>
+  <aside>
+    <div class="search"><input id="q" placeholder="过滤工具名…（如 search / hook）"></div>
+    <div class="tools" id="tools"></div>
+  </aside>
+
+  <section>
+    <div class="tabs">
+      <div class="tab on" data-tab="call">调用</div>
+      <div class="tab" data-tab="log">调用日志</div>
+    </div>
+
+    <div class="pane on" id="pane-call">
+      <div id="detail"><div class="empty">从左侧选一个工具</div></div>
+    </div>
+
+    <div class="pane" id="pane-log">
+      <div class="logbar">
+        <label class="switch"><input type="checkbox" id="log-enable"><span class="track"></span>
+          <span>记录调用流水</span></label>
+        <span class="grow"></span>
+        <button class="ghost" id="log-refresh">刷新</button>
+        <button class="danger" id="log-clear">清空</button>
+      </div>
+      <div class="sum" id="log-sum"></div>
+      <div class="row" style="margin-bottom:10px">
+        <input type="text" id="f-tool" placeholder="按工具名过滤" style="width:180px">
+        <select id="f-status" style="width:120px">
+          <option value="">全部状态</option>
+          <option value="ok">仅成功</option>
+          <option value="fail">仅失败</option>
+        </select>
+        <input type="text" id="f-q" placeholder="在参数/返回/错误里搜…" style="flex:1;min-width:160px">
+        <button class="ghost" id="log-apply">应用</button>
+      </div>
+      <div id="log-list"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+let TOOLS = [], CUR = null;
+
+function toast(msg, kind){
+  const d = document.createElement("div");
+  d.className = "toast " + (kind || "");
+  d.textContent = msg;
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), 4200);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch(e){ j = {ok:false, error:"返回不是 JSON"}; }
+  return j;
+}
+function badge(text, cls){
+  const s = document.createElement("span");
+  s.className = "badge " + (cls||"");
+  s.textContent = text;
+  return s;
+}
+
+/* ---------------------------------------------------- 工具列表 */
+let FILTER = "";
+
+function buildList(){
+  const box = $("#tools");
+  box.textContent = "";
+  const q = FILTER.toLowerCase();
+  const shown = TOOLS.filter(t =>
+    !q || t.name.toLowerCase().includes(q) || (t.title || "").toLowerCase().includes(q));
+  const groups = {};
+  for (const t of shown) (groups[t.group] = groups[t.group] || []).push(t);
+  const keys = Object.keys(groups);
+  if (!keys.length){
+    const e = document.createElement("div");
+    e.className = "empty"; e.textContent = "没有匹配的工具";
+    box.appendChild(e);
+    return;
+  }
+  for (const g of keys){
+    const h = document.createElement("div");
+    h.className = "grp"; h.textContent = g + "（" + groups[g].length + "）";
+    box.appendChild(h);
+    for (const t of groups[g]) box.appendChild(toolRow(t));
+  }
+  // 重渲染后要把选中态补回来（否则过滤一下高亮就没了）
+  if (CUR){
+    const el = box.querySelector('.tool[data-name="' + CUR.name + '"]');
+    if (el) el.classList.add("sel");
+  }
+}
+
+async function loadTools(){
+  const j = await api("/api/tools");
+  if (!j.ok){ $("#tools").textContent = "取工具清单失败：" + (j.error||""); return; }
+  TOOLS = j.tools;
+  $("#p-tools").innerHTML = "工具 <b>" + j.count + "</b>";
+  if (j.note) toast(j.note, "bad");
+  buildList();
+}
+
+function toolRow(t){
+  const d = document.createElement("div");
+  d.className = "tool"; d.dataset.name = t.name;
+  d.title = t.title || t.description.slice(0, 200);
+  const dot = document.createElement("span");
+  dot.className = "dot " + (t.read_only ? "ro" : (t.destructive ? "ds" : "ow"));
+  const nm = document.createElement("span");
+  nm.className = "nm"; nm.textContent = t.name;
+  d.append(dot, nm);
+  d.onclick = () => selectTool(t);
+  return d;
+}
+
+function filterTools(){
+  FILTER = $("#q").value.trim();
+  // 整表重渲染，而不是逐个 display:none 切换。
+  // 为什么：切换式写法会让**分组表头和计数**与实际可见项脱节
+  // （实测：过滤后工具被隐藏了，表头还写着「UE 层（5）」、分组也没被收起）。
+  // 重渲染天然不会出现这种半更新状态，代码还更短。
+  buildList();
+}
+
+/* ---------------------------------------------------- 工具详情 */
+function selectTool(t, updateHash){
+  CUR = t;
+  if (updateHash !== false){
+    // 深链接：#tool=<名字> 与 #tab=log。人工调试时常要把「我正在看哪个工具」
+    // 发给别人，或刷新后回到同一处；顺带让自动化截图变得确定
+    // （不靠像素坐标去点）。
+    const hash = "#tool=" + encodeURIComponent(t.name);
+    if (location.hash !== hash) history.replaceState(null, "", hash);
+  }
+  document.querySelectorAll(".tool").forEach(el =>
+    el.classList.toggle("sel", el.dataset.name === t.name));
+  const box = $("#detail");
+  box.textContent = "";
+
+  const h = document.createElement("h2"); h.textContent = t.name;
+  box.appendChild(h);
+
+  const bs = document.createElement("div"); bs.className = "badges";
+  bs.appendChild(badge(t.group === "未分组" ? "未分组" : t.group));
+  bs.appendChild(badge(t.read_only ? "只读" : "会改动", t.read_only ? "ro" : "ds"));
+  if (t.destructive) bs.appendChild(badge("破坏性", "ds"));
+  if (t.idempotent) bs.appendChild(badge("幂等"));
+  if (t.open_world) bs.appendChild(badge("接触外部世界", "ow"));
+  box.appendChild(bs);
+
+  if (t.title){ const p = document.createElement("div"); p.className="desc";
+    p.textContent = "【" + t.title + "】"; box.appendChild(p); }
+  if (t.description){
+    const p = document.createElement("div"); p.className = "desc";
+    p.textContent = t.description; box.appendChild(p);
+  }
+
+  const form = document.createElement("div");
+  if (!t.params.length){
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "该工具没有参数"; form.appendChild(e);
+  }
+  for (const p of t.params) form.appendChild(field(t, p));
+
+  const row = document.createElement("div"); row.className = "row";
+  row.style.marginTop = "6px";
+  const btn = document.createElement("button");
+  btn.id = "run"; btn.textContent = "调用 " + t.name;
+  btn.onclick = runTool;
+  const clr = document.createElement("button");
+  clr.className = "ghost"; clr.textContent = "重置为默认值";
+  clr.onclick = () => selectTool(t, false);
+  row.append(btn, clr);
+  form.appendChild(row);
+
+  const out = document.createElement("div"); out.id = "out";
+  form.appendChild(out);
+  box.appendChild(form);
+}
+
+function field(t, p){
+  const wrap = document.createElement("div"); wrap.className = "field";
+  const lab = document.createElement("label");
+  lab.textContent = p.name;
+  if (p.required){
+    const r = document.createElement("span"); r.className = "req";
+    r.textContent = " *"; lab.appendChild(r);
+  }
+  const ty = document.createElement("span"); ty.className = "ty";
+  ty.textContent = p.type + (p.has_default ? "，默认 " + JSON.stringify(p.default) : "");
+  lab.appendChild(ty);
+  wrap.appendChild(lab);
+
+  let el;
+  const longText = ["code","checks","args","hex_data","goal"].includes(p.name);
+  if (p.enum){
+    el = document.createElement("select");
+    if (!p.required){
+      const o = document.createElement("option"); o.value = ""; o.textContent = "（默认）";
+      el.appendChild(o);
+    }
+    for (const v of p.enum){
+      const o = document.createElement("option"); o.value = String(v); o.textContent = String(v);
+      el.appendChild(o);
+    }
+    if (p.has_default) el.value = String(p.default);
+  } else if (p.type === "boolean"){
+    el = document.createElement("select");
+    for (const v of ["true","false"]){
+      const o = document.createElement("option"); o.value = v; o.textContent = v;
+      el.appendChild(o);
+    }
+    el.value = String(p.has_default ? p.default : false);
+  } else if (p.type === "integer" || p.type === "number"){
+    el = document.createElement("input"); el.type = "number";
+    if (p.type === "number") el.step = "any";
+    if (p.has_default) el.value = p.default;
+  } else if (p.type === "object" || p.type === "array" || longText){
+    el = document.createElement("textarea");
+    if (p.type === "object") el.placeholder = '{"键":值}';
+    if (p.type === "array") el.placeholder = "[1,2,3]";
+    if (p.has_default) el.value = typeof p.default === "string"
+      ? p.default : JSON.stringify(p.default, null, 2);
+  } else {
+    el = document.createElement("input"); el.type = "text";
+    if (p.has_default) el.value = p.default;
+  }
+  el.id = "arg-" + p.name;
+  el.dataset.pname = p.name;
+  wrap.appendChild(el);
+
+  if (p.description){
+    const h = document.createElement("div"); h.className = "hint";
+    h.textContent = p.description; wrap.appendChild(h);
+  }
+  return wrap;
+}
+
+function collectArgs(){
+  const args = {};
+  document.querySelectorAll("#detail [data-pname]").forEach(el => {
+    const name = el.dataset.pname;
+    if (el.tagName === "SELECT" && el.value === "") return;
+    if (el.tagName === "INPUT" && el.type !== "checkbox" && el.value === "") return;
+    args[name] = el.value;
+  });
+  return args;
+}
+
+async function runTool(){
+  if (!CUR) return;
+  const btn = $("#run");
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.innerHTML = '<span class="spin"></span>调用中…';
+  const out = $("#out");
+  out.textContent = "";
+  const wait = document.createElement("div"); wait.className = "empty";
+  wait.textContent = "已发起调用…";
+  out.appendChild(wait);
+
+  try{
+    const j = await api("/api/call", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({tool: CUR.name, args: collectArgs()})
+    });
+    out.textContent = "";
+    if (!j.ok && j.args === undefined){
+      out.appendChild(chips([["错误", j.error, "bad"]]));
+      toast("调用失败：" + j.error, "bad");
+      return;
+    }
+    const cs = [["耗时", j.elapsed_ms + " ms"], ["返回", j.bytes + " B"]];
+    if (j.result_ok === false) cs.push(["工具报错", j.error || "见返回", "bad"]);
+    else if (j.result_ok === true) cs.push(["ok", "true", "ok"]);
+    if (j.capped) cs.push(["已被体积上限截断", "看返回里的 note", "warn"]);
+    out.appendChild(chips(cs));
+    const pre = document.createElement("pre");
+    pre.textContent = j.json || JSON.stringify(j, null, 2);
+    out.appendChild(pre);
+    toast("调用成功", "ok");
+    refreshLogSoon();
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+function chips(list){
+  const d = document.createElement("div"); d.className = "chips";
+  for (const [k, v, cls] of list){
+    const s = document.createElement("span");
+    s.className = "chip " + (cls || "");
+    s.textContent = k + "：" + v;
+    d.appendChild(s);
+  }
+  return d;
+}
+
+/* ---------------------------------------------------- 调用日志 */
+let logTimer = null;
+function refreshLogSoon(){
+  if (logTimer) return;
+  logTimer = setTimeout(() => { logTimer = null; loadLog(); }, 400);
+}
+
+async function loadLog(){
+  const st = await api("/api/log/stats");
+  $("#log-enable").checked = !!st.enabled;
+  $("#p-log").innerHTML = "流水 <b>" + (st.enabled ? "开" : "关") + "</b>"
+    + (st.exists ? " · " + fmtBytes(st.current_bytes) : "");
+  const sum = await api("/api/log/summary");
+  const box = $("#log-sum"); box.textContent = "";
+  if (!sum.exists){
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "还没有任何调用记录。打开上面的开关后，人工调用与 AI 客户端的调用都会记到这里。";
+    box.appendChild(e);
+    $("#log-list").textContent = "";
+    return;
+  }
+  box.appendChild(chipText("共 " + sum.total + " 次"));
+  if (sum.failed) box.appendChild(chipText("失败 " + sum.failed + " 次", "bad"));
+  for (const [src, n] of Object.entries(sum.by_source))
+    box.appendChild(chipText((src === "ui" ? "人工" : "AI/客户端") + " " + n + " 次"));
+  const top = Object.entries(sum.by_tool).slice(0, 6)
+    .map(([k, v]) => k + "×" + v.calls).join("  ");
+  if (top) box.appendChild(chipText(top));
+  box.appendChild(chipText("文件 " + sum.path));
+
+  const q = new URLSearchParams({
+    limit: "100", tool: $("#f-tool").value.trim(),
+    status: $("#f-status").value, q: $("#f-q").value.trim()
+  });
+  const j = await api("/api/log/records?" + q.toString());
+  const list = $("#log-list"); list.textContent = "";
+  if (!j.records.length){
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "没有匹配的记录（现有过滤条件下）。";
+    list.appendChild(e); return;
+  }
+  for (const r of j.records) list.appendChild(recRow(r));
+  if (j.has_more){
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "只显示最近 100 条，还有更多（用上面的过滤缩小范围）。";
+    list.appendChild(e);
+  }
+}
+function chipText(t, cls){
+  const s = document.createElement("span");
+  s.className = "chip " + (cls || ""); s.textContent = t; return s;
+}
+function fmtBytes(n){
+  if (n == null) return "?";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n/1024).toFixed(1) + " KB";
+  return (n/1048576).toFixed(2) + " MB";
+}
+function recRow(r){
+  const d = document.createElement("details"); d.className = "rec";
+  const s = document.createElement("summary");
+  const t = document.createElement("span"); t.className = "t"; t.textContent = r.ts || "";
+  const src = document.createElement("span");
+  src.className = "src " + (r.source === "ui" ? "ui" : "mcp");
+  src.textContent = r.source === "ui" ? "人工" : "AI";
+  const name = document.createElement("span"); name.className = "tool"; name.textContent = r.tool;
+  const status = document.createElement("span");
+  status.className = "chip " + (r.ok === false ? "bad" : (r.ok === true ? "ok" : ""));
+  status.textContent = r.ok === false ? "失败" : (r.ok === true ? "ok" : "?");
+  s.append(t, src, name, status);
+  if (r.elapsed_ms != null){
+    const e = document.createElement("span"); e.className = "t";
+    e.textContent = r.elapsed_ms + " ms"; s.appendChild(e);
+  }
+  if (r.result_bytes != null){
+    const e = document.createElement("span"); e.className = "t";
+    e.textContent = fmtBytes(r.result_bytes); s.appendChild(e);
+  }
+  if (r.error){
+    const e = document.createElement("span"); e.className = "chip bad";
+    e.textContent = String(r.error).slice(0, 80); s.appendChild(e);
+  }
+  d.appendChild(s);
+
+  const body = document.createElement("div"); body.className = "body";
+  for (const [label, val] of [["参数", r.args], ["返回", r.result]]){
+    const h = document.createElement("h4"); h.textContent = label; body.appendChild(h);
+    const pre = document.createElement("pre");
+    try { pre.textContent = JSON.stringify(val, null, 2); }
+    catch(e){ pre.textContent = String(val); }
+    if (r.truncated && label === "返回"){
+      const n = document.createElement("div"); n.className = "hint";
+      n.textContent = "（该记录体积超限，正文已截断；完整值见 result_bytes 与环境里的工具返回）";
+      body.appendChild(n);
+    }
+    body.appendChild(pre);
+  }
+  d.appendChild(body);
+  return d;
+}
+
+async function toggleLog(on){
+  const j = await api("/api/log/enabled", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({enabled: on})
+  });
+  if (!j.ok){ toast(j.error || "设置失败", "bad"); return; }
+  toast(on ? "已开始记录调用流水" : "已停止记录", "ok");
+  loadLog();
+}
+async function clearLog(){
+  if (!confirm("清空全部调用流水？此操作不可撤销。")) return;
+  const j = await api("/api/log/clear", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body:"{}"});
+  if (j.ok) toast("已清空（删除 " + j.removed.length + " 个文件）", "ok");
+  else toast("部分文件删不掉：" + (j.failed || []).join("；"), "bad");
+  loadLog();
+}
+async function loadSession(){
+  const j = await api("/api/session");
+  const s = (j.session && j.session.session) ? j.session.session : j.session;
+  const b = $("#p-session").querySelector("b");
+  if (s && s.engine) b.textContent = s.engine + " · " + (s.game_dir || "").split(/[\\/]/).pop();
+  else b.textContent = "未识别（先调 open_game）";
+}
+
+/* ---------------------------------------------------- 绑定 */
+function showTab(name, updateHash){
+  document.querySelectorAll(".tab").forEach(x =>
+    x.classList.toggle("on", x.dataset.tab === name));
+  document.querySelectorAll(".pane").forEach(x =>
+    x.classList.toggle("on", x.id === "pane-" + name));
+  if (updateHash !== false){
+    const h = name === "log" ? "#tab=log" : "";
+    history.replaceState(null, "", h || location.pathname);
+  }
+  if (name === "log") loadLog();
+}
+
+document.querySelectorAll(".tab").forEach(t => t.onclick =
+  () => showTab(t.dataset.tab));
+$("#q").oninput = filterTools;
+$("#log-enable").onchange = (e) => toggleLog(e.target.checked);
+$("#log-refresh").onclick = loadLog;
+$("#log-clear").onclick = clearLog;
+$("#log-apply").onclick = loadLog;
+$("#f-status").onchange = loadLog;
+
+/* 按 URL hash 还原视图：#tool=<名字> / #tab=log */
+function applyHash(){
+  const h = location.hash.replace(/^#/, "");
+  if (h === "tab=log"){ showTab("log", false); return; }
+  const m = /^tool=(.+)$/.exec(h);
+  if (m){
+    const want = decodeURIComponent(m[1]);
+    const t = TOOLS.find(x => x.name === want);
+    if (t){ showTab("call", false); selectTool(t, false); }
+  }
+}
+window.addEventListener("hashchange", applyHash);
+
+(async () => {
+  await loadTools();
+  await loadSession();
+  loadLog();
+  applyHash();
+})();
+setInterval(() => {
+  if ($("#pane-log").classList.contains("on")) loadLog();
+  else loadSession();
+}, 5000);
+</script>
+</body>
+</html>

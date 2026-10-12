@@ -198,6 +198,40 @@ def main() -> int:
 
         check("stdout 全程只有 JSON-RPC（跑完工具调用后）",
               srv.non_json_lines == 0, f"非 JSON 行数={srv.non_json_lines}")
+
+        # ------------------------------------------------ 2b. 弱视觉四个工具
+        #
+        # 回归：`capture_screen` / `ocr` / `probe_log` / `wait_for` 曾经在
+        # **脚本形式**下必然失败，错误是
+        #   「加载截图模块失败：attempted relative import with no known parent package」
+        # 根因是这四个工具的调用点写的是函数体内的**相对**导入
+        # （`from .engine import screen as _screen`），而没有父包时它必炸。
+        # 本文件此前只真调了 ue_* / decompile，所以没照到这四处。
+        #
+        # 这里挑**不会卡住**的调用形态来验（关键）：
+        #   · 用 `probe_log` 指向不存在的日志（立刻返回业务错误）；
+        #   · 用 `wait_for(kind="window")` 找一个不存在的窗口（立刻超时）。
+        # **故意不调 `capture_screen` / `ocr`**：它们在全新进程里首次会
+        # `import dxcam`，而本机实测那一句要 60~200 秒（第三方包自己的问题，
+        # 与本项目无关，HEAD 版同样如此）。把它写进门禁只会让门禁变得很慢且
+        # 不稳定 —— 而这条断言要抓的是「相对导入」，用上面两条同样能抓到。
+        probe = srv.call_tool("probe_log", {"path": "C:\\绝对不存在_xyz.log"})
+        wf = srv.call_tool("wait_for", {"kind": "window",
+                                        "target": "绝无此窗口XYZ",
+                                        "timeout_ms": 300})
+        for tag, r in (("probe_log", probe), ("wait_for(kind=window)", wf)):
+            blob = f"{r.get('error', '')} {r.get('data')}"
+            bad_import = ("relative import" in blob
+                          or "no known parent package" in blob)
+            # 业务上的「文件不存在 / 等待超时」是**预期**结果，不算失败；
+            # 这里要抓的只是「相对导入」这个与真实原因无关的报错。
+            business_ok = (not bad_import
+                           and str((r["data"] or {}).get("error", ""))
+                           != "加载截图模块失败")
+            check(f"{tag} 在脚本形式下不再报「相对导入」/「加载模块失败」",
+                  business_ok,
+                  f"is_error={r['is_error']} "
+                  f"err={str((r['data'] or {}).get('error', ''))[:60]}")
     finally:
         srv.close()
 

@@ -8,7 +8,12 @@
 ```powershell
 python devtools\run_all_verify.py          # ← 推荐：全部 + 动态覆盖率门禁 + 崩溃重试
 python devtools\samples.py                 # 只看本机样本可用性（不跑测试）
+python devtools\debug_ui.py                # 起人工调试前端（不是验收，见下）
 ```
+
+> `debug_ui.py` 是**人工调试工具**，不是 `verify_*` 验收脚本，
+> 也不进 `run_all_verify.py`：它起来后等人点。用途与约束见 README
+> 「人工调试前端」一节，它自己的验收在 `verify_debug_ui.py`。
 
 `run_all_verify.py` 会自己带上覆盖率垫片、开跑前清空旧日志，
 所以**一条命令给出的就是本次运行的证据**。它还会：
@@ -57,6 +62,7 @@ python devtools\verify_class_resolve.py    # 运行时类解析：短名/namespa
 python devtools\verify_spawn_stdio.py      # spawn 子进程的 stdout 不许污染 JSON-RPC（自建假子进程，无需游戏）
 python devtools\verify_merged_tools.py     # 合并后工具的回归（需游戏）
 python devtools\verify_tool_coverage.py    # 静态：每个工具是否被脚本调用过（无需游戏）
+python devtools\verify_debug_ui.py         # 人工调试前端与调用流水（无需游戏）
 python devtools\verify_encoding_console.py # 编码健壮性：GBK 控制台下不崩（无需游戏）
 ```
 
@@ -260,6 +266,17 @@ devtools/
 - 跑运行时脚本前建议先 `Get-Process -Name '<游戏名>' | Stop-Process -Force`，
   残留的同名进程会让新实例的 IL2CPP 加载异常，
   表现为「注入成功但 IL2CPP 未就绪」这种假象。
+- **`capture_screen` 在一个全新进程里首次调用可能要 60~200 秒**
+  （`ocr` / `probe_log` / `wait_for(kind="window")` 不受影响）。
+  用 `faulthandler` 抓到栈后确认：时间花在 `screen.py` 的
+  `_try_import("dxcam")` → `dxcam/__init__.py` 的导入上，
+  是**第三方包自己的首次导入慢**，与本项目无关 ——
+  隔离副本里换成 HEAD 版 `server.py`（`import` 风格不同）同样会卡。
+  卡过一次之后同进程内就正常（`dxcam.create()` 实测 0.12 秒）。
+  所以：**别把 `capture_screen` 写进需要快速反馈的门禁**，
+  也别把这段耗时当成产品缺陷去「修」。
+  `devtools/verify_debug_ui.py` 因此只调 `probe_log` / `wait_for`
+  来验弱视觉那四个工具的导入路径。
 
 > **但「跑之前手工清一次」不能替代脚本自己收拾。** 一条验收如果跑完留下
 > 游戏进程，它就是**不可重复**的：第二次跑会撞上 `launch_game` 的

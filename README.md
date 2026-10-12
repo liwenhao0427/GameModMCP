@@ -257,6 +257,55 @@ MCP 还有 `prompts` 这一面，本服务器**不做**，这是量过的结论�
 
 ---
 
+## 人工调试前端（旁路设施）
+
+给人工调试用：在浏览器里看**有哪些工具、怎么调、返回什么**，
+并留下 AI 客户端到底调了什么的流水，便于回溯。
+
+```powershell
+python devtools\debug_ui.py            # → http://127.0.0.1:8770/
+python devtools\debug_ui.py --log-on   # 本次启动就打开调用流水
+# 装过包之后也可以：gamemod-mcp-dbg-ui
+```
+
+它**不重新实现**任何工具：工具清单直接问 `FastMCP.list_tools()`，
+入参表单由每个工具的 `inputSchema` 生成，调用直接走 `FastMCP.call_tool()`。
+所以页面上看到的参数表、返回体与 AI 客户端拿到的是**同一份**，
+不存在「前端能调通、AI 调不通」这种漂移；`ok:false` 的真实报错也照样显示。
+左侧按 `server.py` 的八个「工具分层」分组，只读 / 破坏性 / 接触外部世界
+直接取 MCP 的语义标注。
+
+### 调用流水（可开关 / 可查看 / 可清理）
+
+页面第二个页签是调用流水：每次调用记下工具名、参数、返回、`ok`、错误、
+耗时、体积。**默认关闭**，页面上可以随时开关。
+
+**日志点落在服务器分发层，而不是前端里** —— 这一点是刻意的：
+前端只能看见「经它发出的调用」，而 AI 客户端会**自己拉起一个 MCP
+服务器进程**，前端根本看不见。记在 `ToolManager.call_tool`（FastMCP
+分发工具的唯一入口）上，人工手调的（`source: "ui"`）与 AI 调的
+（`source: "mcp"`）才会落进**同一份**流水，靠 `source` / `pid` 区分。
+`verify_debug_ui.py` 用**另一个进程**的 stdio 客户端把这件事验成了断言。
+
+| 环境变量 | 作用 | 默认 |
+|---|---|---|
+| `GAMEMOD_DEBUG_LOG` | `1` 开 / `0` 关（也可只给某个客户端单独开） | 关 |
+| `GAMEMOD_DEBUG_LOG_PATH` | 流水文件 | `~/.gamemod/debug/calls.jsonl` |
+| `GAMEMOD_DEBUG_LOG_MAX_BYTES` | 单文件上限，超过则轮转 | 8 MB |
+| `GAMEMOD_DEBUG_LOG_MAX_FILES` | 保留份数（含当前） | 4 |
+
+三条约束都做成了断言：① **绝不影响业务** —— 记不上就不记（磁盘满 / 权限
+不足 / 路径是文件），不许让一个本来正常的工具失败；② **不许无界增长** ——
+超上限就轮转、只留最近几份，单条记录里的超大参数/返回截断并标 `truncated`；
+③ **默认不占磁盘** —— 开关关着一个字节都不写。
+
+> 这个前端**不影响** MCP 业务：不起 stdio、不占 MCP 端口、不改任何工具实现，
+> 关掉它 MCP 一侧完全不受影响。运行期依赖也**没变**（只用标准库
+> `http.server`，不引入 Flask/FastAPI/Node）；对 `server.py` 的唯一改动
+> 是一个默认关闭的流水钩子。详见 `devtools/verify_debug_ui.py`（61 项）。
+
+---
+
 ## 目录结构
 
 ```
@@ -269,6 +318,9 @@ GameModMCP/
 │
 ├── src/gamemod_mcp/
 │   ├── server.py                MCP 服务器（45 个工具）
+│   ├── debug_ui.py              人工调试前端（HTTP，旁路设施；见下节）
+│   ├── debug_ui.html            该前端的界面（单文件，无外部依赖）
+│   ├── debuglog.py              工具调用流水（可开关 / 可查看 / 可清理）
 │   ├── logutil.py               日志（只走 stderr，stdout 留给 JSON-RPC）
 │   ├── engine/                  静态分析层
 │   │   ├── pe.py                纯标准库 PE/COFF 解析器
@@ -375,7 +427,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 50 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 51 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -430,6 +482,7 @@ GameModMCP/
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
 | `verify_tool_annotations.py` | 45 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
+| `verify_debug_ui.py` | **人工调试前端与调用流水**：日志坏路径不许拖累业务（含非空转反证）、前端工具目录与 MCP 协议及 `server.py` 分层**三方对账**、**跨进程** stdio 客户端（模拟 AI）与前端落进同一份流水、文件轮转不许无界增长、旁路不改工具实现 |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
 
 > 上表与 `devtools/verify_*.py` 的一致性由 `verify_tool_inventory.py` 校验，

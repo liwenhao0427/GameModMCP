@@ -34,6 +34,8 @@ dependencies = [
 
 [project.scripts]
 gamemod-mcp = "gamemod_mcp.server:main"
+# 人工调试前端（旁路设施：不影响 MCP 业务，默认只监听 127.0.0.1）
+gamemod-mcp-dbg-ui = "gamemod_mcp.debug_ui:main"
 
 # 这里曾有一个 `[project.urls] Documentation = "https://github.com/example/..."`：
 # 占位符，指向 example 组织。没有真实仓库地址就不写，宁可缺字段也不放假链接。
@@ -45,5 +47,6 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 # agent.js 是运行时探针，必须打进包（server 会读它）
+# debug_ui.html 是人工调试前端的界面（debug_ui.py 会读它）
 [tool.setuptools.package-data]
-gamemod_mcp = ["runtime/*.js"]
+gamemod_mcp = ["runtime/*.js", "debug_ui.html"]
