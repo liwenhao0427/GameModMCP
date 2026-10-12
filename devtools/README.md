@@ -20,8 +20,8 @@ python devtools\samples.py                 # 只看本机样本可用性（不�
 也可以按需单独跑：
 
 ```powershell
-python devtools\verify_tool_inventory.py  # 9 处清单一致性（含已删工具名标注、已安装 skill 副本是否与仓库一致）
-python devtools\verify_tool_annotations.py # 38 个工具的语义标注（危险工具须声明，无需游戏）
+python devtools\verify_tool_inventory.py  # 10 处清单一致性（含活文档里的工具数量、已删工具名标注、已安装 skill 副本是否与仓库一致）
+python devtools\verify_tool_annotations.py # 45 个工具的语义标注（危险工具须声明，无需游戏）
 python devtools\verify_handle_scope.py     # 结果句柄作用域：跨游戏旧句柄必须失效（需两个样本）
 python devtools\verify_server_helpers.py   # server.py 的纯函数：命令行拆分 / 字段读取宽度（无需游戏）
 python devtools\verify_response_size.py    # 响应体积：P2-4 前后对比 + 上限不变量 + 旧记录订正（无需注入）
@@ -69,7 +69,7 @@ python devtools\run_all_verify.py --only verify_index
 `--only` 只跑指定脚本，并**自动跳过动态覆盖率门禁** ——
 只跑子集不可能覆盖全部工具，跑门禁只会得到一个恒假的「未覆盖」结论。
 
-## 确认「38 个工具真的都跑过」——动态覆盖率
+## 确认「45 个工具真的都跑过」——动态覆盖率
 
 `verify_tool_coverage.py` 是**静态**检查（工具名有没有出现在脚本里），
 它会**高估**：`sess.hook_method(...)` 这种会话对象的调用也算数。
@@ -89,7 +89,7 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 异常原样抛出。它记录每次调用的 `ok`、`error` 与返回体字节数，
 因此还能顺带暴露「哪个工具在返回超大结果」（对应契约 §3.1 第 5 条）。
 
-当前实测：**38 / 38 全部在 MCP 层真实调用过**。
+当前实测：**45 / 45 全部在 MCP 层真实调用过**。
 
 > 这个门禁不是摆设：曾把 `inject_process` 注入失败放宽成警告后，
 > 覆盖率立刻掉到 **35/38**（`hook_address` / `read_field_value` /
@@ -100,8 +100,8 @@ python devtools\report_tool_coverage.py --strict  # 有工具没跑到则退出�
 > 另一个佐证：新增 `decompile` 后，覆盖率一度停在 38/39 ——
 > 正是因为只有 engine 层被调用、工具层没人调（`decompile` 当时的
 > **唯一**调用者绕过了工具层）。补上 `verify_mcp_decompile.py` 才回到 39/39。
-> （这里的 39 是**当时**的工具数；后来合并重复工具才降到 38，
-> 所以本节前面写的是 38/38 —— 数字随工具数变，别把 39 当成现值。）
+> （这里的 38/39 是**当时**的工具数；数字随工具数变，别把它当成现值。
+> 现值见本节开头，由 `report_tool_coverage.py` 跑出来，本文不硬编码。）
 > 这印证了 §5.1 的结论：**静态检查看不出的「没接上」，动态门禁会立刻发现**。
 
 不需要 `$env:PYTHONPATH`：每个脚本都通过 `samples.add_src_to_path()`
@@ -210,7 +210,7 @@ devtools/
 │                          **只走静态阶段**，另含「候选目录为什么不算游戏」的分类）
 ├── report_runtime_matrix.py 多游戏**运行时**矩阵（**报告**，不是门禁：
 │                          每个游戏真开进程、真注入、真装 Hook，
-│                          38 个工具逐个过一遍 → 逐游戏 × 逐工具可用性矩阵。
+│                          全部 MCP 工具逐个过一遍 → 逐游戏 × 逐工具可用性矩阵。
 │                          静态部分复用 report_multi_game_matrix 的发现逻辑）
 ├── _cov/sitecustomize.py  动态覆盖率垫片（只观测，不改行为）
 ├── archive/               归档的过程产物（**不参与验收**，见其中 README）
@@ -284,7 +284,8 @@ devtools/
 工具**只有 IL2CPP 侧**验过，而 IL2CPP 样本一不在本机，那两条脚本就整段跳过。
 补齐的办法是把这些**与引擎无关**的工具（读内存 / 扫特征码 / 按绝对地址挂钩 /
 字段读取）也放到 Mono 侧验一遍 —— 见 `verify_mono_runtime.py` §3b 与
-`verify_mcp_mono.py` 的 `list_images` 断言。现在 **38/38**。
+`verify_mcp_mono.py` 的 `list_images` 断言。现在**全绿**（具体条数由
+`report_tool_coverage.py` 跑出来，本文不硬编码）。
 
 > 补覆盖时**别写空转断言**。三条实测教训：
 > · 扫特征码要拿**目标模块内**的字节当模式（从模块里读出来再扫回去）；

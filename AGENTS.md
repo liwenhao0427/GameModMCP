@@ -124,12 +124,13 @@ src/gamemod_mcp/
 `verify_tool_annotations.py` 会直接报红。
 
 **工具清单以代码为准，文档不许硬编码数量。**
-用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **9 处**：
+用 `python devtools/verify_tool_inventory.py` 校验，该脚本覆盖 **10 处**：
 
 | 校验对象 | 强度 |
 |---|---|
 | README「工具一览」表格 | **双向完全一致**（不多、不少） |
 | README 正文的数量声明（「N 个工具」） | 数值必须等于实际 |
+| **其他活文档**的数量声明（`devtools/README.md` / `SKILL.md` / `AGENTS.md`） | 数值必须等于实际；`docs/` 下的历史报告**不在范围内**（改了就毁了当时的证据） |
 | `server.py` docstring 的「工具分层」列表 | 双向完全一致 |
 | `FastMCP(instructions=...)` | 只许提到存在的工具 |
 | `SKILL.md`（含**代码块里的调用形式**） | 只许提到存在的工具 |

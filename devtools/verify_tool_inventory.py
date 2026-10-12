@@ -3,21 +3,24 @@
 
 为什么必须有这个脚本
 ============================================================
-「有哪些工具」这件事在本项目里有 9 个地方被描述或复制：
+「有哪些工具」这件事在本项目里有 10 个地方被描述或复制：
 
     1. src/gamemod_mcp/server.py   —— 代码本身（唯一真值）
     2. src/gamemod_mcp/server.py   —— 模块 docstring 的「工具分层」列表
     3. src/gamemod_mcp/server.py   —— FastMCP(instructions=...) 里的工作流
     4. README.md                   —— 「工具一览」表格
     5. README.md                   —— 正文里的数量声明（「N 个工具」）
-    6. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
-    7. 任何 *.md                   —— 提到已删 / 已合并的工具名时必须**同行标注**
-    8. README.md                   —— 「验证脚本」表 vs devtools/verify_*.py
-    9. ~/.dsh/skills/              —— 已安装的 skill 副本 vs 仓库内（Agent 真正读的那份）
+    6. 其他**活文档**的数量声明     —— devtools/README.md / SKILL.md / AGENTS.md
+                                       （docs/ 下的历史报告**不在范围内**，见第 2a 节）
+    7. skills/gamemod-mod/SKILL.md —— 工作流里引用的工具名
+    8. 任何 *.md                   —— 提到已删 / 已合并的工具名时必须**同行标注**
+    9. README.md                   —— 「验证脚本」表 vs devtools/verify_*.py
+   10. ~/.dsh/skills/              —— 已安装的 skill 副本 vs 仓库内（Agent 真正读的那份）
 
-其中 7、8、9 不属于「工具」本身，但属于同一类问题：**手工维护的副本必然漂移**。
+其中 6、8、9、10 不属于「工具」本身，但属于同一类问题：
+**手工维护的副本必然漂移**。
 
-经验证明靠人肉同步**必然漂移**（真实发生过的六起）：
+经验证明靠人肉同步**必然漂移**（真实发生过的七起）：
     · README 写了并不存在的 `unhook_all`
     · server.py 的 docstring 漏写了 13 个工具
     · README 的「41 个工具」与实际数量不符
@@ -28,6 +31,11 @@
     · 已安装的 skill 副本落后仓库 139 行、开头还在教已删除的工具
       —— 也就是说「仓库修好了、门禁全绿」与「Agent 照着删掉的工具去调」
       可以**同时成立**（修好的那份不是被读的那份）
+    · devtools/README.md 长期写着「38 个工具」（实际已 45）—— 第 2 节只管
+      README.md、第 8 节只查「已删工具名」不查数字，于是**门禁全绿**。
+      这条是评估 morluto/rea 时对照发现的：它的教训正是
+      **手工维护的清单必然漂移，所以要生成、要由门禁双向卡住**
+      （见 docs/外部项目评估-REA.md §5.1）
 
 所以用本脚本卡住：**不一致就非零退出**。
 
@@ -167,6 +175,25 @@ REMOVED_TOOLS = {
 LAYER_WORDS = {
     "UE", "IL2CPP", "Mono", "MCP", "API",
 }
+
+# 「已经没了」/「是当时的事」的标记词 —— 同一行能看出是历史记录，就不算违规。
+# 两处共用这一份定义：
+#   · 第 2a 节：`AGENTS.md` 里「曾写『41 个工具』而实际已变」必须保留；
+#   · 第 8 节：已删工具名必须同行标注「它已经没了」。
+# 故意放宽 —— 目的是**消除歧义**，不是逼人用某个固定句式。
+# 共用而不是各写一份：两份正则一旦漂开，同一个词在一处算历史、在另一处不算，
+# 门禁就会给出自相矛盾的结论。
+HISTORY_WORDS = re.compile(
+    r"已删|删掉|删除|移除|已移除|已合并|合并|~~|旧|曾经|曾|更名|"
+    r"不再|当时|历史|不存在|从未|基线|一度|后来|已变|已增长")
+
+# 「这个数字是**子集**，不是总数」的标记词。
+# 为什么需要：「差的 8 个工具分两类原因」「docstring 漏写了 13 个工具」里的
+# 数字都是**差额/子集**，不是工具总数 —— 拿它们去和总数比是**假失败**，
+# 而假失败会让门禁被当成噪声忽略掉（比不检查更糟）。
+# 允许「漏写」后跟「了/的」等虚词，所以用 `漏写[了的]?` 而非精确匹配。
+SUBSET_WORDS = re.compile(
+    r"(漏写[了的]?|差了?|差的|其中|剩下|其余|这类|这|另有|只有)\s*$")
 
 PASS, FAIL = [], []
 
@@ -339,6 +366,63 @@ def main() -> int:
         check("README 里找到了工具数量声明", False,
               "没找到「N 个工具」字样（工具清单应说明规模）")
 
+    # ------------------------------------------- 2a. 其他**活文档**里的数量声明
+    #
+    # 为什么补这一节：第 2 节只管 README.md，而这类数字在别的**活文档**里同样会漂。
+    # 实测 `devtools/README.md` 曾长期写着「38 个工具」（实际已 45）——
+    # 门禁全绿，因为第 2 节只扫 README.md、第 8 节只查「已删工具名」不查数字。
+    #
+    # 这正是 REA 的教训（docs/testing.md）：**手工维护的清单必然漂移**，
+    # 所以要么由生成器产出，要么由门禁双向卡住。README.md 已生成化（§2b），
+    # 而 `devtools/README.md` / `SKILL.md` 里的数字没有护栏 —— 就是这里要堵的口子。
+    #
+    # 范围刻意收窄到「活文档」（会被 Agent 当指令读的那几份）。
+    # `docs/` 下的历史报告（交接说明、重启验证报告等）**不在范围内** ——
+    # 它们记录的是**当时**的事实，改反而毁掉证据。所以这里显式排除 docs/。
+    show("2a. 其他活文档里的工具数量声明（防 README 之外的数字漂移）")
+    LIVE_DOCS = ["devtools/README.md", "skills/gamemod-mod/SKILL.md", "AGENTS.md"]
+    live_scanned = 0
+    for rel in LIVE_DOCS:
+        p = ROOT / rel
+        if not p.is_file():
+            check(f"{rel} 存在", False, "活文档不见了 —— 门禁无法执行")
+            continue
+        live_scanned += 1
+        offenders = []
+        for lineno, line in enumerate(
+                p.read_text(encoding="utf-8").splitlines(), 1):
+            # 「N 个工具」是本节的目标写法。
+            # 注意排除历史叙述：`AGENTS.md` 里「曾写『41 个工具』而实际已变」
+            # 这类记录**必须保留**，所以只要同一行能看出是历史，就不算违规
+            # （与第 8 节「已删工具名必须同行标注」是同一套语义）。
+            if "个工具" not in line:
+                continue
+            if HISTORY_WORDS.search(line):
+                continue
+            for m in re.finditer(r"(\d+)\s*个工具", line):
+                # 子集数字（「差的 8 个工具」）不是总数声明，跳过。
+                if SUBSET_WORDS.search(line[:m.start()]):
+                    continue
+                if int(m.group(1)) != len(tools):
+                    offenders.append(
+                        f"{rel}:{lineno} 写 {m.group(1)} 个工具 —— {line.strip()[:60]}")
+        for o in offenders:
+            check(f"{rel} 的工具数量声明与实际一致", False, o)
+        if not offenders:
+            check(f"{rel} 的工具数量声明与实际一致", True,
+                  f"（{len(tools)} 个）")
+    # 非空转保证：真的扫到了活文档，且这些文档里**确实**有「N 个工具」字样 ——
+    # 否则「没有 offenders」可能只是因为扫了个空集合。
+    check("扫到了活文档（否则本节是空转的）", live_scanned == len(LIVE_DOCS),
+          f"{live_scanned}/{len(LIVE_DOCS)}")
+    live_hits = sum(
+        1 for rel in LIVE_DOCS
+        if (ROOT / rel).is_file()
+        for line in (ROOT / rel).read_text(encoding="utf-8").splitlines()
+        if re.search(r"\d+\s*个工具", line))
+    check("这些活文档里确实有「N 个工具」字样（证明扫描不是空转）",
+          live_hits > 0, f"{live_hits} 处")
+
     # ------------------------------------------------- 2b. 生成式一致性
     #
     # 第 1 节是「表格里的工具名 vs 代码」—— 它能发现**名字**漂移。
@@ -490,8 +574,9 @@ def main() -> int:
                  and "node_modules" not in p.parts]
     # 「已经没了」的标记词。故意放宽 —— 这一节的目的是**消除歧义**，
     # 不是逼人用某个固定句式。
-    GONE = re.compile(r"已删|删掉|删除|移除|已移除|已合并|合并|~~|旧|曾经|更名|"
-                      r"不再|当时|历史|不存在|从未")
+    # 定义已上移到模块级 `HISTORY_WORDS`，与第 2a 节**共用同一份** ——
+    # 两份正则一旦漂开，同一个词在一处算历史、在另一处不算，门禁自相矛盾。
+    GONE = HISTORY_WORDS
     mentions = 0
     offenders: list[str] = []
     for p in sorted(doc_files):
