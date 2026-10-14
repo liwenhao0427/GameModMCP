@@ -107,6 +107,8 @@ if __package__ in (None, ""):  # 直接当脚本跑
     from gamemod_mcp.engine import decompile as dc
     from gamemod_mcp.engine import discovery, state
     from gamemod_mcp.engine import ue as ue_mod
+    from gamemod_mcp.engine import fields as _fields
+    from gamemod_mcp.engine import verifier as _verifier
     from gamemod_mcp.engine.state import ensure_index, ensure_runtime
     from gamemod_mcp.logutil import progress, warn
 else:  # 正常作为包被导入
@@ -115,6 +117,8 @@ else:  # 正常作为包被导入
     from .engine import decompile as dc
     from .engine import discovery, state
     from .engine import ue as ue_mod
+    from .engine import fields as _fields
+    from .engine import verifier as _verifier
     from .engine.state import ensure_index, ensure_runtime
     from .logutil import progress, warn
 
@@ -317,7 +321,42 @@ def _overlapping_hook(st: Any, address: str, size: int) -> dict | None:
 #: `__wrapped__`。于是脚本会「单独跑全绿、进套件就红」——
 #: 本轮真的踩到了（`verify_cap` / `verify_response_size` 都是这样挂的）。
 #: 显式登记原函数就不受任何外层替换影响。
+
+# 字段宽度/编码与验收求值的**实现**已下沉到 engine/（见那两个模块的分层说明）。
+# 这里按原名字 re-export：既让 server.py 内部的调用点不用改，
+# 也保持 `devtools/verify_field_write.py` / `verify_server_helpers.py` 里
+# `S._field_read_width` / `S._encode_field_value` 这些既有访问**原样生效**
+# （它们直接摸 S 的属性，而不是 import 名字）。
+_FIELD_WIDTH = _fields._FIELD_WIDTH
+_FIELD_WRITE_KIND = _fields._FIELD_WRITE_KIND
+_field_read_width = _fields._field_read_width
+_field_write_kind = _fields._field_write_kind
+_encode_field_value = _fields._encode_field_value
+_resolve_enum_underlying = _fields._resolve_enum_underlying
+_explain_bytes = _fields._explain_bytes
+
+_field_value_as_text = _verifier._field_value_as_text
+_values_equal = _verifier._values_equal
+
 RAW_TOOLS: dict[str, Any] = {}
+
+
+def _eval_condition(kind: str, **kw: Any) -> dict:
+    """验收条件求值：把 `RAW_TOOLS` 与 `_screen_mod` **注入**给 engine 层。
+
+    为什么在 server.py 里再做一层薄包装（而不是直接 `from ... import`）
+    ------------------------------------------------------------------
+    `devtools/verify_verify_state.py` 会 monkeypatch `S._screen_mod` 与
+    `S.RAW_TOOLS["find_instances"]` 来构造可控场景。如果 server.py 直接把
+    engine.verifier 的函数绑到 `_eval_condition` 名字上，**这个包装就不存在**，
+    注入点会固化成 engine 模块里的一份副本 —— 那些 monkeypatch 不再生效，
+    测试就变成对一个与生产不同的副本求值（「通过」不再说明生产正确）。
+
+    所以这里保留同名函数：每次调用现取 `RAW_TOOLS` / `_screen_mod` 传下去。
+    """
+    return _verifier._eval_condition(kind, raw_tools=RAW_TOOLS,
+                                     screen_mod=_screen_mod, **kw)
+
 
 
 def _cap_response(fn: Any) -> Any:
@@ -552,224 +591,18 @@ def _split_argv(text: str) -> list[str]:
     return out
 
 
-#: 字段类型名 → 读取宽度（字节）。
-#:
-#: 为什么需要它：`read_field_value` 原来**固定读 8 字节**。字段只有 4 字节时，
-#: 那 4 个「多读的」字节是**相邻字段**的内容 —— 既会给出无意义的
-#: `as_int64`（两个字段拼出来的数），又会在字段贴近页尾时把一次**本可成功**
-#: 的读取变成假失败。宽度按字段类型来，才不会读到别人的字节。
-#:
-#: 键同时收 IL2CPP 的 `il2cpp_type_get_name` 形式（`System.Int32`）与短名，
-#: 因为运行时返回的是前者；查不到就按 8 字节（**引用类型/指针**在 x64 上
-#: 就是 8 字节，且这是原来的行为，不会把没覆盖的类型改坏）。
-_FIELD_WIDTH: dict[str, int] = {
-    "System.Boolean": 1, "bool": 1,
-    "System.Byte": 1, "byte": 1, "System.SByte": 1, "sbyte": 1,
-    "System.Char": 2, "char": 2,
-    "System.Int16": 2, "short": 2, "System.UInt16": 2, "ushort": 2,
-    "System.Int32": 4, "int": 4, "System.UInt32": 4, "uint": 4,
-    "System.Single": 4, "float": 4,
-    "System.Int64": 8, "long": 8, "System.UInt64": 8, "ulong": 8,
-    "System.Double": 8, "double": 8, "System.IntPtr": 8, "System.UIntPtr": 8,
-}
 
 
-def _field_read_width(type_name: Any) -> int:
-    """字段类型名 → 要读几个字节。查不到按 8（指针宽度，也是原来的行为）。"""
-    if not type_name:
-        return 8
-    return _FIELD_WIDTH.get(str(type_name).strip(), 8)
 
 
-#: 枚举没有显式底层类型时的默认宽度来源。
-#:
-#: C# 枚举的默认底层类型就是 `int`（System.Int32，4 字节）——
-#: 这是语言规范定的，不是我们猜的。显式声明 `: byte` / `: long` 的枚举
-#: 由探针的 `enum_base_type` 给出真值，走不到这个默认值。
-_ENUM_DEFAULT_BASE = "System.Int32"
 
 
-def _resolve_enum_underlying(st: Any, ftype: Any, hit: dict) -> str | None:
-    """字段如果是**枚举**，返回它的底层整型类型名；否则返回 `None`。
-
-    为什么需要它：字段枚举 API 只给类型名字符串，**枚举字段给的是枚举类名**
-    （如 `EasingType`），与普通类名长得一模一样。于是 `_field_read_width`
-    查不到表，按默认的 8 字节读 —— 4 字节的枚举会把**相邻字段**的 4 字节
-    一起读进来（`as_int64` 是两个字段拼出来的数）；`set_field_value` 更糟，
-    它会因为「宽度 8 且类型名认不出」把枚举误判成**引用类型**而直接拒绝写入。
-
-    两条来源，按可信度排序：
-
-      1. **运行时探针**（`hit["is_enum"]`）—— 最可靠，直接问过
-         `il2cpp_class_is_enum` / `mono_class_is_enum`，且能给出显式底层类型
-         （`enum_base_type`）。只有探针版本支持这几个导出时才有这个键。
-      2. **静态索引**（`is_enum` 列）—— 探针给不出判定时兜底。
-         按 `nested_name` / `full_name` / `name` 三写法查（与
-         `_match_type_ids` 同口径，嵌套类型必须用完整名）。
-
-    两条都拿不到时返回 `None` —— **不猜**。猜错的代价是「按 8 字节读一个
-    4 字节字段」，那正是这个函数要修的缺陷本身。
-    """
-    # ① 运行时探针的判定（首选）
-    if hit.get("is_enum") is True:
-        base = hit.get("enum_base_type")
-        return str(base).strip() if base else _ENUM_DEFAULT_BASE
-    if hit.get("is_enum") is False:
-        return None
-
-    # ② 静态索引兜底（探针没给 is_enum 键时）
-    name = str(ftype).strip() if ftype else ""
-    if not name:
-        return None
-    if name in _FIELD_WIDTH:
-        return None                       # 基础类型，本来就不需要兜底
-    try:
-        if not st.has_index():
-            return None
-        idx = st.index
-        if idx is None:
-            return None
-        row = idx.conn.execute(
-            "SELECT is_enum FROM types "
-            "WHERE nested_name = ? OR full_name = ? OR name = ? "
-            "ORDER BY (nested_name = ?) DESC, (full_name = ?) DESC LIMIT 1",
-            (name, name, name, name, name),
-        ).fetchone()
-    except Exception:  # noqa: BLE001 - 兜底失败不该让读写字段整个失败
-        return None
-    if row and row["is_enum"]:
-        return _ENUM_DEFAULT_BASE
-    return None
 
 
-#: 字段类型名 → 写值时的「解释方式」。与 `_FIELD_WIDTH` 同一张表的口径，
-#: 但**必须区分有符号/无符号/浮点**：同样 4 字节，写成 int 还是 float
-#: 得到的字节完全不同，而 `as_int32` 与 `as_float` 在读取时会同时给出，
-#: 写的时候却只能选一个 —— 选错的后果是「值看着变了、游戏行为不对」。
-_FIELD_WRITE_KIND: dict[str, str] = {
-    "System.Boolean": "bool", "bool": "bool",
-    "System.SByte": "int", "sbyte": "int",
-    "System.Byte": "uint", "byte": "uint",
-    "System.Int16": "int", "short": "int",
-    "System.UInt16": "uint", "ushort": "uint",
-    "System.Int32": "int", "int": "int",
-    "System.UInt32": "uint", "uint": "uint",
-    "System.Int64": "long", "long": "long",
-    "System.UInt64": "ulong", "ulong": "ulong",
-    "System.Single": "float", "float": "float",
-    "System.Double": "double", "double": "double",
-    "System.Char": "uint", "char": "uint",
-    "System.IntPtr": "long", "System.UIntPtr": "ulong",
-}
 
 
-def _field_write_kind(field_type: Any, width: int) -> str:
-    """字段类型 + 宽度 → 写值方式。
-
-    类型认不出来时**按宽度**给一个保底解释：4 字节按 int、8 字节按 long。
-    为什么不按 ptr：写指针是极危险的操作，而「引用类型字段」写指针
-    在语义上多半是错的（用户想要的是改内容而不是换对象），
-    所以引用类型这里**统一报错**，让调用方改用 `eval_script` 或 Hook。
-    """
-    key = str(field_type).strip() if field_type else ""
-    if key in _FIELD_WRITE_KIND:
-        return _FIELD_WRITE_KIND[key]
-    if width == 1:
-        return "uint"
-    if width == 2:
-        return "int"
-    if width == 4:
-        return "int"
-    if width == 8:
-        return "long"
-    return "bytes"
 
 
-def _encode_field_value(value: Any, width: int, kind: str) -> tuple[bytes | None, str]:
-    """把调用方给的值编码成 `width` 字节。返回 `(bytes, error)`。
-
-    抽成**纯函数**是为了能在不启动游戏的情况下验收（§5 要求纯函数与
-    端到端两层都验）：编码错了会让「写入成功但值不对」，而那种缺陷
-    在 e2e 里很难与「游戏自己覆盖了」区分开。
-
-    规矩：**溢出直接报错，绝不静默截断**。把 300 写进 1 字节字段如果
-    截成 44，调用方会看到「ok:true」却拿到一个自己没要的值。
-    """
-    import struct as _struct
-
-    def _need(cond: bool, msg: str) -> str | None:
-        return None if cond else msg
-
-    try:
-        if kind == "bytes":
-            s = str(value).strip()
-            if s.startswith("0x") or s.startswith("0X"):
-                s = s[2:]
-            s = s.replace(" ", "")
-            if len(s) % 2:
-                return None, f"字节串长度必须是偶数个十六进制字符：{value!r}"
-            try:
-                b = bytes.fromhex(s)
-            except ValueError:
-                return None, f"不是合法的十六进制字节串：{value!r}"
-            if len(b) != width:
-                return None, (f"字节串长度 {len(b)} 与字段宽度 {width} 不一致"
-                              f"（字段类型决定宽度，不能多也不能少）")
-            return b, ""
-
-        if kind == "bool":
-            if isinstance(value, bool):
-                return (b"\x01" if value else b"\x00"), ""
-            s = str(value).strip().lower()
-            if s in ("1", "true", "yes", "on"):
-                return b"\x01", ""
-            if s in ("0", "false", "no", "off"):
-                return b"\x00", ""
-            return None, f"bool 字段只认 true/false/1/0，收到 {value!r}"
-
-        if kind == "float":
-            return _struct.pack("<f", float(value)), ""
-        if kind == "double":
-            return _struct.pack("<d", float(value)), ""
-
-        # 整数族：先按字符串解析，避免 float 传进来被静默截断
-        if isinstance(value, bool):
-            return None, f"bool 不能写进 {kind} 字段（要写 1/0 请写整数）"
-        s = str(value).strip()
-        try:
-            iv = int(s, 0)  # 支持 0x 前缀
-        except ValueError:
-            return None, f"{kind} 字段要整数，收到 {value!r}"
-
-        limits = {
-            "int": (-(1 << 7), (1 << 7) - 1, "b", 1),
-            "uint": (0, (1 << 8) - 1, "B", 1),
-            "long": (-(1 << 63), (1 << 63) - 1, "q", 8),
-            "ulong": (0, (1 << 64) - 1, "Q", 8),
-        }
-        # 1/2/4 字节统一走 int/uint 的宽度表
-        width_limits = {
-            (1, "int"): (-128, 127), (1, "uint"): (0, 255),
-            (2, "int"): (-32768, 32767), (2, "uint"): (0, 65535),
-            (4, "int"): (-(1 << 31), (1 << 31) - 1),
-            (4, "uint"): (0, (1 << 32) - 1),
-        }
-        if kind in ("int", "uint") and (width, kind) in width_limits:
-            lo, hi = width_limits[(width, kind)]
-        elif kind in limits:
-            lo, hi = limits[kind][0], limits[kind][1]
-        else:
-            return None, f"不支持的值类型：{kind}"
-        if not (lo <= iv <= hi):
-            return None, (f"{iv} 超出 {kind}({width} 字节) 的范围 [{lo}, {hi}]；"
-                          f"溢出不会被静默截断")
-        fmt = {1: ("b" if kind == "int" else "B"),
-               2: ("h" if kind == "int" else "H"),
-               4: ("i" if kind == "int" else "I"),
-               8: ("q" if kind in ("long", "int") else "Q")}[width]
-        return _struct.pack("<" + fmt, iv), ""
-    except (TypeError, ValueError, OverflowError) as exc:
-        return None, f"编码失败：{exc}"
 
 
 # ================================================================
@@ -2562,37 +2395,6 @@ def set_field_value(
         return _err(f"写入字段失败：{exc}")
 
 
-def _explain_bytes(hexs: str) -> dict:
-    """按**实际长度**解释一段小端字节，只给这个长度下有意义的解释。
-
-    与 `read_field_value` 用同一口径（那边是内联的），抽出来给
-    `set_field_value` 复用，避免两处对同一段字节给出不同解释。
-    """
-    import struct as _struct
-    out: dict[str, Any] = {}
-    try:
-        if len(hexs) >= 2:
-            b1 = bytes.fromhex(hexs[:2])
-            out["as_int8"] = _struct.unpack("<b", b1)[0]
-            out["as_uint8"] = _struct.unpack("<B", b1)[0]
-            out["as_bool"] = b1[0] != 0
-        if len(hexs) >= 4:
-            b2 = bytes.fromhex(hexs[:4])
-            out["as_int16"] = _struct.unpack("<h", b2)[0]
-            out["as_uint16"] = _struct.unpack("<H", b2)[0]
-        if len(hexs) >= 8:
-            b4 = bytes.fromhex(hexs[:8])
-            out["as_int32"] = _struct.unpack("<i", b4)[0]
-            out["as_uint32"] = _struct.unpack("<I", b4)[0]
-            out["as_float"] = round(_struct.unpack("<f", b4)[0], 6)
-        if len(hexs) >= 16:
-            b8 = bytes.fromhex(hexs[:16])
-            out["as_int64"] = _struct.unpack("<q", b8)[0]
-            out["as_double"] = _struct.unpack("<d", b8)[0]
-            out["as_pointer"] = hex(_struct.unpack("<Q", b8)[0])
-    except (ValueError, struct.error):  # pragma: no cover - 防御
-        pass
-    return out
 
 
 def _static_field_hit(st: Any, name: str, field: str,
@@ -3105,165 +2907,8 @@ def _split_checks(checks: Any) -> list[str]:
     return [x.strip() for x in _CHECK_SPLIT_RE.split(str(checks)) if x.strip()]
 
 
-def _eval_condition(kind: str, *, target: str = "", region: str = "",
-                    window: str = "", name: str = "", namespace: str = "",
-                    image: str = "", field: str = "", equals: str = "",
-                    pattern: str = "", min_count: int = 1,
-                    log_baseline: int | None = None) -> dict:
-    """**单次**求值一个验收条件。返回 `{hit, detail, error, unverifiable, baseline}`。
-
-    为什么抽成独立函数：`wait_for`（轮询等待）与 `verify_state`（多条件验收）
-    需要**同一套**条件语义。写两份实现必然漂移 —— 那样「同一个条件在两处
-    给出不同结论」就会成为一个新的假信息源。AGENTS.md §3 要求一个能力
-    只有一个实现。
-
-    这里不做任何循环、不睡、不记证据 —— 那些是调用方的事。
-    """
-    hit = False
-    detail: dict[str, Any] = {}
-    error = ""
-    unverifiable = ""
-    baseline = log_baseline
-
-    try:
-        return _eval_condition_inner(
-            kind, target=target, region=region, window=window, name=name,
-            namespace=namespace, image=image, field=field, equals=equals,
-            pattern=pattern, min_count=min_count, baseline=baseline)
-    except Exception as exc:                                  # noqa: BLE001
-        # 单次求值失败**不该**让整个等待崩掉 —— 记进 error 继续轮询。
-        return {"hit": False, "detail": detail, "error": str(exc)[:200],
-                "unverifiable": "", "baseline": baseline}
 
 
-def _eval_condition_inner(kind: str, *, target: str = "", region: str = "",
-                          window: str = "", name: str = "", namespace: str = "",
-                          image: str = "", field: str = "", equals: str = "",
-                          pattern: str = "", min_count: int = 1,
-                          baseline: int | None = None) -> dict:
-    """`_eval_condition` 的实际实现（外面那层只负责兜异常）。"""
-    hit = False
-    detail: dict[str, Any] = {}
-    error = ""
-    unverifiable = ""
-    log_baseline = baseline
-
-    if kind == "instances":
-        r = RAW_TOOLS["find_instances"](
-            name=name, namespace=namespace, image=image, max_count=200)
-        if r.get("ok"):
-            cnt = int(r.get("count") or 0)
-            detail = {"count": cnt, "min_count": min_count}
-            hit = cnt >= max(1, int(min_count))
-        elif r.get("unsupported"):
-            # 「本时机不可用」不是「没成立」
-            unverifiable = str(r.get("error", ""))[:200]
-            detail = {"unsupported": True}
-        else:
-            error = str(r.get("error", ""))[:200]
-
-    elif kind == "field":
-        fi = RAW_TOOLS["find_instances"](
-            name=name, namespace=namespace, image=image, max_count=8)
-        if not fi.get("ok"):
-            if fi.get("unsupported"):
-                unverifiable = str(fi.get("error", ""))[:200]
-                detail = {"unsupported": True}
-            else:
-                error = str(fi.get("error", ""))[:200]
-                detail = {"instances_ok": False}
-        else:
-            # 实例枚举会**连派生类一起返回**（liveness 语义如此：实测
-            # find_instances(Transform) 拿回的全是 RectTransform）。
-            # 用基类的字段偏移去读派生类实例可能读错位置，所以：
-            #   ① 把 `class_name` 与本类**精确匹配**的实例排在前面；
-            #   ② 逐个试（最多 8 个），任何一个命中 `equals` 就算成立。
-            # 原来只取 `ptrs[0]`：派生类排在前面时，明明有实例满足条件
-            # 却判成不成立 —— 那是**假阴性**，会让 Agent 去改一个没坏的 Mod。
-            want_short = (name or "").split(".")[-1].lower()
-            insts = list(fi.get("instances") or [])
-            exact = [x for x in insts
-                     if str(x.get("class_name") or "").split(".")[-1].lower()
-                     == want_short]
-            ordered = exact + [x for x in insts if x not in exact]
-            ptrs = [x.get("pointer") for x in ordered if x.get("pointer")]
-
-            if not ptrs:
-                detail = {"count": 0}
-            else:
-                tried: list[dict] = []
-                for p in ptrs[:8]:
-                    rf = RAW_TOOLS["read_field_value"](
-                        instance=p, name=name, field=field,
-                        namespace=namespace, image=image)
-                    if not rf.get("ok"):
-                        tried.append({"pointer": p, "read_ok": False,
-                                      "error": str(rf.get("error", ""))[:120]})
-                        continue
-                    got = _field_value_as_text(rf)
-                    tried.append({"pointer": p, "actual": got})
-                    if _values_equal(got, equals, rf):
-                        # 命中：如实说明是在第几个实例上命中的
-                        detail = {"field": field, "actual": got,
-                                  "expected": equals, "pointer": p,
-                                  "instance_index": len(tried) - 1,
-                                  "instances_tried": len(tried),
-                                  "exact_class_count": len(exact)}
-                        hit = True
-                        break
-                if not hit:
-                    # 一个都没命中：给出**每个**实例的实测值，便于区分
-                    # 「值确实不对」与「读的是别的派生类实例」
-                    detail = {"field": field, "expected": equals,
-                              "instances_tried": len(tried),
-                              "exact_class_count": len(exact),
-                              "tried": tried}
-                    if tried and all(t.get("read_ok") is False for t in tried):
-                        error = str(tried[0].get("error") or "")[:200]
-
-    elif kind == "ocr":
-        o = RAW_TOOLS["ocr"](region=region, window=window, expected=target,
-                             match="contains", max_items=50)
-        if o.get("ok"):
-            n = int(o.get("matched_count") or 0)
-            detail = {"matched_count": n, "expected": target,
-                      "texts_seen": len(o.get("texts") or [])}
-            hit = n > 0
-        else:
-            error = str(o.get("error", ""))[:200]
-
-    elif kind == "log":
-        if not pattern:
-            return {"hit": False, "detail": {}, "error": "kind='log' 需要 pattern",
-                    "unverifiable": "", "baseline": baseline}
-        if not target:
-            # target 在 log 分支里是**日志路径**（与 ocr/window 的语义不同）
-            return {"hit": False, "detail": {},
-                    "error": "kind='log' 时请把日志路径放进 target",
-                    "unverifiable": "", "baseline": baseline}
-        lr = RAW_TOOLS["probe_log"](path=target, pattern=pattern, max_lines=20)
-        if lr.get("ok"):
-            n = int(lr.get("matched_count") or 0)
-            if baseline is None:
-                baseline = n
-                detail = {"matched_count": n, "pattern": pattern,
-                          "baseline": n, "baseline_note": "首次求值记基线，等增量"}
-                hit = False
-            else:
-                detail = {"matched_count": n, "pattern": pattern,
-                          "baseline": baseline, "delta": n - baseline}
-                hit = n > baseline
-        else:
-            error = str(lr.get("error", ""))[:200]
-
-    elif kind == "window":
-        _screen = _screen_mod()
-        w = _screen.find_window_rect(target)
-        detail = {"window_found": bool(w.get("ok")), "title": w.get("title")}
-        hit = bool(w.get("ok"))
-
-    return {"hit": hit, "detail": detail, "error": error,
-            "unverifiable": unverifiable, "baseline": baseline}
 
 
 @mcp.tool(annotations=_ann("轮询等待一个条件成立（带证据）",
@@ -3604,55 +3249,8 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
     return out
 
 
-def _field_value_as_text(rf: dict) -> str:
-    """把 `read_field_value` 的结果压成一个可比较的字符串。
-
-    按**实际读取宽度**取值，不给这个宽度下没意义的解释
-    （与 `read_field_value` 自己的口径一致）：4 字节字段绝不拼 8 字节。
-    """
-    w = int(rf.get("read_width") or 8)
-    if w == 1:
-        if "as_uint8" in rf:
-            return str(rf["as_uint8"])
-    elif w == 2:
-        if "as_uint16" in rf:
-            return str(rf["as_uint16"])
-    elif w == 4:
-        if "as_int32" in rf:
-            return str(rf["as_int32"])
-    else:
-        if "as_int64" in rf:
-            return str(rf["as_int64"])
-    raw = str(rf.get("raw_hex") or "")
-    return raw
 
 
-def _values_equal(actual: str, expected: str, rf: dict) -> bool:
-    """比较字段实际值与期望值。按类型做**语义**比较，不做字符串比较。
-
-    为什么不能只比字符串：`equals="9999"` 与实际的 `as_int32=9999`
-    字符串比较是相等的，但 `equals="0x270F"`（同一个数的十六进制）就
-    不会相等 —— 而调用方完全可能这么写。浮点也一样（`1.0` vs `1`）。
-    """
-    if actual is None or expected is None:
-        return False
-    a, e = str(actual).strip(), str(expected).strip()
-    if a == e:
-        return True
-    ftype = str(rf.get("field_type") or "")
-    # 整数族：两边都按整数解析（支持 0x 前缀）
-    if ftype and ("Int" in ftype or "Byte" in ftype or "Char" in ftype
-                  or "Boolean" in ftype):
-        try:
-            return int(a, 0) == int(e, 0)
-        except (ValueError, TypeError):
-            pass
-    if ftype in ("System.Single", "System.Double", "float", "double"):
-        try:
-            return abs(float(a) - float(e)) < 1e-6
-        except (ValueError, TypeError):
-            pass
-    return False
 
 
 # ================================================================

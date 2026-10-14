@@ -419,6 +419,90 @@ def main() -> int:
           "args=args" in inspect.getsource(_st_mod.ensure_runtime),
           "纯签名检查挡不住「收了但不用」")
 
+    # ================================================================
+    # 8. 分层：字段/验收求值的实现已下沉到 engine/，且**注入点仍生效**
+    #
+    # 这次重构把 ~440 行纯逻辑从 server.py 挪到 engine/fields.py 与
+    # engine/verifier.py。风险不在「挪没挪对」，而在两处**兼容契约**：
+    #   ① 既有测试直接访问 `S._field_read_width` 等属性 → 必须 re-export；
+    #   ② `verify_verify_state.py` 会 monkeypatch `S._screen_mod` 与
+    #      `S.RAW_TOOLS[...]` → server 必须**每次调用时**把它们注入 engine，
+    #      而不是让 engine 自己持有一份引用（那样 monkeypatch 会被绕过，
+    #      测试就变成对一个副本求值）。
+    # ②是这次重构最容易静默做错的地方，所以单独钉住。
+    print()
+    print("=" * 74)
+    print("8. 分层：helper 下沉到 engine/，注入点仍生效")
+    print("=" * 74)
+
+    import types                                             # noqa: E402
+
+    from gamemod_mcp.engine import fields as _fields_mod      # noqa: E402
+    from gamemod_mcp.engine import verifier as _verifier_mod  # noqa: E402
+
+    for nm in ("_FIELD_WIDTH", "_FIELD_WRITE_KIND", "_field_read_width",
+               "_field_write_kind", "_encode_field_value",
+               "_resolve_enum_underlying", "_explain_bytes",
+               "_field_value_as_text", "_values_equal", "_eval_condition"):
+        _has = hasattr(S, nm)
+        check(f"server 仍可按原名访问 {nm}（re-export 兼容）", _has,
+              "" if _has else f"getattr(S, {nm!r}) 取不到 —— "
+                              "既有测试会 AttributeError")
+    check("实现已真的下沉（不再是 server 里定义的）",
+          S._field_read_width is _fields_mod._field_read_width
+          and S._values_equal is _verifier_mod._values_equal,
+          "同名绑定指向 engine 模块里的函数")
+    # 反证：如果只是「在 server 里又抄了一份」，id 不会相同。
+    check("反证：两份实现不是各写一份（对象身份相同，不是复制）",
+          S._encode_field_value is _fields_mod._encode_field_value)
+
+    # ---- 注入点 ①：_screen_mod 的 monkeypatch 必须影响求值
+    _real_screen2 = S._screen_mod()
+    _fake2 = types.ModuleType("fake_screen_h")
+    _fake2.__dict__.update(_real_screen2.__dict__)
+    _fake2.find_window_rect = lambda t: {"ok": True, "title": str(t)}
+    _orig_sm = S._screen_mod
+    S._screen_mod = lambda: _fake2
+    try:
+        _r_patched = S._eval_condition("window", target="分层测试窗口")
+    finally:
+        S._screen_mod = _orig_sm
+    _r_restored = S._eval_condition("window", target="分层测试窗口")
+    check("monkeypatch `S._screen_mod` **真的**影响 engine 层求值",
+          _r_patched.get("hit") is True and _r_restored.get("hit") is not True,
+          f"patch 后 hit={_r_patched.get('hit')} / 还原后 "
+          f"hit={_r_restored.get('hit')}")
+
+    # ---- 注入点 ②：RAW_TOOLS 的替换必须影响求值
+    _orig_fi2 = S.RAW_TOOLS.get("find_instances")
+    S.RAW_TOOLS["find_instances"] = lambda **kw: {"ok": True, "count": 7,
+                                                  "instances": []}
+    try:
+        _r_tools = S._eval_condition("instances", name="Whatever", min_count=5)
+    finally:
+        if _orig_fi2 is not None:
+            S.RAW_TOOLS["find_instances"] = _orig_fi2
+    check("monkeypatch `S.RAW_TOOLS['find_instances']` **真的**影响求值",
+          _r_tools.get("hit") is True
+          and _r_tools.get("detail", {}).get("count") == 7,
+          f"detail={_r_tools.get('detail')}")
+
+    # ---- server.py 只剩编排，不再定义这些纯函数
+    import ast as _ast                                       # noqa: E402
+    _tree = _ast.parse((samples.SRC / "gamemod_mcp" / "server.py"
+                        ).read_text(encoding="utf-8"))
+    _defined = {n.name for n in _tree.body
+                if isinstance(n, _ast.FunctionDef)}
+    _moved = {"_field_read_width", "_field_write_kind", "_encode_field_value",
+              "_resolve_enum_underlying", "_explain_bytes",
+              "_eval_condition_inner", "_field_value_as_text", "_values_equal"}
+    _still = sorted(_moved & _defined)
+    check("那些纯函数已不在 server.py 里定义（真的下沉了）",
+          not _still, f"仍在 server.py 定义：{_still}")
+    check("`_eval_condition` **保留**在 server.py（它是注入用的薄包装）",
+          "_eval_condition" in _defined,
+          "去掉它会让 monkeypatch 失效（见上面两条注入断言）")
+
     print()
     print("=" * 74)
     if FAIL:

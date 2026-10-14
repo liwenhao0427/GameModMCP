@@ -82,11 +82,23 @@ class _FakeRuntime:
 
 
 class _FakeState:
+    """假会话状态。
+
+    `live_runtime()` 是必须实现的：`server.py` 的运行时工具统一走
+    `_need_runtime()` → `live_runtime()`（原子取引用，避免并发下的
+    TOCTOU 竞态）。这里若不提供，工具会 AttributeError —— 而那是
+    **测试替身不完整**，不是产品缺陷，所以替身要与真实 `SessionState`
+    的接口保持一致（含 `has_runtime` 与 `live_runtime` 两个取用入口）。
+    """
+
     def __init__(self, rt) -> None:
         self.runtime = rt
 
     def has_runtime(self) -> bool:
-        return True
+        return self.runtime is not None and getattr(self.runtime, "alive", True)
+
+    def live_runtime(self):
+        return self.runtime if self.has_runtime() else None
 
 
 _orig_state = S.state.state
@@ -184,8 +196,10 @@ check("失败时**不带** count（不给一个会被误读成结果的值）",
       "count" not in out3 or out3.get("count") is None,
       f"count={out3.get('count')!r}")
 
-# 没有运行时会话时也必须如实失败
-S.state.state = lambda: type("S", (), {"has_runtime": lambda self: False})()  # type: ignore
+# 没有运行时会话时也必须如实失败。
+# 用 `_FakeState(None)` 而不是临时 type(...)：工具现在走 `live_runtime()`，
+# 替身必须把**真实的取用接口**都提供出来（否则测出来的是替身不完整）。
+S.state.state = lambda: _FakeState(None)      # type: ignore
 try:
     out4 = _raw(name="X")
 finally:

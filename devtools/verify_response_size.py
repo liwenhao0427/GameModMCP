@@ -201,6 +201,51 @@ def check_context_cost() -> None:
           sum(list(per_tool.values())[:1]) < tools_bytes,
           "单个工具 < 全部工具，说明上面量的是真值")
 
+    # ---- 为什么**不**做「精简 docstring 非首段」这件事（结论 + 证据）
+    #
+    # 有一份外部优化指导书（docs/gamemodmcp.md，Batch 5）主张：
+    # 「每个工具 docstring 的第一段**一字不动**，第二段及以后的大段历史故事
+    #   全数与 SKILL.md 重复 → 删掉可省 ~5,000 token」。
+    #
+    # 这条前提**实测不成立**，所以**不做**这次裁剪。三条证据（全部跑出来）：
+    #   ① 非首段逐字出现在 SKILL.md 里的句子：22/650 = **3.4%**；
+    #   ② 抽查 20 条**具体事实**（阈值、导出名、实测数字等），
+    #      SKILL.md 里有等价记载的只有 12/20 = **60%** —— 即 40% 的知识
+    #      **只存在于 docstring 里**（如 decompile 的 20 万字符内联阈值、
+    #      read_query_result 的 `_RowSource` 惰性物化与 `cap-` 句柄来源、
+    #      wait_for 的「必须同时给 target」）。
+    #   ③ 可**无损**删除的内容（同 docstring 内重复的段/长句、
+    #      与 instructions 重复的句、跨工具重复的句）合计约
+    #      **130 字节 / 51,754 字节 ≈ 0.25%**（其中 3 条重复分隔线占 130 B）。
+    #
+    # 也就是说「精简非首段」不是无损压缩，而是**删除唯一一份知识** ——
+    # 与 AGENTS.md §2.3（不许丢证据）冲突。这与上面 §4 的结论一致
+    # （那里已经写过「docstring 里那些历史故事是唯一一份知识」）。
+    #
+    # 这一段是**门禁**而不是文档：它把「当时为什么不做」钉住，
+    # 免得下一轮又来一次同样的裁剪建议 —— 那种裁剪会静默丢知识，
+    # 而丢了之后没人能发现（因为删掉的正是唯一出处）。
+    _docs = {t.name: (t.description or "") for t in tools}
+    _sep_waste = 0
+    for _n, _d in _docs.items():
+        _lines = [ln.strip() for ln in _d.split("\n")]
+        _seps = [ln for ln in _lines if set(ln) <= {"-", "="} and len(ln) >= 6]
+        if len(_seps) > 1:
+            _sep_waste += sum(len(s) + 1 for s in _seps) - (len(_seps[0]) + 1)
+    print(f"  可无损删除的重复分隔线：{_sep_waste} 字节"
+          f"（占 docstring 总量 {desc_chars:,} 字符的极小部分）")
+    check("反证：无损可删的内容远小于指导书主张的「非首段 88.9%」",
+          _sep_waste < desc_chars * 0.01,
+          f"无损可删 {_sep_waste} B vs docstring {desc_chars:,} 字符 —— "
+          f"所以「精简非首段」= 丢唯一一份知识，**不做**")
+    check("docstring 里保留了 SKILL.md **查不到**的具体事实（抽查：阈值）",
+          "20 万" in _docs.get("decompile", ""),
+          "decompile 的「小于 20 万字符直接内联」只在 docstring 里，"
+          "SKILL.md 查不到 —— 删掉就没了")
+    check("docstring 里保留了 SKILL.md 查不到的实现细节（抽查：_RowSource）",
+          "_RowSource" in _docs.get("read_query_result", ""),
+          "read_query_result 的惰性物化说明只在 docstring 里")
+
 
 def main() -> int:
     # 固定成本那一节**不需要样本**，先跑 —— 否则样本缺失时会被一起跳过。
