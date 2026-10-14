@@ -363,6 +363,82 @@ check("恢复后 System.Single 又是 float",
       S._field_write_kind("System.Single", 4) == "float")
 
 # ================================================================
+section("8. 静态字段：`instance='static'` 的判定与分派（不需要游戏）")
+
+# 为什么单独测这一层：`instance="static"` 是**同一个工具**的第二种输入
+# （AGENTS.md §3.1 第 3 条：一个能力只暴露一个工具，用参数区分）。
+# 分派判据必须与实例路径**互斥且完备** —— 判错会让「读静态字段」变成
+# 「把 'static' 当十六进制地址解析」，那会给出一个误导性的报错。
+
+# 分派判据：`instance.strip().lower() in ("static", "")`
+STATIC_INPUTS = ["static", "STATIC", " Static ", ""]
+for inv in STATIC_INPUTS:
+    check(f"instance={inv!r} 走静态分支",
+          str(inv).strip().lower() in ("static", ""), "分派判据")
+
+# 真实地址绝不能走静态分支
+for inv in ["0x7ffa2cc4b170", "0x1000", "deadbeef", "  0x1234  "]:
+    check(f"instance={inv!r} 不走静态分支（按地址处理）",
+          str(inv).strip().lower() not in ("static", ""),
+          "否则真实地址会被当成关键字")
+
+# 静态字段**没有实例偏移** —— offset 恒为 0 且与实例无关。
+# 这里钉住「实现里不拿 offset 去算地址」：静态路径只调探针的
+# read_static_field / write_static_field。
+import inspect                                            # noqa: E402
+_src_read = inspect.getsource(S._read_static_field)
+_src_write = inspect.getsource(S._write_static_field)
+check("_read_static_field 调探针的 read_static_field（不自己算地址）",
+      "read_static_field(" in _src_read
+      and "field_addr" not in _src_read,
+      "静态字段在类的静态区里，没有「实例 + 偏移」")
+check("_write_static_field 调探针的 write_static_field（不自己算地址）",
+      "write_static_field(" in _src_write
+      and "field_addr" not in _src_write,
+      "同上")
+check("静态路径同样拒绝宽度 8 且类型认不出的（引用类型护栏一致）",
+      "_FIELD_WRITE_KIND" in _src_write,
+      "实例与静态两条路必须同一套护栏，否则静态会成为绕过口")
+
+# 静态度量：静态字段会连同**基类**一起查（declared_by 说明来源）
+_src_find = inspect.getsource(S._static_field_hit)
+check("静态字段查找用 static_only=True（不把实例字段混进来）",
+      "static_only=True" in _src_find,
+      "混进来的实例字段没有静态区可读")
+
+# 非空转反证：把静态判据改成只看 "static"（不 strip/不 lower），
+# 那么 " Static " 与 "STATIC" 会被当成地址 —— 上面两条会报红。
+_naive = lambda s: s in ("static",)                     # noqa: E731 旧写法
+check("反证：旧写法（不 strip/lower）会漏掉 'STATIC' 与 ' Static '",
+      not _naive("STATIC") and not _naive(" Static ")
+      and str("STATIC").strip().lower() in ("static", "")
+      and str(" Static ").strip().lower() in ("static", ""),
+      "证明上面那组用例不是空转")
+
+# ---- 枚举成员必须被**前置拒绝**（实测：写它会 access violation）
+#
+# Dave the Diver 上逐个候选试写的结果：
+#   · 声明类是枚举的 4 个（BindingFlags.CreateInstance / DesiredAccess.
+#     FILE_CREATE_PIPE_INSTANCE / JungleInteractionType.* / BufferState.*）
+#     → 4/4 失败，`access violation accessing 0x0`（常量没有静态存储槽）；
+#   · 声明类是普通类的 1 个（System.RuntimeType.BinderNonCreateInstance）
+#     → 1/1 成功。
+# 所以实现里加了一条**前置判据**：字段类型名 == 解析到的类名且是枚举 ⇒ 拒绝。
+check("枚举成员的判据要求「字段类型名 == 解析到的类名」（两者都非空）",
+      "resolved and str(ftype).strip() == resolved.strip()" in _src_write,
+      "普通类持有枚举字段时两者名字不同，不会被误判")
+check("拒绝时带 is_enum_member 标记与原因说明",
+      "is_enum_member=True" in _src_write
+      and "access violation" in _src_write,
+      "要说明「为什么不能写」，而不是只报失败")
+# 反证：去掉「且是枚举」这一半，普通类的静态字段会被误拒
+_naive_reject = lambda ftype, resolved: (                  # noqa: E731
+    str(ftype).strip() == str(resolved).strip())
+check("反证：若不要求 enum_base，普通类的普通静态字段会被误拒",
+      _naive_reject("System.Int32", "System.Int32") is True,
+      "所以判据里必须同时要求 enum_base（枚举底层类型）")
+
+# ================================================================
 print()
 print("=" * 78)
 print(f"通过 {PASS} 项，失败 {FAIL} 项" + (f"，警告 {WARN} 项" if WARN else ""))

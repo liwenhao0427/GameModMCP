@@ -126,6 +126,11 @@ NON_TOOL_IDENTIFIERS = {
     # set_field_value 文档里说明「静态字段该用哪个引擎 API」时提到它，
     # 是 IL2CPP C API 导出名，不是 MCP 工具。
     "il2cpp_field_static_set_value",
+    # 静态字段功能（instance="static"）文档里提到的：
+    #   · `declared_by` 是返回字段（该静态字段声明在哪个类上），不是工具；
+    #   · `mono_gc_walk_heap` 是 Mono C API 导出名（说明「Mono 上
+    #     find_instances 常不可用、所以静态字段是拿单例的正路」）。
+    "declared_by", "mono_gc_walk_heap",
     # SKILL.md「语义化点击 UI」配方里演示 eval_script 时用到的 IL2CPP
     # C API 导出名（引擎 API，不是 MCP 工具）
     "il2cpp_class_get_method_from_name", "il2cpp_object_get_class",

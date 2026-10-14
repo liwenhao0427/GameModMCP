@@ -160,7 +160,7 @@ Agent 会自动：
 | `hook_status` | 列出当前所有 Hook 及其触发次数。 |
 | `inject_process` | 把运行时探针注入正在运行的游戏进程。目标换了游戏时会**把会话身份与索引一起换过去**，并在返回里给 `context_switched`。 |
 | `launch_game` | 启动游戏并**在游戏初始化之前**注入探针（**能抢在初始化前挂钩**）。 |
-| `read_field_value` | 读取某个对象实例上某个字段的原始值。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。 |
+| `read_field_value` | 读取某个**实例或静态**字段的原始值（静态字段传 `instance="static"`）。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。 |
 | `read_memory` | 读取游戏进程内存（十六进制返回）。 |
 | `runtime_class_info` | 查类的**运行时**实况：**真实字段偏移**与**方法真实地址**（RVA）。 |
 | `runtime_info` | 查看已注入游戏的**探针状态**：IL2CPP 模块、映像数量、可用 API。含静态/运行时一致性自检（`image_count_matches`）。 |
@@ -461,7 +461,7 @@ GameModMCP/
 | `verify_mcp_decompile.py` | `decompile` 工具（`ilspycmd` 薄封装） |
 | `verify_mcp_extra.py` | 补全主流程没覆盖到的工具 |
 | `verify_server_helpers.py` | `server.py` 的纯函数：命令行拆分（`launch_game`）与字段读取宽度（`read_field_value`） |
-| `verify_field_write.py` | **字段写入的编码**（`set_field_value`）：宽度按类型、溢出必须报错不截断、浮点/整数不混、引用类型被拒。含**非空转反证**（改回「一律 8 字节」或去掉范围检查，断言必须报红） |
+| `verify_field_write.py` | **字段写入的编码**（`set_field_value`）：宽度按类型、溢出必须报错不截断、浮点/整数不混、引用类型被拒、**枚举字段按底层类型定宽**、**静态字段（`instance="static"`）的分派与枚举成员前置拒绝**。含**非空转反证**（改回「一律 8 字节」、去掉范围检查、静态判据不 strip/lower，断言必须报红） |
 | `verify_find_instances.py` | **实例枚举的语义**（`find_instances`）：`max_count`/`namespace` 真的传下去、**派生类混入可核查**（`exact+derived==count`；实测 `Transform` 全返回 `RectTransform`）、「拿不到」不许冒充「没有」（Mono 时机限制必须 `unsupported`）、只读标注。含非空转反证 |
 | `verify_screen.py` | **弱视觉/UI 层**（`capture_screen`/`ocr`/`probe_log`）：**ROI 原点加回坐标**（用固定 OCR 桩做到确定性）、「没找到 ≠ 不存在」的语义、失败留证据、日志 GBK 自动探测与**只读不消费**、region 畸形输入。含非空转反证；缺可选依赖时记为「无法验证」而非通过 |
 | `verify_wait_for.py` | **轮询等待与三态判定**（`wait_for`）：超时如实报 `fail`（不静默当通过）、**`unverifiable` 与 `fail` 严格区分**、`timeout_ms`/`interval_ms` 真的影响行为、条件**后来**成立时能等到、`evidence` 有上限但 `polls` 计数完整、**`kind="log"` 等的是增量而非存在**（旧日志已有时不许秒过）。含非空转反证 |

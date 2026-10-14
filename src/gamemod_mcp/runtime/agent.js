@@ -92,6 +92,9 @@
         'il2cpp_field_get_parent',
         'il2cpp_field_get_flags',
         'il2cpp_field_static_get_value',
+        // 静态字段写入（与 readonly 的 get 对称）。实测 Dave the Diver 的
+        // GameAssembly.dll 上两个都在。
+        'il2cpp_field_static_set_value',
         'il2cpp_field_get_value',
         'il2cpp_field_set_value',
         // 方法
@@ -222,6 +225,11 @@
         'mono_field_get_type',
         'mono_field_get_flags',
         'mono_field_static_get_value',
+        // 静态字段写入 + 取 vtable：Mono 的 `mono_field_static_*` 要
+        // (vtable, field, value) 三个参数，vtable 由 `mono_class_vtable` 取。
+        // 实测 Archon Soul / Kinny 的 mono-2.0-bdwgc.dll 上两者都在。
+        'mono_field_static_set_value',
+        'mono_class_vtable',
         'mono_field_get_value',
         // 方法
         'mono_class_get_methods',
@@ -563,6 +571,7 @@
             il2cpp_field_get_parent: ['pointer', ['pointer']],
             il2cpp_field_get_flags: ['pointer', ['pointer']],
             il2cpp_field_static_get_value: ['void', ['pointer', 'pointer']],
+            il2cpp_field_static_set_value: ['void', ['pointer', 'pointer']],
             il2cpp_field_get_value: ['void', ['pointer', 'pointer', 'pointer']],
             il2cpp_field_set_value: ['void', ['pointer', 'pointer', 'pointer']],
 
@@ -1102,7 +1111,8 @@
     }
 
     /** 枚举类的字段，带运行时偏移与类型名。 */
-    function fieldsOf(klass, wantStatic) {        if (!funcs.il2cpp_class_get_fields) { return []; }
+    function fieldsOf(klass, wantStatic) {
+        if (!funcs.il2cpp_class_get_fields) { return []; }
         var iter = Memory.alloc(Process.pointerSize);
         iter.writePointer(NULL);
         var out = [];
@@ -1531,7 +1541,16 @@
         mono_field_get_offset: ['pointer', ['pointer']],
         mono_field_get_type: ['pointer', ['pointer']],
         mono_field_get_flags: ['pointer', ['pointer']],
-        mono_field_static_get_value: ['void', ['pointer', 'pointer']],
+        // ⚠️ 官方签名是 **3 个参数**：(MonoVTable *vt, MonoClassField *field,
+        // void *value) —— 见 mono/metadata/object.h。这里原来只登记了 2 个，
+        // 因为该函数在此之前**从未被调用过**（绑定了一个没接线的能力），
+        // 所以那个错误签名一直没暴露。静态字段读写接上之后它会真的被调用，
+        // 参数个数错的 NativeFunction 会让 Frida 按错误的方式传参 → 崩溃。
+        mono_field_static_get_value: ['void', ['pointer', 'pointer', 'pointer']],
+        mono_field_static_set_value: ['void', ['pointer', 'pointer', 'pointer']],
+        // MonoVTable* mono_class_vtable(MonoDomain *domain, MonoClass *klass)
+        // —— 静态字段的值存在 vtable 的静态区里，取它必须用**声明类的** vtable。
+        mono_class_vtable: ['pointer', ['pointer', 'pointer']],
         mono_field_get_value: ['void', ['pointer', 'pointer', 'pointer']],
         mono_class_get_methods: ['pointer', ['pointer', 'pointer']],
         mono_class_get_method_from_name: ['pointer', ['pointer', 'pointer', 'int']],
@@ -2619,6 +2638,265 @@
         return out;
     }
 
+    // ================================================================ 静态字段
+
+    /**
+     * 在类的继承链上找一个字段（含基类），返回**原始 FieldInfo 指针**。
+     *
+     * 为什么要走继承链：静态字段常声明在基类上（例如各种 `Instance`
+     * 单例字段在 `SomeManagerBase` 上）。只查本类会漏掉它们，而调用方
+     * 看到的症状是「类里没有这个字段」—— 与真实的「字段在基类上」
+     * 完全不同。规则与 `fieldsWithInheritance` 一致（最多 32 层）。
+     *
+     * 为什么不复用 `fieldsOfOwn`：那个返回的是**记录**（名字/类型/偏移），
+     * 里面没有 FieldInfo 指针，而静态字段读写必须有指针。
+     *
+     * @param {string} kind 后端种类（'il2cpp' / 'mono'）
+     * @returns {{field: NativePointer, klass: NativePointer,
+     *            owner: string, depth: number, is_static: boolean}|null}
+     */
+    function findFieldInChain(klass, fieldName, kind) {
+        var cur = klass;
+        var depth = 0;
+        while (cur && !cur.isNull() && depth < 32) {
+            if (kind === 'il2cpp') {
+                if (!funcs.il2cpp_class_get_fields) { return null; }
+                var iter = Memory.alloc(Process.pointerSize);
+                iter.writePointer(NULL);
+                for (;;) {
+                    var f = funcs.il2cpp_class_get_fields(cur, iter);
+                    if (!f || f.isNull()) { break; }
+                    var nm = funcs.il2cpp_field_get_name
+                        ? cstr(funcs.il2cpp_field_get_name(f)) : null;
+                    if (nm !== fieldName) { continue; }
+                    if (fieldIsStaticIL2CPP(f) !== true) { continue; }
+                    return { field: f, klass: cur, owner: fullNameOf(cur),
+                             depth: depth, is_static: true };
+                }
+            } else if (kind === 'mono') {
+                if (!monoFuncs.mono_class_get_fields) { return null; }
+                var miter = Memory.alloc(Process.pointerSize);
+                miter.writePointer(NULL);
+                for (;;) {
+                    var mf = null;
+                    try { mf = monoFuncs.mono_class_get_fields(cur, miter); }
+                    catch (e) { break; }
+                    if (!mf || mf.isNull()) { break; }
+                    var mnm = monoFuncs.mono_field_get_name
+                        ? cstr(monoFuncs.mono_field_get_name(mf)) : null;
+                    if (mnm !== fieldName) { continue; }
+                    if (fieldIsStaticMono(mf) !== true) { continue; }
+                    return { field: mf, klass: cur, owner: monoClassFullName(cur),
+                             depth: depth, is_static: true };
+                }
+            } else {
+                return null;
+            }
+            var par = null;
+            try { par = parentOfFor(kind, cur); } catch (e) { par = null; }
+            if (!par || par.isNull()) { break; }
+            cur = par;
+            depth++;
+        }
+        return null;
+    }
+
+    /** 按后端取父类指针（与 BE.parentOf 同一实现，但可在 BE 之外调用）。 */
+    function parentOfFor(kind, klass) {
+        if (kind === 'il2cpp') {
+            if (!funcs.il2cpp_class_get_parent) { return null; }
+            return funcs.il2cpp_class_get_parent(klass);
+        }
+        if (kind === 'mono') {
+            if (!monoFuncs.mono_class_get_parent) { return null; }
+            return monoFuncs.mono_class_get_parent(klass);
+        }
+        return null;
+    }
+
+    /** IL2CPP 字段是否 static（0x10 = FIELD_ATTRIBUTE_STATIC）。 */
+    function fieldIsStaticIL2CPP(fieldInfo) {
+        if (!funcs.il2cpp_field_get_flags) { return null; }
+        try {
+            return (funcs.il2cpp_field_get_flags(fieldInfo).toUInt32() & 0x10) !== 0;
+        } catch (e) { return null; }
+    }
+
+    /** Mono 字段是否 static（0x10 = FieldAttributes.Static）。 */
+    function fieldIsStaticMono(fieldInfo) {
+        if (!monoFuncs.mono_field_get_flags) { return null; }
+        try {
+            return (monoFuncs.mono_field_get_flags(fieldInfo).toUInt32() & 0x10) !== 0;
+        } catch (e) { return null; }
+    }
+
+    /**
+     * 读一个**静态字段**的原始字节。
+     *
+     * 为什么需要它：Mono 游戏的 `find_instances` 受官方限制常常不可用
+     * （`mono_gc_walk_heap` 只在 pre-stop-world 回调内有效），于是
+     * 「拿到单例对象指针」在 Mono 上没有正路 —— 而静态字段（如
+     * `GameManager.Instance`）恰恰就是那条路：读出它的指针即可。
+     * `il2cpp_field_static_get_value` / `mono_field_static_get_value` 早就
+     * 绑定了，但此前**一次都没被调用过**（已绑定未接线的能力）。
+     *
+     * `size` 由宿主按字段类型给（与实例字段同一张宽度表，包括枚举的底层类型）。
+     *
+     * @returns {{ok: boolean, hex?: string, field?: string, owner?: string,
+     *            offset?: number, via?: string, static?: boolean,
+     *            error?: string, detail?: object}}
+     */
+    function readStaticFieldBytes(opts, be) {
+        opts = opts || {};
+        var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
+        if (!found.ok) { return found; }
+        var hit = findFieldInChain(found.klass, opts.field, be.kind);
+        if (!hit) {
+            return fail('类 ' + be.fullNameOf(found.klass) +
+                        ' 及其基类里没有静态字段 ' + opts.field,
+                        { engine: be.kind, klass: found.klass.toString() });
+        }
+        var size = parseInt(opts.size, 10);
+        if (!(size > 0) || size > 64) {
+            return fail('size 不合法（静态字段读 1..64 字节）', { size: opts.size });
+        }
+        var buf = Memory.alloc(size);
+        try {
+            if (be.kind === 'il2cpp') {
+                if (!funcs.il2cpp_field_static_get_value) {
+                    return fail('il2cpp_field_static_get_value 不可用', {
+                        engine: 'il2cpp', api_missing: 'il2cpp_field_static_get_value'
+                    });
+                }
+                funcs.il2cpp_field_static_get_value(hit.field, buf);
+            } else {
+                if (!monoFuncs.mono_field_static_get_value || !monoFuncs.mono_class_vtable) {
+                    var miss = [];
+                    if (!monoFuncs.mono_field_static_get_value) {
+                        miss.push('mono_field_static_get_value');
+                    }
+                    if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
+                    return fail('Mono 运行时缺静态字段读所需的导出：' + miss.join(' / '),
+                                { engine: 'mono', api_missing: miss });
+                }
+                var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
+                if (!vt || vt.isNull()) {
+                    return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可读）',
+                                { engine: 'mono', klass: hit.klass.toString() });
+                }
+                monoFuncs.mono_field_static_get_value(vt, hit.field, buf);
+            }
+            var raw = buf.readByteArray(size);
+            var bytes = new Uint8Array(raw);
+            var hex = [];
+            for (var i = 0; i < bytes.length; i++) {
+                hex.push(('0' + bytes[i].toString(16)).slice(-2));
+            }
+            return {
+                ok: true,
+                engine: be.kind,
+                field: opts.field,
+                owner: hit.owner,
+                class: be.fullNameOf(found.klass),
+                declared_by: hit.owner,
+                inherited_depth: hit.depth,
+                is_static: true,
+                size: size,
+                hex: hex.join(''),
+                via: (be.kind === 'il2cpp' ? 'il2cpp_field_static_get_value'
+                                           : 'mono_field_static_get_value')
+            };
+        } catch (e) {
+            return fail('读静态字段失败：' + (e.message || e),
+                        { engine: be.kind, field: opts.field, owner: hit.owner });
+        }
+    }
+
+    /**
+     * 写一个**静态字段**的原始字节。
+     *
+     * 与实例字段写入同一套纪律：**字节由宿主按字段类型编码好**再传进来
+     * （这里只负责搬运），长度必须与 `size` 一致 —— 否则会出现
+     * 「写了 8 字节到 4 字节字段」这种把相邻静态字段一起改掉的事故。
+     *
+     * ⚠️ 写错值/写错字段会立刻影响游戏行为（静态字段常被全局逻辑读），
+     * 所以宿主侧必须**先读回原值**并放进返回里供回滚。
+     */
+    function writeStaticFieldBytes(opts, be) {
+        opts = opts || {};
+        var found = be.resolveClassOrFail(opts.image, opts.namespace, opts.name);
+        if (!found.ok) { return found; }
+        var hit = findFieldInChain(found.klass, opts.field, be.kind);
+        if (!hit) {
+            return fail('类 ' + be.fullNameOf(found.klass) +
+                        ' 及其基类里没有静态字段 ' + opts.field,
+                        { engine: be.kind, klass: found.klass.toString() });
+        }
+        var s = String(opts.hex || '').replace(/\s+/g, '');
+        if (!s.length || s.length % 2 !== 0) {
+            return fail('hex 长度必须为偶数且非空', { hex: opts.hex });
+        }
+        var nbytes = s.length / 2;
+        var size = parseInt(opts.size, 10);
+        if (size !== nbytes) {
+            // 长度不符**必须**拒绝：多写会改到相邻字段，少写会留下半个旧值。
+            return fail('写入长度与字段宽度不符：字节 ' + nbytes +
+                        ' 个，字段宽 ' + size + ' 字节',
+                        { hex_bytes: nbytes, field_size: size });
+        }
+        var bytes = [];
+        for (var i = 0; i < s.length; i += 2) {
+            var b = parseInt(s.substr(i, 2), 16);
+            if (isNaN(b)) { return fail('hex 含非法字符：' + s.substr(i, 2)); }
+            bytes.push(b);
+        }
+        var buf = Memory.alloc(Math.max(nbytes, 1));
+        try {
+            if (be.kind === 'il2cpp') {
+                if (!funcs.il2cpp_field_static_set_value) {
+                    return fail('il2cpp_field_static_set_value 不可用', {
+                        engine: 'il2cpp', api_missing: 'il2cpp_field_static_set_value'
+                    });
+                }
+                buf.writeByteArray(bytes);
+                funcs.il2cpp_field_static_set_value(hit.field, buf);
+            } else {
+                if (!monoFuncs.mono_field_static_set_value || !monoFuncs.mono_class_vtable) {
+                    var miss = [];
+                    if (!monoFuncs.mono_field_static_set_value) {
+                        miss.push('mono_field_static_set_value');
+                    }
+                    if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
+                    return fail('Mono 运行时缺静态字段写所需的导出：' + miss.join(' / '),
+                                { engine: 'mono', api_missing: miss });
+                }
+                var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
+                if (!vt || vt.isNull()) {
+                    return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可写）',
+                                { engine: 'mono', klass: hit.klass.toString() });
+                }
+                buf.writeByteArray(bytes);
+                monoFuncs.mono_field_static_set_value(vt, hit.field, buf);
+            }
+            return {
+                ok: true,
+                engine: be.kind,
+                field: opts.field,
+                class: be.fullNameOf(found.klass),
+                declared_by: hit.owner,
+                inherited_depth: hit.depth,
+                is_static: true,
+                size: size,
+                wrote_hex: s.toLowerCase(),
+                via: (be.kind === 'il2cpp' ? 'il2cpp_field_static_set_value'
+                                           : 'mono_field_static_set_value')
+            };
+        } catch (e) {
+            return fail('写静态字段失败：' + (e.message || e),
+                        { engine: be.kind, field: opts.field, owner: hit.owner });
+        }
+    }
+
     // ================================================================ 后端装配
 
     /** IL2CPP 的父类指针（fieldsWithInheritance 用）。 */
@@ -2967,6 +3245,35 @@
                 count: fs.length,
                 fallbacks: fallbacks
             };
+        },
+
+        /**
+         * 读一个**静态字段**的原始字节（`read_field_value(instance="static")`）。
+         *
+         * 打通「拿到静态单例指针」这条路 —— Mono 上 `find_instances` 受官方
+         * 限制常常不可用，此时读静态字段（`GameManager.Instance`）是唯一正路。
+         * `opts.size` 由宿主按字段类型给（含枚举的底层类型）。
+         */
+        readStaticField: function (opts, preferredModule) {
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
+            if (!ready.ok) { return ready; }
+            return readStaticFieldBytes(opts, be);
+        },
+
+        /**
+         * 写一个**静态字段**的原始字节（`set_field_value(instance="static")`）。
+         *
+         * 字节由宿主按字段类型编码好再传（这里只搬运 + 校验长度）。
+         * ⚠️ 改静态字段会影响全局逻辑，宿主侧必须先读回原值供回滚。
+         */
+        writeStaticField: function (opts, preferredModule) {
+            var be = selectBackend(preferredModule);
+            if (!be) { return backendNotFound(); }
+            var ready = be.ensureReady(preferredModule);
+            if (!ready.ok) { return ready; }
+            return writeStaticFieldBytes(opts, be);
         },
 
         /**

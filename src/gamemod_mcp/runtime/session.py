@@ -670,6 +670,33 @@ class RuntimeSession:
             preferred_module or None,
         )
 
+    def read_static_field(self, namespace: str = "", name: str = "",
+                          image: str = "", field: str = "", size: int = 8,
+                          preferred_module: str = "") -> dict:
+        """读一个**静态字段**的原始字节（`instance="static"` 那条路）。
+
+        `size` 由调用方按字段类型给（与实例字段同一张宽度表）——
+        探针不做类型推断，只负责把 `size` 个字节读出来。
+        """
+        return self._call(
+            "readStaticField",
+            {"namespace": namespace, "name": name, "image": image,
+             "field": field, "size": int(size)},
+            preferred_module or None,
+        )
+
+    def write_static_field(self, namespace: str = "", name: str = "",
+                           image: str = "", field: str = "", size: int = 8,
+                           hex_data: str = "",
+                           preferred_module: str = "") -> dict:
+        """写一个**静态字段**的原始字节。字节必须已按字段类型编码好。"""
+        return self._call(
+            "writeStaticField",
+            {"namespace": namespace, "name": name, "image": image,
+             "field": field, "size": int(size), "hex": hex_data},
+            preferred_module or None,
+        )
+
     # -------------------------------------------------- Hook
 
     def hook(self, address: str, args: list[str] | None = None,

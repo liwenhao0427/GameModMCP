@@ -294,10 +294,37 @@ set_field_value(instance="0x...", name="UserData", field="gold", value=9999)
 |---|---|
 | 值超出字段宽度（如 300 写进 1 字节） | **报错，不静默截断**（截成 44 会让你以为成功了） |
 | 字段类型认不出、宽度 8（多半是引用类型） | **拒绝**：换对象引用属于改逻辑，该用 `eval_script` / Hook |
-| 静态字段 | **拒绝**：那是 `il2cpp_field_static_set_value` 的事 |
+| 枚举成员（`BindingFlags.CreateInstance` 这类编译期常量） | **拒绝并说明**：它没有静态存储槽，写它会 access violation |
 
 `verify=True`（默认）会在写完后**回读一次**并把实测值放进 `read_back`；
 回读与写入不一致时**报 `ok:false`**，不会给你一个「看着成功」的结果。
+
+#### 静态字段：`instance="static"`
+
+同一个工具用**参数**区分静态与实例（不是另开一个工具）：
+
+```python
+# 读静态字段（不需要对象指针）
+read_field_value(instance="static", name="GameManager", field="Instance")
+# → {ok, is_static: true, declared_by, read_width: 8, raw_hex,
+#    as_pointer: "0x1d3b...", ...}
+
+# 宽度 8 的引用类型静态字段：as_pointer 就是**单例对象指针**，
+# 直接喂给同一个工具去读实例字段 —— 这就是「拿到单例」的闭环
+read_field_value(instance="0x1d3b...", name="GameManager", field="m_gold")
+
+# 写静态字段（先读一次留回滚依据，返回里带 value_before）
+set_field_value(instance="static", name="GameManager", field="m_maxGold",
+                value=9999)
+```
+
+三条要点：
+
+| 要点 | 说明 |
+|---|---|
+| **Mono 上这是拿单例的<u>正路</u>** | Mono 的 `find_instances` 受官方限制常返回 `unsupported`（`mono_gc_walk_heap` 只在 pre-stop-world 回调内有效）。此时读静态字段（`GameManager.Instance`）是唯一可靠的路 |
+| **会连同基类一起查** | 静态字段常声明在基类上；返回里的 `declared_by` 告诉你它到底属于哪个类 |
+| **枚举成员写不了** | `BindingFlags.CreateInstance` 这类**编译期常量**没有静态存储槽，工具会明确拒绝并说明原因（读是好的）—— 常量已被内联进调用方，改它没有意义 |
 
 ### 第 6 步：Hook 并观察
 

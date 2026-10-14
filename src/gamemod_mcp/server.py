@@ -2226,7 +2226,7 @@ def read_field_value(
     namespace: str = "",
     image: str = "",
 ) -> dict:
-    """读取某个对象实例上某个字段的原始值。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。
+    """读取某个**实例或静态**字段的原始值（静态字段传 `instance="static"`）。**读几个字节由字段类型决定**（bool 1 / int 4 / long·double·引用 8）。
 
     自动完成三步：运行时查字段偏移 → 算出字段地址 → 读内存。
 
@@ -2242,8 +2242,16 @@ def read_field_value(
     局限：只适合**基础类型字段**（int/float/bool/enum 等）。
     引用类型字段读到的是指针，要读内容需再解引用（用 read_memory）。
 
+    **静态字段**：把 `instance` 传成 `"static"`（或空串）即可读**静态字段**，
+    不需要对象指针。这是 Mono 上拿单例指针的**正路** —— Mono 的
+    `find_instances` 受官方限制常常返回 `unsupported`，而
+    `GameManager.Instance` 这类静态字段读出来的 `as_pointer` 就是实例指针
+    （宽度 8 的引用类型），可以直接喂给本工具的 `instance` 去读实例字段。
+    静态字段会**连同基类一起查**（`declared_by` 告诉你它声明在哪个类上）。
+
     Args:
         instance:  对象指针（十六进制）。可从 Hook 事件的 args[0] 里拿到。
+                   **传 `"static"` 表示读静态字段**（不需要对象指针）。
         name:      类名。
         field:     字段名。
         namespace: 命名空间。
@@ -2252,6 +2260,23 @@ def read_field_value(
     st = state.state()
     if not st.has_runtime():
         return _err("当前没有已注入的运行时会话。请先调用 inject_process。")
+
+    # ---------------- 静态字段：`instance="static"`（或空串）
+    #
+    # 为什么要有这条路：Mono 游戏的 `find_instances` 受官方限制常常不可用
+    # （`mono_gc_walk_heap` 只在 pre-stop-world 回调内有效），于是「拿到单例
+    # 对象指针」在 Mono 上没有正路。而静态字段（如 `GameManager.Instance`）
+    # 正是那条路：读出它的指针即可接着读实例字段。
+    # 探针里 `*_field_static_get_value` 早已绑定、却从未被调用 —— 这条
+    # 接口把那个「已绑定未接线」的能力接上。
+    #
+    # 用**同一个工具**而不是新增一个：AGENTS.md §3.1 第 3 条要求一个能力
+    # 只暴露一个工具、用参数区分（`instance="static"` 与「传地址」是同一个
+    # 动作的两种输入）。
+    if str(instance).strip().lower() in ("static", ""):
+        return _read_static_field(st, name=name, field=field,
+                                  namespace=namespace, image=image)
+
     try:
         ci = st.runtime.class_fields(namespace=namespace, name=name,
                                      image=image, instance_only=True)
@@ -2365,9 +2390,17 @@ def set_field_value(
     且宽度为 8 时，本工具报错而不是去写一个指针 —— 换对象引用属于改逻辑，
     应该用 `eval_script` 或 Hook，而不是改一个字段的字节。
 
+    **静态字段**：把 `instance` 传成 `"static"`（或空串）即可写**静态字段**
+    （与 `read_field_value` 同一套约定）。静态字段走探针的
+    `*_field_static_set_value`，没有「实例 + 偏移」这回事；返回里 `is_static`
+    为 true、并给出 `declared_by`（它可能声明在**基类**上）。
+    ⚠️ 静态字段常被全局逻辑读取，改了会影响整个游戏——返回里带
+    `value_before`，出问题可以用它写回。
+
     Args:
         instance:  对象指针（十六进制）。可用 `find_instances` 拿，
                    或从 Hook 事件的 args[0] 拿。
+                   **传 `"static"` 表示写静态字段**（不需要对象指针）。
         name:      类名。
         field:     字段名。
         value:     要写入的值。整数按字段宽度与符号解释；浮点字段给数字；
@@ -2384,6 +2417,15 @@ def set_field_value(
     st = state.state()
     if not st.has_runtime():
         return _err("当前没有已注入的运行时会话。请先调用 inject_process。")
+
+    # ---------------- 静态字段：`instance="static"`（或空串）
+    # 与 `read_field_value` 对称的入口（见那边的说明）。静态字段**没有实例
+    # 偏移**，走 `*_field_static_set_value` 而不是「实例地址 + 偏移」。
+    if str(instance).strip().lower() in ("static", ""):
+        return _write_static_field(st, name=name, field=field, value=value,
+                                   namespace=namespace, image=image,
+                                   verify=verify)
+
     try:
         ci = st.runtime.class_fields(namespace=namespace, name=name,
                                      image=image, instance_only=True)
@@ -2403,7 +2445,7 @@ def set_field_value(
             )
         if hit.get("is_static") is True:
             return _err(f"字段 {field} 是静态字段，本工具只写实例字段"
-                        "（静态字段请用 eval_script 调 il2cpp_field_static_set_value）")
+                        "（静态字段请用 instance=\"static\"）")
 
         off = hit.get("offset")
         if off is None:
@@ -2519,6 +2561,187 @@ def _explain_bytes(hexs: str) -> dict:
     except (ValueError, struct.error):  # pragma: no cover - 防御
         pass
     return out
+
+
+def _static_field_hit(st: Any, name: str, field: str,
+                      namespace: str, image: str) -> tuple[dict | None, dict | None, str]:
+    """找一个**静态**字段的记录。返回 `(hit, error_response, resolved_class)`。
+
+    `resolved_class` 是探针给出的**完整类名** —— 调用方需要它来判定
+    「这个字段是不是枚举成员」（枚举成员的类型名 == 所属枚举的类名）。
+
+    与实例字段走同一套宽度口径：枚举字段折成底层整型再定宽度
+    （否则 4 字节枚举会被当成 8 字节读，见 `_resolve_enum_underlying`）。
+    """
+    ci = st.runtime.class_fields(namespace=namespace, name=name, image=image,
+                                 static_only=True)
+    if not ci.get("ok"):
+        return None, _err(ci.get("error", "未找到类"), **{
+            k: v for k, v in ci.items() if k not in ("ok", "error")
+        }), ""
+    fields = ci.get("fields") or []
+    hit = next((f for f in fields if f.get("name") == field), None)
+    if hit is None:
+        return None, _err(
+            f"类 {name}（含基类）里没有静态字段 {field}",
+            available=[f.get("name") for f in fields],
+            hint="静态字段会连同基类一起列出；若列表为空，说明该类的静态"
+                 "字段不在运行时反射可见范围内（或类名不对）",
+        ), str(ci.get("class") or "")
+    return hit, None, str(ci.get("class") or "")
+
+
+def _read_static_field(st: Any, *, name: str, field: str,
+                       namespace: str, image: str) -> dict:
+    """读静态字段（`read_field_value(instance="static")` 的实现）。"""
+    hit, err, _resolved = _static_field_hit(st, name, field, namespace, image)
+    if err is not None:
+        return err
+    assert hit is not None
+    # 枚举字段：类型名是枚举类名，直接查表会落到 8 字节
+    enum_base = _resolve_enum_underlying(st, hit.get("type"), hit)
+    width = _field_read_width(enum_base or hit.get("type"))
+    r = st.runtime.read_static_field(namespace=namespace, name=name,
+                                     image=image, field=field, size=width)
+    if not r.get("ok"):
+        return _err(r.get("error", "读静态字段失败"),
+                    field=field, field_type=hit.get("type"),
+                    read_width=width,
+                    **{k: v for k, v in r.items() if k not in ("ok", "error")})
+    hexs = r.get("hex") or ""
+    out: dict[str, Any] = {
+        "class": name,
+        "field": field,
+        "instance": "static",
+        "is_static": True,
+        # 静态字段**没有实例偏移**（offset 恒为 0 且与实例无关），
+        # 所以这里不给 offset 字段 —— 给了会让调用方以为能拿它算地址。
+        # 但如实说明它声明在哪个类上（继承链上的字段 owner 不是请求的类）。
+        "declared_by": r.get("declared_by"),
+        "raw_hex": hexs,
+        "field_type": hit.get("type"),
+        "read_width": width,
+        "via": r.get("via"),
+    }
+    if r.get("inherited_depth"):
+        out["inherited_depth"] = r.get("inherited_depth")
+    if enum_base:
+        out["is_enum"] = True
+        out["enum_base_type"] = enum_base
+    out.update(_explain_bytes(hexs))
+    # 引用类型静态字段的 `as_pointer` 就是**单例对象的实例指针** ——
+    # 这正是本功能要打通的闭环，明确说出来，别让 Agent 自己猜。
+    if width == 8 and out.get("as_pointer"):
+        out["note"] = ("宽度 8：若该字段是引用类型，`as_pointer` 即指向的"
+                       "对象实例，可直接喂给 read_field_value / "
+                       "set_field_value 的 instance（指针只在游戏运行期间有效）")
+    return _ok(**out)
+
+
+def _write_static_field(st: Any, *, name: str, field: str, value: Any,
+                        namespace: str, image: str,
+                        verify: bool) -> dict:
+    """写静态字段（`set_field_value(instance="static")` 的实现）。
+
+    与实例字段写入同一套纪律：**溢出直接报错不截断**、**引用类型拒绝**、
+    **写完回读核对**。区别只在落点由探针的 `*_field_static_set_value` 决定
+    （静态值在类的静态区里，没有「实例 + 偏移」这回事）。
+    """
+    hit, err, resolved = _static_field_hit(st, name, field, namespace, image)
+    if err is not None:
+        return err
+    assert hit is not None
+    ftype = hit.get("type")
+    enum_base = _resolve_enum_underlying(st, ftype, hit)
+    width_type = enum_base or ftype
+    width = _field_read_width(width_type)
+    kind = _field_write_kind(width_type, width)
+
+    # 引用类型护栏：与实例字段同一条规矩（写指针属于改逻辑）。
+    if kind == "long" and (not width_type
+                           or str(width_type).strip() not in _FIELD_WRITE_KIND):
+        return _err(
+            f"静态字段 {field} 的类型 {ftype!r} 认不出（宽度 8），"
+            f"疑似**引用类型**。写入指针属于改逻辑 —— 若确实要换单例，"
+            f"请用 eval_script / Hook；要写裸字节请用 write_memory。",
+            field_type=ftype, is_static=True,
+        )
+
+    blob, enc_err = _encode_field_value(value, width, kind)
+    if blob is None:
+        return _err(f"值编码失败：{enc_err}", field_type=ftype,
+                    write_width=width, write_kind=kind, is_static=True)
+
+    # 枚举成员（`BindingFlags.CreateInstance` 这类）**不可写**：它们是 C# 的
+    # 编译期常量，值存在元数据里、**没有静态存储槽**，所以 IL2CPP 的
+    # `il2cpp_field_static_set_value` 会解引用 NULL。
+    #
+    # 这是**实测**出来的（Dave the Diver，逐个候选试写）：
+    #   · 声明类是枚举的 4 个候选：4/4 失败，报 `access violation accessing 0x0`；
+    #   · 声明类是普通类的 1 个候选：1/1 成功。
+    # 与其让它抛一个「access violation」让人以为探针坏了，不如在这里明确拒绝
+    # 并说清原因 —— 读这些字段仍然可用（返回元数据里的常量值）。
+    #
+    # 判据：字段类型名 == 请求解析到的类名，且该类型是枚举。此时字段就是
+    # 该枚举的一个成员（普通类持有枚举字段时，两者名字不同，不会被误判）。
+    if enum_base and resolved and str(ftype).strip() == resolved.strip():
+        return _err(
+            f"{resolved}.{field} 是**枚举成员**（编译期常量），没有可写的静态"
+            f"存储槽 —— 写它会解引用 NULL（实测 access violation）。"
+            f"常量在编译期已被内联进调用方，改它没有意义；"
+            f"要改「生效中的值」请找持有它的那个字段/属性。",
+            field=field, field_type=ftype, is_static=True,
+            declared_by=resolved, is_enum_member=True,
+        )
+
+    # 先读原值：静态字段改了会影响全局逻辑，回滚依据比实例字段更要紧
+    before = st.runtime.read_static_field(namespace=namespace, name=name,
+                                          image=image, field=field, size=width)
+
+    out: dict[str, Any] = {
+        "class": name,
+        "field": field,
+        "instance": "static",
+        "is_static": True,
+        "declared_by": hit.get("declared_by"),
+        "field_type": ftype,
+        "write_width": width,
+        "write_kind": kind,
+        "wrote_hex": blob.hex(),
+    }
+    if enum_base:
+        out["is_enum"] = True
+        out["enum_base_type"] = enum_base
+    if before.get("ok"):
+        out["value_before_hex"] = before.get("hex")
+        out["value_before"] = _explain_bytes(before.get("hex") or "")
+
+    wr = st.runtime.write_static_field(namespace=namespace, name=name,
+                                       image=image, field=field, size=width,
+                                       hex_data=blob.hex())
+    if not wr.get("ok"):
+        return _err(wr.get("error", "写静态字段失败"), **{
+            k: v for k, v in wr.items() if k not in ("ok", "error")
+        }, **{k: out[k] for k in ("write_width", "write_kind", "wrote_hex")
+              if k in out})
+
+    if verify:
+        after = st.runtime.read_static_field(namespace=namespace, name=name,
+                                             image=image, field=field,
+                                             size=width)
+        if after.get("ok"):
+            out["read_back_hex"] = after.get("hex")
+            out["read_back"] = _explain_bytes(after.get("hex") or "")
+            out["verified"] = (after.get("hex") or "").lower() == blob.hex().lower()
+            if not out["verified"]:
+                # 写完不是自己写的内容 —— 必须说出来，不能报成功
+                return _err(
+                    "写入后回读到的字节与写入值不一致（可能被游戏立刻覆盖，"
+                    "或该静态字段是只读/常量）。**不要**当成成功。", **out)
+        else:
+            out["verified"] = None
+            out["verify_error"] = after.get("error")
+    return _ok(**out)
 
 @mcp.tool(annotations=_ann("内存特征码扫描", read_only=True, open_world=True))
 @_cap_response
