@@ -2115,7 +2115,7 @@ def hook_status() -> dict:
         return _err(f"查询失败：{exc}")
 
 
-@mcp.tool(annotations=_ann("读取 Hook 事件", read_only=False, destroy=True, open_world=True))
+@mcp.tool(annotations=_ann("读取 Hook 事件", read_only=False, destroy=False, open_world=True))
 @_cap_response
 def drain_events(limit: int = 200, kind: str = "") -> dict:
     """取走探针缓冲的 Hook 事件（调用记录）。`kind` 过滤作用于**整条队列**（不是只看队首）。
@@ -2585,13 +2585,20 @@ def eval_script(code: str) -> dict:
         return _err(f"执行失败：{exc}")
 
 
-@mcp.tool(annotations=_ann("开关 GC", read_only=False, destroy=False, idempotent=True, open_world=True))
+@mcp.tool(annotations=_ann("开关 GC", read_only=False, destroy=False, idempotent=False, open_world=True))
 @_cap_response
 def gc_control(disable: bool = True) -> dict:
     """暂停/恢复游戏的 GC（垃圾回收）。
 
     Hook 期间建议暂停 GC，避免正在观察的对象被回收掉。
     **观察结束后务必恢复（disable=False）**，否则游戏内存会持续增长。
+
+    标注上 `idempotentHint=False`：它是**状态开关**，`disable=True` 与
+    `disable=False` 是两个不同状态，且「开了没关」会让内存持续增长。
+    同参数重复调确实无额外影响，但把这个调用标成「幂等」会被客户端读成
+    「可以随便重试」—— 在一个已经暂停了 GC 的会话里那样做是错的。
+    探针卸载时会自动恢复 GC（见 `agent.js` 的 `dispose`），但那是兜底，
+    不该替代调用方自己恢复。
 
     Args:
         disable: True 暂停 GC，False 恢复。

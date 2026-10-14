@@ -373,7 +373,7 @@ class ResultStore:
     #: 代次号：进程内每新建一个句柄表就 +1，保证句柄字符串跨索引不重名。
     _EPOCH = itertools.count(1)
 
-    def __init__(self, owner: str = "", max_entries: int = 32):
+    def __init__(self, owner: str = "", max_entries: int = 128):
         self._max = max_entries
         self._items: dict[str, QueryResult] = {}
         self._counter = 0
@@ -381,6 +381,20 @@ class ResultStore:
         # owner 只影响可读性；**唯一性由代次号保证**（同一个引擎的两个游戏
         # owner 相同，只靠引擎名区分不开）。
         self._prefix = f"{owner or 'idx'}-g{self._epoch}-"
+        #: 并发保护。**为什么必须有**：MCP 的工具被 offload 到线程池执行
+        #: （`server.py` 的 `_install_event_loop_guard` 用 `asyncio.to_thread`），
+        #: 而 `cap_results` 是**进程级单例**（`state.py`），多个工具调用会
+        #: 同时读它、也会同时往它里面登记新句柄。
+        #: 没有锁时 `self._counter += 1` 是「读-改-写」三步，两个线程可能
+        #: 拿到同一个序号 → **两个不同的结果集共用一个句柄**，
+        #: 而 `put()` 里的「淘汰最旧」`next(iter(...))` + `del` 也可能在
+        #: 迭代中途被另一个线程改动字典，抛 `RuntimeError: dictionary
+        #: changed size during iteration`。两者都是「偶发、且结果看着正常」
+        #: 的缺陷 —— 最坏的情况是调用方翻页时读到**别人的**结果集。
+        #:
+        #: 用 RLock 而非 Lock：`handles()` 等只读方法将来可能在持锁路径上
+        #: 被重入调用（同一个线程再取锁不会死锁），代价可以忽略。
+        self._lock = threading.RLock()
 
     @property
     def prefix(self) -> str:
@@ -389,23 +403,28 @@ class ResultStore:
 
     def put(self, kind: str, source: _RowSource) -> QueryResult:
         """登记一份结果来源，返回句柄（**不物化**，见模块上方说明）。"""
-        self._counter += 1
-        handle = f"{self._prefix}{kind}-{self._counter}"
-        qr = QueryResult(handle=handle, kind=kind, source=source)
-        self._items[handle] = qr
+        # 序号自增与淘汰必须**一起**持锁：分成两段的话，「取序号」与
+        # 「写进字典」之间会有窗口，另一个线程可能先插进同名键。
+        with self._lock:
+            self._counter += 1
+            handle = f"{self._prefix}{kind}-{self._counter}"
+            qr = QueryResult(handle=handle, kind=kind, source=source)
+            self._items[handle] = qr
 
-        # 淘汰最旧的
-        while len(self._items) > self._max:
-            oldest = next(iter(self._items))
-            del self._items[oldest]
+            # 淘汰最旧的（字典保持插入序，所以队首就是最旧的）
+            while len(self._items) > self._max:
+                oldest = next(iter(self._items))
+                del self._items[oldest]
 
-        return qr
+            return qr
 
     def get(self, handle: str) -> QueryResult | None:
-        return self._items.get(handle)
+        with self._lock:
+            return self._items.get(handle)
 
     def handles(self) -> list[str]:
-        return list(self._items)
+        with self._lock:
+            return list(self._items)
 
     def clear(self) -> None:
         """作废全部句柄（切游戏 / 关会话时用，见 `state.close_index`）。
@@ -413,7 +432,8 @@ class ResultStore:
         代次号**不重置** —— 这正是要点：清空后新句柄不会与旧的同名，
         于是「已经作废的句柄」永远是查不到的，不会静默命中新数据。
         """
-        self._items.clear()
+        with self._lock:
+            self._items.clear()
 
 
 # ---------------------------------------------------------------- 索引主体

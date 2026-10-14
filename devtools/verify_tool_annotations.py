@@ -1,4 +1,4 @@
-"""验收：38 个 MCP 工具的**语义标注**（P2-5）。
+"""验收：全部 MCP 工具的**语义标注**（P2-5）。
 
 要证明的问题
 --------------------------------------------------
@@ -20,15 +20,21 @@
   · `decompile` / `ue_profile` 给了 `output_dir` / `output_path` 就会**落盘**，
     标成只读是不对的（它们只写自己的产物、可覆盖，所以不算破坏）。
 
+**工具数量不写死在文案里**（本轮修的 §11.5）：脚本标题、断言标签里的数字
+一律用 `len(tools)` 现算 —— 历史文案曾长期写着「38 个工具」而实际已 45，
+注释陈旧本身无害，但它会让人**以为门禁的数字是手工维护的**。
+
 这个脚本守什么
 --------------------------------------------------
 1. 五（四）个语义位**每位都有值** —— 不许把语义留给默认值。
 2. 三个分组（只读本地 / 只读但要游戏进程 / 非只读）与代码**双向完全一致**；
    新增工具不在这张表里就直接报红 —— 逼着作者**当面表态**它危不危险。
+   （这张表**故意**手工维护：自动化导出会丢掉「逼作者表态」的强制力。
+   见 `docs/交接与评审说明书.md` §11.6 的讨论。）
 3. 蕴含关系：只读 ⇒ 不破坏且无副作用（不许出现自相矛盾的标注）。
 4. `_ann()` 自身会拦住矛盾组合（`read_only=True` + `destroy=True` 抛错）——
    否则这个「防矛盾」的设计只是个说法。
-5. 点名那三个曾经写错/容易写错的工具，防止有人改回去。
+5. 点名那几个曾经写错/容易写错的工具，防止有人改回去。
 """
 
 from __future__ import annotations
@@ -101,7 +107,12 @@ MUTATING: dict[str, tuple[bool, bool, bool]] = {
     "decompile":      (False, True, False),   # 给 output_dir 才落盘，只写自己的产物
     "ue_profile":     (False, True, False),   # 同上（output_path）
     "inject_process": (False, True, True),    # 同一进程重复注入会复用
-    "gc_control":     (False, True, True),    # 可开可关
+    # `gc_control(disable)` 是**开关**：True 与 False 是两个不同状态，
+    # 且「开了没关」会让游戏内存持续增长。标 idempotent=True 会被客户端
+    # 读成「这个调用可以随便重试」—— 在开着 GC 暂停的会话里那是错的。
+    # 同参数重复调本身确实无额外影响，但**跨参数**会改变状态，所以这里
+    # 按「状态开关」如实标 False（§11.4 的结论）。
+    "gc_control":     (False, False, True),
     # 截图/OCR 会**落盘**（PNG），所以不是只读；但落的是自己的产物，
     # 重复调用等价（同一画面截两次内容一致），不破坏任何东西。
     "capture_screen": (False, True, True),
@@ -118,21 +129,48 @@ MUTATING: dict[str, tuple[bool, bool, bool]] = {
     "hook_address":   (False, False, True),
     # 破坏性：不可逆 / 可能崩游戏 / 数据被消费掉
     "unhook":         (True, True, True),     # 不带 id 会把 Hook 全卸了
-    "drain_events":   (True, False, True),    # **取走即消费**，事件没了就没了
+    # `drain_events` 标 **destructiveHint=False**（§11.2 的结论）：
+    # 它读走的是**探针自己的事件缓冲**，不是游戏数据；而且被消费掉的东西
+    # 是「本来就会随时间被覆盖的观测记录」，不是用户的资产。
+    # 原来的 `destructiveHint=True` 让它与 `eval_script`（任意代码执行）
+    # 在客户端眼里**风险等级完全相同** → 真正危险的工具被弹窗疲劳淹没。
+    # 它仍然**不是只读**（readOnlyHint=False：缓冲区确实被消费了），
+    # 但也不幂等（idempotentHint=False：第二次调取不到第一次的事件）。
+    "drain_events":   (False, False, True),
     "write_memory":   (True, True, True),     # 写错地址立刻崩游戏
     "set_field_value": (True, True, True),    # 同上：写错值/地址立刻崩游戏
     "eval_script":    (True, False, True),    # 游戏进程内任意代码执行
 }
 
-#: 必须声明为破坏性的工具（客户端要弹确认的就是它们）
+#: 必须声明为破坏性的工具（客户端要弹确认的就是它们）。
+#:
+#: `drain_events` **不在**这里 —— 见上面 `MUTATING` 里的说明（§11.2）。
+#: 它必须仍然「不是只读」，但不再与「写内存 / 任意代码执行」同档。
 MUST_BE_DESTRUCTIVE = {"write_memory", "set_field_value", "eval_script",
-                       "unhook", "drain_events"}
+                       "unhook"}
 
 #: **曾经写错**的标注 —— 点名钉住，防止有人改回去
 MUST_NOT_BE_READONLY = {
     "drain_events": "取走即消费：事件被消费掉就没了，标只读会让客户端以为重试无害",
     "decompile": "给了 output_dir 会落盘（写自己的产物，不算破坏）",
     "ue_profile": "给了 output_path 会落盘（同上）",
+}
+
+#: 本轮按《交接与评审说明书》§11.2 / §11.4 调整的两处语义标注。
+#: 它们都是**取舍**，所以把「为什么」和「断言」一起钉在这里 ——
+#: 否则后来者只看到两个看似随意的 True/False，很容易「顺手改回对称」。
+SEMANTIC_DECISIONS = {
+    # (destructive, idempotent, 理由)
+    "drain_events": (
+        False, False,
+        "§11.2：读走的是**探针自己的事件缓冲**，不是游戏数据。原来标 "
+        "destructive=True 让它与 eval_script（任意代码执行）在客户端眼里"
+        "风险等级完全相同 → 真危险的工具被弹窗疲劳淹没。"
+        "仍非只读（缓冲确实被消费）且非幂等（第二次取不到第一次的事件）。"),
+    "gc_control": (
+        False, False,
+        "§11.4：它是**状态开关**，disable=True/False 是两个不同状态；"
+        "标幂等会被读成「可以随便重试」，而「开了没关」会让内存持续增长。"),
 }
 
 BITS = ("title", "readOnlyHint", "destructiveHint",
@@ -151,7 +189,7 @@ def main() -> int:
     print("  -- 1. 4 个语义位 + title 都必须显式有值（不许吃默认值）--")
     missing = [(n, b) for n, a in live.items() for b in BITS
                if a is None or getattr(a, b, None) is None]
-    check("38 个工具都写全了标注", not missing,
+    check(f"{len(tools)} 个工具都写全了标注", not missing,
           f"缺 {len(missing)} 处：{missing[:6]}" if missing else
           f"{len(tools)} 个工具 × {len(BITS)} 位")
 
@@ -243,6 +281,40 @@ def main() -> int:
           f"实际 {sorted(actual_destructive)}"
           if actual_destructive != MUST_BE_DESTRUCTIVE
           else f"{sorted(actual_destructive)}")
+
+    # ---- 本轮按 §11.2 / §11.4 调整的两处标注（防止被「顺手改回对称」）
+    print()
+    print("  -- 6b. §11.2 / §11.4 的语义取舍（含反证对照）--")
+    for name, (want_d, want_i, why) in sorted(SEMANTIC_DECISIONS.items()):
+        a = live.get(name)
+        check(f"{name} 的 destructiveHint={want_d}", 
+              a is not None and a.destructiveHint is want_d,
+              f"实际 {getattr(a, 'destructiveHint', None)} —— {why}")
+        check(f"{name} 的 idempotentHint={want_i}",
+              a is not None and a.idempotentHint is want_i,
+              f"实际 {getattr(a, 'idempotentHint', None)}")
+        check(f"{name} 仍然**不是只读**（读缓冲 ≠ 无副作用）",
+              a is not None and a.readOnlyHint is False,
+              "消费了缓冲就不是只读")
+
+    # 反证对照：`drain_events` 与 `eval_script` 现在**能**被客户端区分开
+    # （这正是 §11.2 那条调整的目的）。若有人把 drain_events 改回
+    # destructive=True，这三个语义位又会变得一模一样。
+    _de = live.get("drain_events")
+    _ev = live.get("eval_script")
+    _same = (_de is not None and _ev is not None
+             and _de.destructiveHint == _ev.destructiveHint
+             and _de.idempotentHint == _ev.idempotentHint
+             and _de.readOnlyHint == _ev.readOnlyHint)
+    check("反证：drain_events 与 eval_script 的标注**不再相同**"
+          "（客户端因此能区分风险等级）",
+          not _same,
+          f"drain_events=({getattr(_de, 'readOnlyHint', None)}, "
+          f"{getattr(_de, 'destructiveHint', None)}, "
+          f"{getattr(_de, 'idempotentHint', None)}) vs "
+          f"eval_script=({getattr(_ev, 'readOnlyHint', None)}, "
+          f"{getattr(_ev, 'destructiveHint', None)}, "
+          f"{getattr(_ev, 'idempotentHint', None)})")
 
     # ---------------------------------------------- 7. _ann 自身会拦矛盾
     print()

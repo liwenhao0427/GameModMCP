@@ -201,7 +201,7 @@ def test_pure() -> None:
     circular["self"] = circular
     # 注意：`_cap_response` 有**副作用** —— 它会把原函数登记进 `RAW_TOOLS`
     # （那是给「量截断前有多大」用的）。这里传的是临时 lambda，
-    # 登记进去就会让第 13 节「RAW_TOOLS 恰好等于 38 个工具」多出一条。
+    # 登记进去就会让第 13 节「RAW_TOOLS 恰好等于工具数」多出一条。
     # 本轮就是这么被第 13 节抓到的（**套件里**才红，单独跑不红）。
     raw_snapshot = dict(S.RAW_TOOLS)
     try:
@@ -353,16 +353,19 @@ def test_e2e() -> None:
 
 
 def test_decorator() -> None:
-    """`@_cap_response` 是**加在 38 个工具上的**，所以它自己也得被验收。
+    """`@_cap_response` 是**加在每个工具上的**，所以它自己也得被验收。
 
     尤其是「不能改变入参 schema」：用 `*args, **kwargs` 包一层如果忘了
     `functools.wraps`，FastMCP 就会把包装器的签名当成工具签名 ——
     现象是工具的入参**全部消失**（或者多出 `args` / `kwargs`），
     而工具**照样能跑**，所以只有比对 schema 才看得出来。
 
-    本轮 P2-4 加装饰器时就是这么验的（用 `_dump_schemas.py` 把 38 个工具的
+    本轮 P2-4 加装饰器时就是这么验的（用 `_dump_schemas.py` 把全部工具的
     schema 落盘、改前改后比 sha256）。这里把它变成**常驻断言**，
     免得下次再加装饰器时又要靠一次性脚本。
+
+    注：文案里的工具数一律用**现算**的 `len(tools)`（§11.5 的教训 ——
+    写死的数字会随工具增长而陈旧）。
     """
     section("13. 装饰器不许改变入参 schema（functools.wraps 真的保住了签名）")
     import asyncio
@@ -403,12 +406,12 @@ def test_decorator() -> None:
           else f"RAW_TOOLS 共 {len(S.RAW_TOOLS)} 个 / 工具 {len(tools)} 个")
     check("每个工具注册出去的入参 schema 与其原函数签名完全一致",
           not mismatch,
-          f"不一致：{mismatch[:3]}" if mismatch else "38 个工具逐个比对通过")
+          f"不一致：{mismatch[:3]}" if mismatch else f"{len(tools)} 个工具逐个比对通过")
     check("没有任何工具用 *args / **kwargs 收参数（那样 schema 必然不完整）",
           not varargs,
           f"发现：{varargs}" if varargs
-          else "38 个工具的参数都是显式声明的（`launch_game(args=...)` 的 args "
-               "是普通参数，不算）")
+          else f"{len(tools)} 个工具的参数都是显式声明的"
+               "（`launch_game(args=...)` 的 args 是普通参数，不算）")
 
     # 反证：上一条「schema 与签名一致」必须证明它**能**失败 ——
     # 去掉 functools.wraps 包一层，签名立刻就变成 (*args, **kwargs)。

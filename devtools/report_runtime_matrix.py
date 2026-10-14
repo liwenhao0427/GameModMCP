@@ -8,7 +8,9 @@
 静态阶段全绿、运行时一用就废，是完全可能的（本轮就实测到：静态 15/15
 通过，而带 `args_type` 的 Hook 在 Frida 17 下**参数全丢**）。
 
-本脚本对每个游戏把 **38 个工具**都过一遍，运行时部分是**真的开游戏、真的注入**：
+本脚本对每个游戏把 `ALL_TOOLS` 里的**每个**工具都过一遍（清单与服务器实际
+报出的工具**逐一核对，不一致直接非零退出、不生成报告**），运行时部分是
+**真的开游戏、真的注入**：
 
     ① inspect_game / inspect_binary / open_game / get_session   识别 + 建索引
     ② 静态查询全家桶（search_* / class_detail / class_hierarchy /
@@ -83,7 +85,14 @@ CALL_TIMEOUT = 900.0
 #: 「拿不到 this」。
 NATURAL_WAIT = 25.0
 
-#: 全部 38 个工具（顺序即报告里的行顺序，按「静态 → 运行时」分组）。
+#: 全部工具（顺序即报告里的行顺序，按「静态 → 运行时」分组）。
+#:
+#: ⚠️ **这份清单必须与服务器实际报出的工具逐一对应**。历史上它漏了 7 个
+#: （`find_instances` / `set_field_value` / `capture_screen` / `ocr` /
+#: `probe_log` / `wait_for` / `verify_state`），而脚本发现不一致时**只打印
+#: 一句警告就继续**，于是那份「覆盖 38 个工具、逐名核对一致」的报告
+#: 在事实上有 7 个工具从未被验证过。现在 `main()` 里对账不一致会**直接
+#: 非零退出**（见 `_check_tool_inventory`），不再带病生成报告。
 ALL_TOOLS: list[str] = [
     # 发现与索引
     "find_game_processes", "inspect_game", "inspect_binary", "open_game",
@@ -99,7 +108,10 @@ ALL_TOOLS: list[str] = [
     "inject_process", "launch_game", "runtime_info", "runtime_class_info",
     "find_hook_target", "hook_method", "hook_address", "unhook", "hook_status",
     "drain_events", "read_memory", "write_memory", "read_field_value",
-    "scan_pattern", "eval_script", "gc_control", "close_session",
+    "set_field_value", "find_instances", "scan_pattern", "eval_script",
+    "gc_control", "close_session",
+    # 弱视觉 / 验收
+    "capture_screen", "ocr", "probe_log", "wait_for", "verify_state",
 ]
 
 #: 只在 UE 上有意义的工具。对 Unity 游戏调用它们只会得到 `is_ue: false`，
@@ -111,11 +123,16 @@ UE_ONLY = ["ue_profile", "ue_list_entries", "ue_script_objects", "ue_manifest"]
 #: 历史：`agent.js` 曾经只认 IL2CPP，于是 Mono 游戏在这批工具上「没有可用路径」，
 #: 本报告把它们记为「不适用」。**探针补上 Mono 后端之后这条边界不存在了** ——
 #: Mono 游戏现在真的会走完这批工具，结果如何由实测决定，不再预先跳过。
+#:
+#: `find_instances` / `set_field_value` 也必须在这张表里：它们同样要有活着的
+#: 运行时探针才答得出来，漏进来会让 UE 游戏把它们记成「失败」而不是
+#: 「不适用」。
 RUNTIME_TOOLS = [
     "inject_process", "launch_game", "runtime_info", "runtime_class_info",
     "find_hook_target", "hook_method", "hook_address", "unhook", "hook_status",
     "drain_events", "read_memory", "write_memory", "read_field_value",
-    "scan_pattern", "eval_script", "gc_control", "close_session",
+    "set_field_value", "find_instances", "scan_pattern", "eval_script",
+    "gc_control", "close_session",
 ]
 
 #: 浮点靶子的候选表：(类, 方法, 参数规格列表, 调用参数, 期望返回值, 说明)。
@@ -697,6 +714,7 @@ class Probe:
             if not this_ptr:
                 continue
             # 拿这个指针读一个实例字段：指针若不是真对象，这里必然失败
+            read_ok = False
             for fname in self._instance_field_names(cls)[:3]:
                 rv = self.call("read_field_value", {
                     "instance": this_ptr, "name": cls,
@@ -704,8 +722,117 @@ class Probe:
                 if rv.get("ok"):
                     self.note("field_read", f"{fname}="
                               f"{rv.get('raw_hex')}（宽度 {rv.get('read_width')}）")
+                    read_ok = True
                     break
-            return
+            # `set_field_value` 的对称路径：拿**刚读到的值**幂等写回
+            # （写回自己的原值无害，且能真正走完「编码 → 写 → 回读核对」）。
+            # 放在 read 成功之后：指针不可信时不该去写内存。
+            if read_ok:
+                for fname in self._instance_field_names(cls)[:3]:
+                    rv = self.call("read_field_value", {
+                        "instance": this_ptr, "name": cls,
+                        "field": fname, "namespace": "UnityEngine"},
+                        record=False)
+                    if not rv.get("ok"):
+                        continue
+                    width = int(rv.get("read_width") or 0)
+                    as_int = rv.get("as_int32")
+                    # 只写**基础整型**字段（认得出宽度、值在 int 范围内）：
+                    # 引用/浮点字段写回原值要么被工具正确拒绝，要么需要按
+                    # 类型编码，都不适合放在这个自动矩阵里。
+                    if width == 4 and isinstance(as_int, int):
+                        self.call("set_field_value", {
+                            "instance": this_ptr, "name": cls, "field": fname,
+                            "value": as_int})
+                        break
+            break
+
+    def stage_instances(self) -> None:
+        """`find_instances`：枚举活实例（拿 `instance` 指针的正路）。
+
+        它是本次补进 `ALL_TOOLS` / `RUNTIME_TOOLS` 的工具之一；此前它既不
+        在清单里、也没有执行阶段，于是报告里**从来没出现过**这一格。
+        """
+        for cls, ns in (("Object", "UnityEngine"),
+                        ("Transform", "UnityEngine"),
+                        ("Component", "UnityEngine"),
+                        ("String", "System")):
+            r = self.call("find_instances", {
+                "name": cls, "namespace": ns, "max_count": 5})
+            if r.get("ok"):
+                self.note("find_instances_target", f"{ns}.{cls}")
+                self.note("find_instances_count",
+                          f"{r.get('count')}（精确 {r.get('exact_class_count')}"
+                          f" / 派生 {r.get('derived_count')}）")
+                return
+            # 「本时机不可用」（Mono 的官方限制）与「没找到类」是两回事：
+            # 前者是**引擎限制**，继续试下一个没有意义，如实记下并停。
+            if r.get("unsupported"):
+                self.note("find_instances_target",
+                          f"{ns}.{cls}：本时机不可用（{str(r.get('error'))[:60]}）")
+                return
+        self.note("find_instances_target", "（本轮没有可枚举实例的类）")
+
+    def stage_verify(self) -> None:
+        """弱视觉 / 验收层：`capture_screen` / `ocr` / `probe_log` /
+        `wait_for` / `verify_state`。
+
+        这 5 个工具此前**完全不在**矩阵清单里（见 §11.1），本次补上。
+        验收工具本身也需要被验收 —— 它们若坏了，Agent 会拿到假证据。
+
+        屏幕/OCR 依赖是**可选**的：拿不到就如实记为「不适用」，不算失败
+        （`get_diagnostics` 的 `screen.*_usable` 已先查过）。
+        """
+        diag = self.rec.get("cells", {}).get("get_diagnostics", {}).get("data") or {}
+        screen = (diag.get("screen") or {}) if isinstance(diag, dict) else {}
+
+        # capture_screen：截一张存到测试缓存（不落进仓库）
+        shot = CACHE / f"matrix-shot-{self.rec.get('name', 'game')}.png"
+        self.call("capture_screen", {"save_path": str(shot), "max_side": 640})
+
+        # ocr：对**整屏**做一次（ROI 未知，整屏最稳）；命中数不做断言
+        if screen.get("ocr_usable") is False:
+            self.skip("ocr", "本机未安装可用的 OCR 依赖（见 get_diagnostics）")
+        else:
+            self.call("ocr", {"expected": "", "max_items": 5})
+
+        # probe_log：找一个真实存在的日志文件做只读探测。
+        # 找不到时**如实记为不适用** —— 不是失败，游戏没写日志而已。
+        logp = self._find_log_file()
+        if not logp:
+            self.skip("probe_log", "本轮没有找到可读的游戏日志文件（非缺陷）")
+        else:
+            self.note("probe_log_target", str(logp))
+            self.call("probe_log", {"path": str(logp), "max_lines": 5})
+
+        # wait_for：等一个**几乎必然成立**的引擎信号（探针已注入 → 实例数 >= 1
+        # 通常立刻满足）。用 `window=` 也行，但那依赖真实窗口标题；
+        # 这里用 kind="instances" 走引擎信号，比像素稳。
+        self.call("wait_for", {"kind": "instances", "name": "Object",
+                               "namespace": "UnityEngine", "min_count": 1,
+                               "timeout_ms": 3000, "interval_ms": 300})
+        # verify_state：同样用引擎信号凑一条（只要求 1 条，避免与通道数门槛
+        # 冲突 —— 这里验的是「工具能跑通并如实返回三态」，不是验收结论本身）
+        self.call("verify_state", {
+            "checks": "instances=UnityEngine.Object>=1",
+            "require_independent": 1})
+
+    @staticmethod
+    def _find_log_file() -> Path | None:
+        """在测试缓存里造一个**真实的**日志文件给 `probe_log` 探测。
+
+        为什么不扫游戏目录：不同游戏日志路径差异极大（BepInEx / Unity Player.log /
+        自研），扫一遍既慢又不确定。`probe_log` 验的是「能读、能过滤、能报编码」，
+        用自己的临时日志同样是**真实**输入，且结果可复现。
+        """
+        try:
+            CACHE.mkdir(parents=True, exist_ok=True)
+            p = CACHE / "matrix-probe.log"
+            p.write_text("probe_log 自检：ERROR 不该出现\n启动完成\n",
+                         encoding="utf-8")
+            return p
+        except Exception:  # noqa: BLE001 - 写不出来就记「不适用」
+            return None
 
     def stage_close(self) -> None:
         self.call("close_session", {})
@@ -739,11 +866,32 @@ class Probe:
         self.stage_hook_address()
         self.stage_memory()
         self.stage_this()
+        self.stage_instances()
+        self.stage_verify()
         # 收尾前再确认一次进程是否还活着：若运行时工具在中途集体报
         # 「没有已注入的运行时会话」，这一条能区分「游戏崩了」与「会话被丢」
         self.note("pid_alive_before_close", self._pid_alive())
         self.stage_close()
         self.rec["elapsed_total"] = round(time.time() - self.t0, 1)
+
+
+def _check_tool_inventory(names: list[str]) -> tuple[bool, dict]:
+    """把「本脚本的清单」与「服务器实际报出的工具」对账。
+
+    返回 `(ok, detail)`；`detail` 里带 `tools_missing` / `tools_extra`。
+
+    抽成函数是为了能被验收脚本直接调用（`verify_runtime_matrix_inventory.py`）：
+    「不一致时真的返回 False」这件事必须有断言，否则它又会退化成
+    「有检查，但检查不拦人」—— 那正是这个函数要修的缺陷本身。
+    """
+    detail = {
+        "tools_actual": list(names),
+        "tools_missing": sorted(set(names) - set(ALL_TOOLS)),
+        "tools_extra": sorted(set(ALL_TOOLS) - set(names)),
+        "all_tools_count": len(ALL_TOOLS),
+    }
+    ok = bool(names) and not detail["tools_missing"] and not detail["tools_extra"]
+    return ok, detail
 
 
 def main() -> int:
@@ -773,6 +921,19 @@ def main() -> int:
             print("--from-json 需要同时给 --md")
             return 1
         old = json.loads(src_json.read_text(encoding="utf-8"))
+        # 旧 JSON 里记录了它当时的对账结果 —— 若那时就不一致（或那份 JSON
+        # 早于本轮加的对账字段），照样**拒绝**重排，不能靠换个排版把
+        # 「有 7 个工具没跑过」这件事洗掉。
+        _old_missing = old.get("tools_missing")
+        _old_extra = old.get("tools_extra")
+        if _old_missing is None or _old_extra is None:
+            print(f"❌ {src_json} 里没有工具对账记录（tools_missing/"
+                  f"tools_extra）—— 无法确认它覆盖了哪些工具，拒绝重排。")
+            return 1
+        if _old_missing or _old_extra:
+            print(f"❌ {src_json} 记录的对账结果就是不一致的："
+                  f"漏 {_old_missing}，多 {_old_extra}；拒绝为它重排报告。")
+            return 1
         for _r in (old.get("results") or []):
             normalize(_r)
         write_markdown(old, Path(args.md))
@@ -807,8 +968,14 @@ def main() -> int:
             print(f"合并模式：已有 {len(out['results'])} 条记录，"
                   f"本轮结果按游戏覆盖")
 
-    # 先核对「本脚本以为的 38 个工具」与服务器真实报出的一致 ——
-    # 否则报告里的「覆盖 38 个」就是个自说自话的数字。
+    # 先核对「本脚本以为的工具清单」与服务器真实报出的一致 ——
+    # 否则报告里的「覆盖 N 个」就是个自说自话的数字。
+    #
+    # ⚠️ **不一致必须阻断**（这是本轮修的缺陷）：历史实现只在发现不一致时
+    # `print("⚠️ 清单不一致…")` 就继续跑，于是 `ALL_TOOLS` 漏了 7 个工具时，
+    # 那份报告照样产出、照样声称「覆盖 38 个工具、逐名核对一致」——
+    # **有检查，但检查不拦人**。这与 AGENTS.md「不许假成功」是同一类问题：
+    # 带病的报告比没有报告更糟，因为它看起来是证据。
     probe = mcp_stdio.McpStdioServer(
         [sys.executable, "-m", "gamemod_mcp.server"],
         env=mcp_stdio.script_form_env(src, clean_pythonpath=False),
@@ -819,13 +986,24 @@ def main() -> int:
     finally:
         probe.close()
     out["tools_actual"] = names
-    out["tools_missing"] = sorted(set(names) - set(ALL_TOOLS))
-    out["tools_extra"] = sorted(set(ALL_TOOLS) - set(names))
+    _inv_ok, _inv = _check_tool_inventory(names)
+    out["tools_missing"] = _inv["tools_missing"]
+    out["tools_extra"] = _inv["tools_extra"]
     print(f"服务器报出工具 {len(names)} 个；本脚本清单 {len(ALL_TOOLS)} 个")
-    if out["tools_missing"] or out["tools_extra"]:
-        print(f"  ⚠️ 清单不一致：漏 {out['tools_missing']}，多 {out['tools_extra']}")
-    else:
-        print("  ✅ 清单一致")
+    if not init["ok"]:
+        print(f"  ❌ 探针服务器起不来，无法对账工具清单：{init.get('error')}")
+        print("     拒绝生成报告（清单未经核对 = 数字不可信）。")
+        return 1
+    if not _inv_ok:
+        print(f"  ❌ 清单不一致：漏 {out['tools_missing']}，"
+              f"多 {out['tools_extra']}")
+        print("     拒绝继续跑矩阵、拒绝生成报告 —— 否则报告会声称覆盖了"
+              "实际没跑到的工具。")
+        print("     修法：把上面「漏」的那些补进本文件的 ALL_TOOLS /"
+              " RUNTIME_TOOLS / KEY_STATIC / KEY_RUNTIME，并补上对应的"
+              "执行阶段（stage_*）。")
+        return 1
+    print("  ✅ 清单一致")
 
     for g in games:
         install = g["install"]
@@ -919,14 +1097,19 @@ KEY_STATIC = [
     "decompile", "find_game_processes",
 ]
 
-#: 运行时 + UE 容器能力（同样按引擎分组阅读）
+#: 运行时 + UE 容器能力（同样按引擎分组阅读）。
+#: `find_instances` / `set_field_value` 也在这里 —— 它们是运行时能力的
+#: 主力（拿实例指针 / 写字段），漏在表外会让报告对它们**一格都不显示**。
 KEY_RUNTIME = [
     "launch_game", "inject_process", "runtime_info", "runtime_class_info",
     "find_hook_target", "hook_method", "hook_address", "hook_status",
     "unhook", "drain_events", "read_memory", "write_memory",
-    "read_field_value", "scan_pattern", "eval_script", "gc_control",
+    "read_field_value", "set_field_value", "find_instances",
+    "scan_pattern", "eval_script", "gc_control",
     "close_session", "detect_ue", "ue_profile", "ue_list_entries",
     "ue_manifest", "ue_script_objects",
+    # 弱视觉 / 验收层
+    "capture_screen", "ocr", "probe_log", "wait_for", "verify_state",
 ]
 
 KEY_TOOLS = KEY_STATIC + KEY_RUNTIME

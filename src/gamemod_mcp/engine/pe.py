@@ -448,8 +448,7 @@ def _parse_delay_imports(info: PEInfo, delay_rva: int) -> list[ImportedDll]:
         dll = _read_cstring(data, name_off)
 
         entry = ImportedDll(dll=dll, is_delay=True)
-        int_rva = info.rva_to_offset(base)  # 见下：延迟导入的字段布局
-        # 重新按字段读取 IAT / INT
+        # 重新按字段读取 IAT / INT（延迟导入描述符里它们在 +16/+20）
         iat, int_table = struct.unpack_from("<II", data, base + 16)
         thunk_rva = int_table or iat
 

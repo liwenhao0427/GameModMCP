@@ -1228,8 +1228,17 @@ class Metadata:
 
         for idx in self._sorted_type_indexes:
             t = self.types[idx]
-            name = t.full_name
-            if needle not in name.lower():
+            # 匹配**两个**名字：`full_name` 与 `nested_name`（与 mono_meta 的
+            # search_types 同一口径）。
+            #
+            # 为什么必须都试：嵌套类型在元数据里 `namespace` 为空、只有短名，
+            # 所以 `full_name` == 短名（如 `Inner`），而 `nested_name` 才是
+            # 能唯一定位的限定名（`Outer.Inner`）。只匹配 `full_name` 时
+            # `search_classes("Outer.Inner")` 会**搜不到**——而 `class_detail` /
+            # `runtime_class_info` 到处都在教调用方用 nested_name（SKILL.md 明确
+            # 要求「查嵌套类型请把 name 传成完整嵌套名」）。
+            if needle and needle not in t.nested_name.lower() \
+                    and needle not in t.full_name.lower():
                 continue
             if exclude_compiler_generated and (
                 t.name.startswith("<") or "<>" in t.name

@@ -100,12 +100,163 @@ def first_name(payload: dict) -> str:
     return str(it.get("full_name") or it.get("name") or "")
 
 
+def check_concurrency() -> None:
+    """并发安全（**不需要样本**，永远会跑）。
+
+    为什么必须有这一节：`cap_results` 是**进程级单例**（`state.py`），而
+    `server.py` 的 `_install_event_loop_guard()` 把经 MCP 分发的同步工具
+    offload 到 `asyncio.to_thread` —— 于是多个工具调用**真的会并发**
+    读写同一个 `ResultStore`。没有锁时有两种偶发故障：
+      · `self._counter += 1` 是读-改-写，两个线程可能拿到同一个序号
+        → **两个不同的结果集共用一个句柄**（翻页时读到别人的数据）；
+      · `put()` 里「淘汰最旧」的 `next(iter(...))` + `del` 可能撞上另一个
+        线程改字典 → `RuntimeError: dictionary changed size during iteration`。
+    两者都「偶发且结果看着正常」，只能靠并发压测暴露。
+    """
+    import threading                                        # noqa: E402
+    from gamemod_mcp.engine.index import (                  # noqa: E402
+        ResultStore, QueryResult, list_source,
+    )
+
+    section("5. 并发安全：工具被 offload 到线程池后，句柄表不许串号")
+
+    store = ResultStore(owner="conc", max_entries=100000)
+    got: list[str] = []
+    errs: list[str] = []
+    _barrier = threading.Barrier(8)
+
+    def _hammer(n: int) -> None:
+        try:
+            _barrier.wait(timeout=10)      # 尽量让 8 条线程同时冲进 put()
+            for i in range(300):
+                qr = store.put("classes", list_source([{"n": n * 1000 + i}]))
+                got.append(qr.handle)
+        except Exception as exc:                                # noqa: BLE001
+            errs.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=_hammer, args=(k,), daemon=True)
+               for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    check("8 线程 × 300 次登记没有抛异常（字典在迭代中被改会 RuntimeError）",
+          not errs, f"{errs[:2]}" if errs else f"共登记 {len(got)} 次")
+    check("并发登记了 2400 次，条数与调用次数一致",
+          len(got) == 8 * 300, f"{len(got)} vs {8 * 300}")
+    dup = len(got) - len(set(got))
+    check("**句柄完全不重号**（重号 = 两个结果集共用一个句柄）",
+          dup == 0, f"重复 {dup} 个" if dup else f"{len(set(got))} 个唯一句柄")
+    check("每次登记拿到的句柄都能查回自己的结果集",
+          all(store.get(h) is not None for h in got[:50]), "抽查前 50 个")
+    check("条目数被上限约束（淘汰真的在生效）",
+          len(store.handles()) == len(got),
+          f"{len(store.handles())} 条")
+
+    # ---- 非空转反证（**确定性的**，不靠压测碰运气）
+    #
+    # 如实说明：上面那 2400 次并发**没有**复现出重号。CPython 有 GIL，
+    # 字典操作本身是原子的，`self._counter += 1` 在实践中很难被打断 ——
+    # 所以「压测必出重号」这种反证在本运行时上**不可靠**，写成断言会变成
+    # 偶发红。这里改成**与调度时机无关**的判据：
+    # 让另一个线程先占住锁，再调方法 —— 持锁的实现必然**阻塞**，
+    # 不持锁的必然**立刻返回**。两个方向都可判。
+    import time as _time                                   # noqa: E402
+
+    class _NoLockStore(ResultStore):
+        """复刻**修复前**的写法：四个方法全部不持锁。"""
+
+        def put(self, kind, source):                        # type: ignore[override]
+            self._counter += 1
+            handle = f"{self._prefix}{kind}-{self._counter}"
+            qr = QueryResult(handle=handle, kind=kind, source=source)
+            self._items[handle] = qr
+            while len(self._items) > self._max:
+                oldest = next(iter(self._items))
+                del self._items[oldest]
+            return qr
+
+        def get(self, handle):                              # type: ignore[override]
+            return self._items.get(handle)
+
+        def handles(self):                                  # type: ignore[override]
+            return list(self._items)
+
+        def clear(self):                                    # type: ignore[override]
+            self._items.clear()
+
+    def _finished_while_lock_held(target: ResultStore, op: str) -> bool:
+        """锁被占住时调 `op`：提前返回 True（= 没持锁），阻塞则 False。"""
+        done = threading.Event()
+        started = threading.Event()
+
+        def _call() -> None:
+            started.set()
+            if op == "put":
+                target.put("classes", list_source([{"n": 1}]))
+            elif op == "get":
+                target.get("whatever")
+            elif op == "handles":
+                target.handles()
+            else:
+                target.clear()
+            done.set()
+
+        th = threading.Thread(target=_call, daemon=True)
+        with target._lock:                 # 主线程先占住锁
+            th.start()
+            started.wait(timeout=2)
+            early = done.wait(timeout=0.5)
+        done.wait(timeout=2)               # 放锁后必须能完成（否则是死锁）
+        return early
+
+    locked_store = ResultStore(owner="lockprobe", max_entries=10)
+    for op in ("put", "get", "handles", "clear"):
+        check(f"`{op}()` 真的持有锁（锁被占住时会阻塞）",
+              not _finished_while_lock_held(locked_store, op),
+              "持锁 → 阻塞；不持锁 → 会立刻返回")
+
+    free_store = _NoLockStore(owner="nolock", max_entries=10)
+    for op in ("put", "get", "handles", "clear"):
+        check(f"反证：旧写法（不持锁）的 `{op}()` 在锁被占住时**照样返回**",
+              _finished_while_lock_held(free_store, op),
+              "证明上面四条测的确实是「有没有持锁」，不是恒真")
+
+    check("锁是**可重入**的（RLock：将来只读方法在持锁路径上被重入不会死锁）",
+          type(locked_store._lock).__name__ == "RLock",
+          f"{type(locked_store._lock).__name__}")
+
+    # 容量：默认 128（§11.3 —— 原为 32，几次搜索就把旧句柄挤掉）
+    check("默认句柄容量已扩到 128（原 32：一次新搜索就能挤掉旧句柄）",
+          ResultStore(owner="cap")._max == 128,
+          f"默认 {ResultStore(owner='cap')._max}")
+    _ev = ResultStore(owner="evict", max_entries=3)
+    _handles = [_ev.put("classes", list_source([{"n": i}])).handle
+                for i in range(5)]
+    check("淘汰行为仍正确（上限 3 时塞 5 条，最旧的两条查不到）",
+          _ev.get(_handles[0]) is None and _ev.get(_handles[1]) is None
+          and _ev.get(_handles[4]) is not None,
+          f"留下的 = {[h.split('-')[-1] for h in _ev.handles()]}")
+
+    S.close_session(close_runtime=False)
+
+
 def main() -> int:
+    # 并发那一节**不需要样本**，先跑 —— 否则样本缺失时会连它一起被跳过，
+    # 而它恰恰是本轮新增的、最需要长期保护的断言。
+    check_concurrency()
+
     il2cpp = samples.find_il2cpp()
     mono = samples.find_mono()
     if not samples.require(il2cpp, "IL2CPP 样本") or not samples.require(mono, "Mono 样本"):
         print("两个样本缺一不可（要跨游戏才谈得上句柄作用域）")
-        return 0
+        print()
+        print("=" * 78)
+        print(f"\u26a0\ufe0f  通过 {PASS} 项，失败 {FAIL} 项（跨游戏部分**无法验证**，"
+              f"未假装通过）")
+        print("=" * 78)
+        return 1 if FAIL else 0
 
     section("1. 跨游戏：旧句柄必须被拒绝，而不是读到新游戏的数据")
 

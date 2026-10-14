@@ -39,14 +39,20 @@ except Exception:
 
 from gamemod_mcp.engine.index import Index                # noqa: E402
 
-_IL2CPP_GAME = samples.find_il2cpp()
+_IL2CPP_GAME = samples.find_il2cpp_any()   # 规范样本不在时退用任意受支持的 IL2CPP
 _MONO_GAME = samples.find_mono()
 IL2CPP_META = (_IL2CPP_GAME / "Garden of Witches_Data" / "il2cpp_data"
                / "Metadata" / "global-metadata.dat") if _IL2CPP_GAME else None
+if IL2CPP_META is not None and not Path(IL2CPP_META).is_file():
+    # `find_il2cpp_any` 给的是**别的** IL2CPP 游戏，目录结构不同 ——
+    # 直接按 `<game>/*_Data/il2cpp_data/Metadata/global-metadata.dat` 找。
+    IL2CPP_META = next(iter(sorted(
+        _IL2CPP_GAME.glob("*_Data/il2cpp_data/Metadata/global-metadata.dat"))),
+        None)
 MONO_ASM = (_MONO_GAME / "Archon Soul_Data" / "Managed"
             / "Assembly-CSharp.dll") if _MONO_GAME else None
 
-HAVE_IL2CPP = samples.require(IL2CPP_META, "IL2CPP 元数据 Garden of Witches")
+HAVE_IL2CPP = samples.require(IL2CPP_META, "IL2CPP 元数据（规范样本或任意受支持的）")
 HAVE_MONO = samples.require(MONO_ASM, "Mono 程序集 Archon Soul")
 
 PASS = 0
@@ -228,6 +234,52 @@ def probe(tag: str, meta_path: Path, cache: Path, is_il2cpp: bool) -> None:
             check(f"{base} limit={limit}", got == want,
                   f"{len(got)} 条，顺序一致" if got == want
                   else f"长度 {len(got)} vs {len(want)}")
+
+    # ---------------------------------------------- 6. search_types 认嵌套名
+    print()
+    print("  -- 6. `search_types` 必须同时认 `full_name` 与 `nested_name` --")
+    # 嵌套类型在元数据里 namespace 为空、只有短名：`full_name` == 短名，
+    # 而 `nested_name` 才是能唯一定位的限定名（`Outer.Inner`）。
+    # 只匹配 full_name 时 `search_classes("Outer.Inner")` 会**搜不到** ——
+    # 而 `class_detail` / `runtime_class_info` 到处都在教调用方用 nested_name。
+    # mono_meta 一直是两个都试；IL2CPP 侧本轮才对齐（原先只试 full_name）。
+    # 排除编译器生成的类型（`<>c` / `<...>d__N`）：`search_types` 默认就把它们
+    # 过滤掉（`exclude_compiler_generated=True`），拿它们当样例会误判成
+    # 「搜不到」——那是过滤规则生效，不是嵌套名匹配坏了。
+    nested = next((t for t in meta.types
+                   if t.nested_name and t.nested_name.endswith("." + t.name)
+                   and t.nested_name != t.full_name
+                   and not _compiler_generated(t.name)), None)
+    if nested is None:
+        check("样本里存在真正的嵌套类型（该断言的前提）", False,
+              "找不到 nested_name != full_name 的类型", warn_only=True)
+    else:
+        name = nested.nested_name
+        print(f"     样例嵌套类型：nested_name={name!r} "
+              f"full_name={nested.full_name!r}")
+        # 真值：只按 full_name 匹配会命中几条（复刻**修复前**的判据）
+        old_hits = [t for t in meta.types
+                    if name.lower() in t.full_name.lower()
+                    and not _compiler_generated(t.name)]
+        new_hits = [t for t in meta.types
+                    if (name.lower() in (t.nested_name or "").lower()
+                        or name.lower() in t.full_name.lower())
+                    and not _compiler_generated(t.name)]
+        check("反证前提：只按 full_name 匹配**搜不到**这个嵌套名",
+              not old_hits,
+              f"旧判据命中 {len(old_hits)} 条（应为 0，否则这条断言没意义）")
+        check("修复后按嵌套名能搜到（nested_name 参与匹配）",
+              any(t.nested_name == name for t in new_hits),
+              f"命中 {len(new_hits)} 条")
+        got = meta.search_types(name, limit=50)
+        check("`search_types(nested_name)` 返回了该类型",
+              any(t.nested_name == name for t in got),
+              f"返回 {len(got)} 条，首条 "
+              f"{got[0].nested_name if got else None!r}")
+        # 短名照旧要能搜到（别把原有行为改坏）
+        check("按短名仍然能搜到（原有行为未改坏）",
+              bool(meta.search_types(nested.name, limit=50)),
+              f"短名 {nested.name!r}")
 
     idx.close()
 

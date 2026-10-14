@@ -427,7 +427,7 @@ GameModMCP/
 
 ## 可信度：怎么证明它是对的
 
-这个项目**不靠「看起来能跑」**。`devtools/` 下有 51 个可复现的验证脚本，
+这个项目**不靠「看起来能跑」**。`devtools/` 下有 52 个可复现的验证脚本，
 每个都对着**真实游戏**和**地面真值**跑（其中 43 个进自动套件，
 `verify_tool_coverage.py` 是静态导航图、不是门禁，故不参加）：
 
@@ -480,7 +480,8 @@ GameModMCP/
 | `verify_merged_tools.py` | 合并后的工具：参数区分而不是各留一个 |
 | `verify_agent_js.py` | Frida 探针能编译、能加载、能 ping |
 | `verify_tool_inventory.py` | 文档与代码的工具清单、脚本清单一致 |
-| `verify_tool_annotations.py` | 45 个工具的**语义标注**：危险工具必须声明 `destructiveHint` |
+| `verify_tool_annotations.py` | 全部工具的**语义标注**：危险工具必须声明 `destructiveHint`；`drain_events` / `gc_control` 按《交接与评审说明书》§11.2 / §11.4 的取舍标注（含「drain_events 与 eval_script 必须能被客户端区分开」的反证对照） |
+| `verify_runtime_matrix_inventory.py` | **多游戏矩阵的工具清单对账必须阻断**：`report_runtime_matrix.py` 的 `ALL_TOOLS` 与服务器实际报出的工具双向一致，且**不一致时真的判失败**（历史缺陷：该脚本漏了七个工具却只打一句警告，于是报告声称「逐名核对一致」而那七个从未被验证过）。含「删一个 / 加一个 / 服务器报 0 个」三种反证、三张分组的包含关系、以及每个工具都有执行阶段（不许出现「⬜ 没跑到」） |
 | `verify_tool_coverage.py` | 静态扫「哪个工具没人写测试」（导航图，**会高估**） |
 | `verify_debug_ui.py` | **人工调试前端与调用流水**：日志坏路径不许拖累业务（含非空转反证）、前端工具目录与 MCP 协议及 `server.py` 分层**三方对账**、**跨进程** stdio 客户端（模拟 AI）与前端落进同一份流水、文件轮转不许无界增长、旁路不改工具实现 |
 | `verify_encoding_console.py` | 验收脚本在 GBK 控制台不崩 |
@@ -555,14 +556,19 @@ python devtools\report_runtime_matrix.py      # 运行时：真的启动/注入/
 | 协议面 | 实测 | 结论 |
 |---|---|---|
 | `notifications/progress` | 客户端调工具时只传 `{signal, timeout}`，**从不传 `onprogress`** → 请求里没有 `progressToken` → `report_progress` 是静默 no-op；而且它是 `async`，同步工具根本调不了 | 不做 |
-| `notifications/cancelled` | 客户端**确实**会传取消信号，但服务器这一侧够不着：FastMCP 对同步工具是**内联调用**（`return fn(...)`，不开线程），事件循环被占满，连取消通知都读不到 | 不做 |
+| `notifications/cancelled` | 客户端**确实**会传取消信号，但服务器这一侧够不着：`RequestContext` 没有任何取消字段、`Context` 也没有 `cancelled`；而且同步工具**拿不到 `context`**（本项目的工具体都不接受 `ctx` 参数），所以取消通知即便读到了也没有承接方 | 不做 |
 | `notifications/message`（MCP logging） | 同样只有通用 SDK 里有，没有任何客户端包消费 | 不做 |
 | tasks 扩展（`taskSupport`） | 客户端桥**直接抛错**：`requires task-based execution, which this bridge does not support` | 不做（声明 `required` 会主动弄坏） |
 
-**代价是诚实的**：一个 60 秒的 `launch_game` 期间，这个服务器什么都干不了
-（同步工具占着事件循环），用户在客户端上只能看着转圈。
-要改就得把三个长任务改成 `async` + `anyio.to_thread.run_sync` 包一层 ——
-那是结构性改造，而协议那头的收益恰好是没人消费的。
+> **订正（旧文案已过时）**：本表曾写「FastMCP 对同步工具是**内联调用**、
+> 事件循环被占满，连取消通知都读不到」，并据此说「60 秒的 `launch_game` 期间
+> 服务器什么都干不了」。**这两句现在都不成立**：`server.py` 的
+> `_install_event_loop_guard()` 早已把经 MCP 分发的同步工具 offload 到线程池
+> （`ToolManager.call_tool` → `asyncio.to_thread`），并实测慢调用在飞时
+> `get_session` **10/10 次秒回**（见《重启验证报告-第二轮》§4 与
+> `devtools/verify_report_fixes.py`）。
+> 「不做取消」的结论**不变**，但理由换成了上面那条：**结构上够不着**
+> ——同步工具体拿不到 `context`，没有取消的承接方。
 
 这三条依据由 `devtools/verify_mcp_context.py` 钉住：**变了就报红**，
 提醒重读判断，而不是让断言变绿。

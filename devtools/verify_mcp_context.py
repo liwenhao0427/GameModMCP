@@ -10,10 +10,18 @@
 | 协议面 | 客户端（DSH）实测 | 服务器这一侧为什么也够不着 | 结论 |
 |---|---|---|---|
 | `notifications/progress` | `dsh-mcp-client` 调工具时只传 `{signal, timeout, toolDefinition}`，**从不传 `onprogress`** → 请求里没有 `progressToken` | 无 token 时 `Context.report_progress` 直接 `return`（第 2 节实测：**0 条通知**）；且它是 `async`，同步工具根本调不了 | ❌ 不做 |
-| `notifications/cancelled` | 客户端**确实**会传 `AbortSignal`，协议面通 | 但 `RequestContext` **没有任何取消字段**，`Context` 也没有 `cancelled`；更根本的是 FastMCP 对同步工具是**内联直接调用**（`return fn(...)`，不开线程、不 await）→ 事件循环被占满，连那条取消通知都读不到 | ❌ 不做 |
+| `notifications/cancelled` | 客户端**确实**会传 `AbortSignal`，协议面通 | 但 `RequestContext` **没有任何取消字段**，`Context` 也没有 `cancelled`；而且本项目的工具体**都不接受 `ctx` 参数** → 取消通知即便读到也没有承接方（**结构上够不着**） | ❌ 不做 |
 | `notifications/message`（MCP logging） | 同样只有通用 SDK 里有，**没有任何 `dsh-*` 包消费** | —— | ❌ 不做 |
-| tasks 扩展（`taskSupport`） | `dsh-mcp-client` 的桥**直接抛错**：`Tool "x" requires task-based execution, which this bridge does not support` | 我们的 38 个工具都没声明 `execution` | ❌ 不做（声明 `required` 会**主动弄坏**） |
+| tasks 扩展（`taskSupport`） | `dsh-mcp-client` 的桥**直接抛错**：`Tool "x" requires task-based execution, which this bridge does not support` | 本项目的工具都没声明 `execution` | ❌ 不做（声明 `required` 会**主动弄坏**） |
 
+> **订正**：上表 `cancelled` 那一行原来写的是「FastMCP 对同步工具是内联
+> 直接调用 → 事件循环被占满，连取消通知都读不到」。**那句已过时**：
+> `server.py` 的 `_install_event_loop_guard()` 现在把同步工具 offload 到
+> 线程池（`asyncio.to_thread`），慢调用期间 `get_session` 实测 10/10 秒回。
+> 「不做取消」的结论不变，理由改成上表那条（缺 `ctx` 承接方）。
+> 第 3 节仍断言 `server.py` 里没有 `Context` —— 那条**依然成立且正是**
+> 这个结论的依据。
+>
 > 四条合起来是同一个结论：**协议支持 ≠ 有人消费**，
 > 与 P2-1（`outputSchema`）、P2-2（`prompts`）是同一套判断方式。
 
@@ -149,7 +157,7 @@ def main() -> int:
     tools = asyncio.run(S.mcp.list_tools())
 
     # ------------------------------------------------- 1. 决策现状
-    section("1. 决策现状：38 个工具一个都不碰 Context（这行断言是防漂移的）")
+    section("1. 决策现状：全部工具一个都不碰 Context（这行断言是防漂移的）")
 
     check(f"工具数仍是 {EXPECTED_TOOLS}", len(tools) == EXPECTED_TOOLS,
           f"实际 {len(tools)}")
@@ -162,8 +170,10 @@ def main() -> int:
     ctx_params = _tools_with_ctx_param()
 
     check("没有任何工具吃 ctx / Context 参数", not ctx_params,
-          f"吃到的是 {ctx_params}" if ctx_params else "38 个全是纯参数工具")
-    check("38 个工具全是同步函数（这决定了第 3 节的结论）", not async_tools,
+          f"吃到的是 {ctx_params}" if ctx_params
+          else f"{len(tools)} 个全是纯参数工具")
+    check(f"{len(tools)} 个工具全是同步函数（这决定了第 3 节的结论）",
+          not async_tools,
           f"异步的有 {async_tools}" if async_tools
           else "FastMCP 对同步工具走 `return fn(...)`，见第 3 节")
 
@@ -174,7 +184,8 @@ def main() -> int:
           "要重新考虑 P2-3，第一步就得先把这个词引进来")
 
     declared = [t.name for t in tools if getattr(t, "execution", None) is not None]
-    check("38 个工具都没有声明 execution（即没有 taskSupport）", not declared,
+    check(f"{len(tools)} 个工具都没有声明 execution（即没有 taskSupport）",
+          not declared,
           f"声明了的是 {declared}" if declared else "一个都没有")
 
     # ------------------------------------------------- 2. 进度
