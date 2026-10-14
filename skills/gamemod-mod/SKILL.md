@@ -612,9 +612,11 @@ wait_for(kind="ocr", target="开始游戏", region="0,600,1280,200",
 verify_state(checks=r"log=D:\Game\BepInEx\LogOutput.log#已修改 精核,"
                     r"ocr=精核")
 # → {verdict: "pass"|"fail"|"unverifiable",
-#    verdict_reason: "2/2 条成立，达到要求的 2 条独立证据",
+#    verdict_reason: "2/2 条成立，来自 2 条**互相独立**的信号通道"
+#                    "（log, ocr），达到要求的 2 条独立证据",
 #    evidence: [{check, hit, detail}, ...],     ← 每条各自的依据
-#    independent_count: 2, require_independent: 2}
+#    independent_count: 2, independent_kinds: ["log", "ocr"],
+#    require_independent: 2}
 ```
 
 `checks` 的写法（与 `wait_for` **共用同一套条件语义**，所以两处结论必然一致）：
@@ -627,13 +629,23 @@ verify_state(checks=r"log=D:\Game\BepInEx\LogOutput.log#已修改 精核,"
 | `field=<类>.<字段>=<期望值>` | 该字段当前等于期望值 |
 | `instances=<类>>=<最小个数>` | 该类活实例数达到下限 |
 
+> **分隔符是等号**（`kind=参数`），不是冒号。另外 `field=` / `instances=`
+> 里的类名可以整段写（含命名空间、或**完整嵌套名** `Outer.Inner`）——
+> 探针的 class 解析会统一处理，不需要你自己拆命名空间。
+
 **三态与「证据不足」**（这是它最有价值的地方）：
 
 | `verdict` | 含义 | 该怎么办 |
 |---|---|---|
-| `pass` | 成立条数 ≥ `require_independent`（默认 2） | 继续 |
-| `fail` | 判了、没达到（含**只有 1 条成立**） | 看 `evidence`，补一条**独立**来源 |
+| `pass` | 成立条数 ≥ `require_independent`，**且来自 ≥ 这么多条不同通道** | 继续 |
+| `fail` | 判了、没达到（**只有 1 条成立**，或**多条全是同一通道**） | 看 `evidence`，补一条**独立**来源 |
 | `unverifiable` | **没法判**（如引擎不支持枚举实例） | 换判据，**别去改 Mod** |
+
+> ⚠️ **同通道不算独立证据。** `independent_count` 数的是**成立的通道种类数**
+> （按 `kind` 去重），不是成立的条数。所以
+> `checks="ocr=精核,ocr=108"` 虽然两条都成立，但它们是**同一张截图**上的
+> 两条断言 —— 一起对、也会一起错，判 `fail` 并说明「同源，缺独立第 2 通道」。
+> 想要 `pass` 就得凑**不同来源**：日志 + OCR、日志 + 字段、字段 + 窗口……
 
 **单条证据**时它会明确报 `证据不足，不判通过` —— 这不是缺陷，是设计。
 

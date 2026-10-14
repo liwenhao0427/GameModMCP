@@ -304,6 +304,17 @@ if t is not None:
     for must in ("kind", "timeout_ms", "interval_ms", "target", "pattern"):
         check(f"schema 暴露参数 {must}", must in props)
 
+# ---- 文档文案必须与实际参数名一致（说了话不干活 / 说错话引错路）
+# `log` 的日志路径参数叫 `target`，docstring 里曾写「必须同时给 path」——
+# 那是个**不存在的参数**，Agent 照做只会得到「必须给 path」式的困惑。
+_doc = t.description if t is not None else ""
+check("wait_for docstring 里 log 的路径参数说 `target`",
+      "必须同时给 `target`" in _doc, "（旧文案写的是 path）")
+check("wait_for docstring 不再提「必须同时给 path」",
+      "必须同时给 `path`" not in _doc)
+check("wait_for 的 schema 里确实**没有** path 参数（说明旧文案指的是"
+      "不存在的参数）", "path" not in props, f"props={sorted(props)}")
+
 # ================================================================
 section("8. 非空转反证：把语义改回旧写法，断言必须报红")
 

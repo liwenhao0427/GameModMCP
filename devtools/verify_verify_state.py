@@ -114,19 +114,68 @@ check("passed/total 如实报 1/1",
       f"{r1.get('passed')}/{r1.get('total')}")
 
 # ================================================================
-section("3. 达到独立证据数才 pass")
+section("3. 达到独立证据数才 pass（**必须是不同通道**）")
 
-r2 = _RAW(checks=f"log={log_hit}#已修改 精核,log={log_hit}#启动完成",
-          require_independent=2)
-check("2 条都成立 + require=2 → pass", r2.get("verdict") == "pass",
-      f"verdict={r2.get('verdict')!r}")
-check("ok=True", r2.get("ok") is True)
-check("independent_count == 2", r2.get("independent_count") == 2,
-      f"={r2.get('independent_count')}")
+# 2 条 **同通道**（都是 log=）不构成「互相独立」：它们读同一个日志文件，
+# 一起对、也会一起错。所以这里**故意**用两条 log 作对照，
+# 它必须判 fail 而不是 pass（见第 3b 节的同通道专门断言）。
+r_same = _RAW(checks=f"log={log_hit}#已修改 精核,log={log_hit}#启动完成",
+              require_independent=2)
+check("两条**同通道**（log+log）全成立 → **fail**（不是 pass）",
+      r_same.get("verdict") == "fail", f"verdict={r_same.get('verdict')!r}")
+check("理由点明「同源 / 缺独立第 2 通道」",
+      "同源" in str(r_same.get("verdict_reason", ""))
+      or "独立第 2 通道" in str(r_same.get("verdict_reason", "")),
+      str(r_same.get("verdict_reason"))[:90])
+check("passed=2 但 independent_count=1（条数 != 通道数）",
+      r_same.get("passed") == 2 and r_same.get("independent_count") == 1,
+      f"passed={r_same.get('passed')} "
+      f"independent={r_same.get('independent_count')}")
+
+# 真正的双通道：log（真读文件）+ window（走另一条实现）。
+# 假屏幕模块只覆盖 `find_window_rect` / `ocr` —— **其余属性原样继承真实模块**
+# （`probe_log` 也走 `_screen_mod().read_log`，整体替换会把 log 通道一起弄坏）。
+import types                                              # noqa: E402
+
+_orig_screen_mod = getattr(S, "_screen_mod", None)
+_real_screen = S._screen_mod()
+
+
+def _make_fake_screen(window_hit: bool, ocr_hit: bool) -> types.ModuleType:
+    """造一个假屏幕模块：只覆盖窗口/OCR 判定，其余转给真实模块。"""
+    fake = types.ModuleType("fake_screen")
+    fake.__dict__.update(_real_screen.__dict__)
+    fake.find_window_rect = (
+        (lambda t: {"ok": True, "title": str(t)}) if window_hit
+        else (lambda t: {"ok": False, "error": "stub: 没有这个窗口"}))
+    fake.ocr = (
+        (lambda **kw: {"ok": True, "matched_count": 1,
+                       "texts": [{"text": str(kw.get("expected") or "")}]})
+        if ocr_hit else
+        (lambda **kw: {"ok": True, "matched_count": 0, "texts": []}))
+    return fake
+
+
+S._screen_mod = lambda: _make_fake_screen(True, False)
+try:
+    r_multi = _RAW(checks=f"log={log_hit}#已修改 精核,window=SomeWindow",
+                   require_independent=2)
+finally:
+    if _orig_screen_mod is not None:
+        S._screen_mod = _orig_screen_mod
+
+check("两条**不同通道**（log+window）全成立 → pass",
+      r_multi.get("verdict") == "pass", f"verdict={r_multi.get('verdict')!r}")
+check("independent_count == 2（两个不同 kind）",
+      r_multi.get("independent_count") == 2,
+      f"={r_multi.get('independent_count')}")
+check("independent_kinds 如实列出是哪两种通道",
+      set(r_multi.get("independent_kinds") or []) == {"log", "window"},
+      f"{r_multi.get('independent_kinds')}")
 
 r3 = _RAW(checks=f"log={log_hit}#已修改 精核,log={log_miss}#绝不存在XYZ",
           require_independent=2)
-check("1 条成立 + 1 条不成立 → fail（不是 pass）",
+check("两条 log、1 条成立 → fail（不是 pass）",
       r3.get("verdict") == "fail", f"verdict={r3.get('verdict')!r}")
 check("此时**不是** unverifiable（因为有一条明确判了不成立）",
       r3.get("verdict") != "unverifiable")
@@ -138,6 +187,57 @@ r4 = _RAW(checks=f"log={log_miss}#绝不存在XYZ", require_independent=2)
 check("0 条成立 → fail，理由说 0 条", r4.get("verdict") == "fail"
       and "0/" in str(r4.get("verdict_reason", "")),
       str(r4.get("verdict_reason"))[:60])
+
+# ================================================================
+section("3b. **同通道不得提升为 pass**（本轮新增的核心修正）")
+
+# 这是本轮修的缺陷：原来 `independent_count = passed`，于是
+# `checks="ocr=精核,ocr=108"` 这种**同一张截图上的两条 ocr** 会被算成
+# 2 条独立证据 —— 直接把「单条证据不得静默提升」这条契约架空。
+# 两条 ocr 一起对（同一张图）、也会一起错（界面没加载完时同时不成立）。
+_fake_ocr_hit = _make_fake_screen(False, True)
+S._screen_mod = lambda: _fake_ocr_hit
+try:
+    r_ocr2 = _RAW(checks="ocr=精核,ocr=108", require_independent=2)
+finally:
+    if _orig_screen_mod is not None:
+        S._screen_mod = _orig_screen_mod
+
+check("双 ocr=（同通道）全成立 → **fail**，不许当 2 条独立证据",
+      r_ocr2.get("verdict") == "fail", f"verdict={r_ocr2.get('verdict')!r}")
+check("passed 如实报 2（两条确实都成立了）",
+      r_ocr2.get("passed") == 2, f"passed={r_ocr2.get('passed')}")
+check("independent_count 只算 1（同一种通道）",
+      r_ocr2.get("independent_count") == 1,
+      f"independent={r_ocr2.get('independent_count')}")
+check("理由说明「同源 → 缺独立第 2 通道」",
+      "同源" in str(r_ocr2.get("verdict_reason", "")),
+      str(r_ocr2.get("verdict_reason"))[:90])
+check("ok=False（与 verdict 一致）", r_ocr2.get("ok") is False)
+
+# 非空转反证：旧写法（`independent_count = passed`）下，同一组双 ocr 会成为
+# pass —— 这里用**行为对照**证明修复真的改变了结论，而不是断言恒真。
+_old_independent = r_ocr2.get("passed")          # 旧写法：独立数 == 成立条数
+_old_verdict = ("pass" if _old_independent >= 2 else "fail")
+check("反证：旧写法（independent_count = passed）会把双 ocr 判成 pass",
+      _old_verdict == "pass",
+      f"旧判据下 independent_count={_old_independent} → {_old_verdict}")
+check("新写法对同一输入的结论**不同**（说明修复不是空转）",
+      _old_verdict != r_ocr2.get("verdict"),
+      f"旧={_old_verdict} 新={r_ocr2.get('verdict')}")
+
+# 行为对照：同一组 checks 在 require=1 时 pass，说明 fail 的原因是通道数
+S._screen_mod = lambda: _fake_ocr_hit
+try:
+    r_ocr2_1 = _RAW(checks="ocr=精核,ocr=108", require_independent=1)
+finally:
+    if _orig_screen_mod is not None:
+        S._screen_mod = _orig_screen_mod
+check("同一组双 ocr 在 require=1 下 pass（证明 fail 的原因是通道数，"
+      "不是条件判不出来）",
+      r_ocr2_1.get("verdict") == "pass" and r_ocr2.get("verdict") == "fail",
+      f"require=1 → {r_ocr2_1.get('verdict')}，"
+      f"require=2 → {r_ocr2.get('verdict')}")
 
 # ================================================================
 section("4. require_independent 真的影响行为（收了参数就要起作用）")
@@ -159,7 +259,7 @@ check("require=0 被抬到 1（不允许「零证据即通过」）",
 # ================================================================
 section("5. evidence 逐条可核查（每条都说清依据）")
 
-for label, res in (("单条", r1), ("双条", r2)):
+for label, res in (("单条", r1), ("双通道", r_multi)):
     ev = res.get("evidence") or []
     check(f"{label}：evidence 条数与 total 一致",
           len(ev) == res.get("total"), f"{len(ev)} vs {res.get('total')}")
@@ -167,8 +267,12 @@ for label, res in (("单条", r1), ("双条", r2)):
           all("check" in e and "hit" in e and "detail" in e for e in ev))
 check("命中条目的 detail 里有 matched_count（可核查）",
       any((e.get("detail") or {}).get("matched_count") is not None
-          for e in (r2.get("evidence") or [])),
-      f"{[e.get('detail') for e in (r2.get('evidence') or [])]}")
+          for e in (r_multi.get("evidence") or [])),
+      f"{[e.get('detail') for e in (r_multi.get('evidence') or [])]}")
+check("命中条目的 detail 里有 window_found（可核查）",
+      any("window_found" in (e.get("detail") or {})
+          for e in (r_multi.get("evidence") or [])),
+      f"{[e.get('detail') for e in (r_multi.get('evidence') or [])]}")
 
 # ================================================================
 section("6. 与 wait_for 同源的语义（避免同一条件两处结论不一致）")
@@ -183,6 +287,195 @@ _r_wait_like = S.RAW_TOOLS["probe_log"](path=log_hit, pattern="已修改 精核"
 check("probe_log 能独立给出当前匹配数（verify_state 的 log 判据基础）",
       (_r_wait_like.get("matched_count") or 0) >= 1,
       f"matched={_r_wait_like.get('matched_count')}")
+
+# ================================================================
+section("6b. 报错提示不能把调用方引向**不被接受**的写法")
+
+# 校验的是 `=`，提示就**必须**说 `=`。原来校验 "=" 却报「应是 kind:参数」，
+# 于是 Agent 照着提示改成冒号 → 仍然报错 → 在「照提示改」与「还报错」
+# 之间死循环。提示与校验必须一致，这条把它钉死。
+r_bad = _RAW(checks="没有等号的条目")
+_ev0 = (r_bad.get("evidence") or [{}])[0]
+_err_txt = str(_ev0.get("error", ""))
+check("缺 = 的条目报错里说的是 `=`（不是 `:`）",
+      "kind=参数" in _err_txt or "等号" in _err_txt, _err_txt[:90])
+check("报错不再诱导冒号写法（旧文案是 kind:参数）",
+      "kind:参数" not in _err_txt, _err_txt[:90])
+# 提示文案不能只说「用等号」却仍留着冒号示范 —— 两种写法对照检查
+check("docstring 里的写法说明也用 `=`",
+      "kind=参数" in (_RAW.__doc__ or ""),
+      "（docstring 与报错同一个口径）")
+
+# ================================================================
+section("6c. 嵌套类名必须**整体**交给探针，不能按最后一个点号拆")
+
+# 违反 AGENTS.md / SKILL.md 的规则：IL2CPP 里嵌套类型的 namespace 是**空**的、
+# 只有短名，所以 `Outer.Inner` 拆成 namespace="Outer" / name="Inner" 会解析失败。
+# 这里拦在**参数传递**这一层（不注入游戏）：看 field/instances 分支交给
+# `_eval_condition` 的 kw 是什么。
+_seen_kw: list[dict] = []
+_orig_eval = S._eval_condition
+
+
+def _spy_eval(kind, **kw):
+    _seen_kw.append({"kind": kind, **kw})
+    return {"hit": False, "detail": {}, "error": "", "unverifiable": "",
+            "baseline": None}
+
+
+S._eval_condition = _spy_eval
+try:
+    _RAW(checks="field=Outer.Inner.SomeField=7")
+    _RAW(checks="instances=Outer.Inner>=2")
+finally:
+    S._eval_condition = _orig_eval
+
+
+def _spy_for(kind_want: str) -> dict:
+    return next((k for k in _seen_kw if k["kind"] == kind_want), {})
+
+
+# 注：`field=<类>.<字段>=<值>` 里最后一段是**字段名**，所以
+# `Outer.Inner.SomeField` 的「类」部分是 `Outer.Inner`。
+_f = _spy_for("field")
+check("field 分支把完整类名交给 name，namespace 留空",
+      _f.get("name") == "Outer.Inner" and _f.get("namespace") == "",
+      f"name={_f.get('name')!r} namespace={_f.get('namespace')!r}")
+check("field 分支的字段名仍被正确切出来",
+      _f.get("field") == "SomeField", f"field={_f.get('field')!r}")
+_i = _spy_for("instances")
+check("instances 分支把完整类名交给 name，namespace 留空",
+      _i.get("name") == "Outer.Inner" and _i.get("namespace") == "",
+      f"name={_i.get('name')!r} namespace={_i.get('namespace')!r}")
+# 反证：旧写法会把 `Outer.Inner` 拆成 ns=Outer / name=Inner —— 对照一下
+_old_ns, _old_short = "Outer.Inner".rsplit(".", 1)
+check("反证：旧写法会拆成 namespace=Outer / name=Inner（这就是缺陷）",
+      _old_ns == "Outer" and _old_short == "Inner"
+      and not (_f.get("name") == _old_short and _f.get("namespace") == _old_ns),
+      f"旧拆法 {( _old_ns, _old_short)}，实际传给探针的"
+      f" {( _f.get('name'), _f.get('namespace'))}")
+
+# 带命名空间的顶层类也必须照常可用（不能被这次改动弄坏）
+_seen_kw.clear()
+S._eval_condition = _spy_eval
+try:
+    _RAW(checks="field=TeamTapas.ProjectR.UserData.gold=9999")
+finally:
+    S._eval_condition = _orig_eval
+_f2 = _spy_for("field")
+check("带命名空间的顶层类整体传给 name（探针自己会解析）",
+      _f2.get("name") == "TeamTapas.ProjectR.UserData"
+      and _f2.get("field") == "gold",
+      f"name={_f2.get('name')!r} field={_f2.get('field')!r}")
+
+# ================================================================
+section("6d. field 分支：不能只看第 0 个实例")
+
+# `find_instances` 会**连派生类一起**返回（liveness 语义如此：实测
+# find_instances("Transform") 拿回的全是 RectTransform）。用基类字段偏移
+# 去读派生类实例可能读错，所以：
+#   ① `class_name` 与本类精确匹配的实例要**排在前面**；
+#   ② 逐个试，任何一个命中 `equals` 就算成立。
+# 原来只取 `ptrs[0]` —— 如果第 0 个是派生类、值不对，明明有实例满足条件
+# 却判成不成立（**假阴性**，会让 Agent 去改一个没坏的 Mod）。
+_orig_fi = S.RAW_TOOLS["find_instances"]
+_orig_rf = S.RAW_TOOLS["read_field_value"]
+#: 指针 → 该实例上字段的实际值
+_VALUES = {"0xPTR_DERIVED": "111", "0xPTR_EXACT": "9999"}
+_READ_ORDER: list[str] = []
+
+
+def _stub_find_instances(**kw):
+    # 故意把**派生类**实例排在前面（这是 liveness 的真实行为）
+    return {"ok": True, "count": 2,
+            "instances": [{"pointer": "0xPTR_DERIVED",
+                           "class_name": "SomeOtherDerived"},
+                          {"pointer": "0xPTR_EXACT",
+                           "class_name": "UserData"}]}
+
+
+def _stub_read_field_value(instance="", **kw):
+    _READ_ORDER.append(instance)
+    return {"ok": True, "read_width": 4, "as_int32": int(_VALUES[instance]),
+            "field_type": "System.Int32"}
+
+
+S.RAW_TOOLS["find_instances"] = _stub_find_instances
+S.RAW_TOOLS["read_field_value"] = _stub_read_field_value
+try:
+    res_field = S._eval_condition("field", name="UserData", field="gold",
+                                  equals="9999")
+finally:
+    S.RAW_TOOLS["find_instances"] = _orig_fi
+    S.RAW_TOOLS["read_field_value"] = _orig_rf
+
+check("field 条件在后一个实例上命中 → hit=True（不再只看第 0 个）",
+      res_field.get("hit") is True, f"hit={res_field.get('hit')}")
+check("命中的是**精确匹配**那个实例（派生类排在前面也找得到）",
+      res_field.get("detail", {}).get("pointer") == "0xPTR_EXACT",
+      f"pointer={res_field.get('detail', {}).get('pointer')}")
+check("精确匹配优先 ⇒ 第 0 个就读到它（tried=1，不必先试派生类）",
+      res_field.get("detail", {}).get("instances_tried") == 1,
+      f"tried={res_field.get('detail', {}).get('instances_tried')}；"
+      f"读取顺序={_READ_ORDER}")
+check("精确匹配的实例被**优先读**（第 1 个读的就是它）",
+      _READ_ORDER[:1] == ["0xPTR_EXACT"],
+      f"读取顺序={_READ_ORDER}")
+check("反证：旧写法（只读第 0 个）会读到 111 → 判不成立",
+      _VALUES["0xPTR_DERIVED"] != "9999",
+      f"第 0 个实例的值={_VALUES['0xPTR_DERIVED']}")
+
+# 另一种情形：**同类多实例**，只有后一个的值符合 —— 必须逐个试到命中为止。
+# 这条专门验「遍历多个实例」，与上面的「精确匹配优先」是两件事。
+_MULTI = {"0xA1": "1", "0xA2": "2", "0xA3": "9999"}
+_ORDER2: list[str] = []
+
+
+def _stub_fi_multi(**kw):
+    return {"ok": True, "count": 3,
+            "instances": [{"pointer": p, "class_name": "UserData"}
+                          for p in ("0xA1", "0xA2", "0xA3")]}
+
+
+def _stub_rf_multi(instance="", **kw):
+    _ORDER2.append(instance)
+    return {"ok": True, "read_width": 4, "as_int32": int(_MULTI[instance]),
+            "field_type": "System.Int32"}
+
+
+S.RAW_TOOLS["find_instances"] = _stub_fi_multi
+S.RAW_TOOLS["read_field_value"] = _stub_rf_multi
+try:
+    res_third = S._eval_condition("field", name="UserData", field="gold",
+                                  equals="9999")
+finally:
+    S.RAW_TOOLS["find_instances"] = _orig_fi
+    S.RAW_TOOLS["read_field_value"] = _orig_rf
+check("同类多实例：第 3 个才命中 → hit=True", res_third.get("hit") is True,
+      f"hit={res_third.get('hit')}")
+check("确实逐个试到了第 3 个（instances_tried=3）",
+      res_third.get("detail", {}).get("instances_tried") == 3,
+      f"tried={res_third.get('detail', {}).get('instances_tried')} "
+      f"顺序={_ORDER2}")
+check("反证：旧写法只读第 0 个（0xA1=1）永远命中不了 → 假阴性",
+      _MULTI["0xA1"] != "9999", f"第 0 个的值={_MULTI['0xA1']}")
+
+
+# 一个都不命中时，要把**每个**实例的实测值报出来（便于区分「值不对」与
+# 「读的是别的派生类」）
+_READ_ORDER.clear()
+S.RAW_TOOLS["find_instances"] = _stub_find_instances
+S.RAW_TOOLS["read_field_value"] = _stub_read_field_value
+try:
+    res_miss = S._eval_condition("field", name="UserData", field="gold",
+                                 equals="12345")
+finally:
+    S.RAW_TOOLS["find_instances"] = _orig_fi
+    S.RAW_TOOLS["read_field_value"] = _orig_rf
+check("全不命中 → hit=False", res_miss.get("hit") is False)
+check("全不命中时给出每个实例的实测值（可核查）",
+      len(res_miss.get("detail", {}).get("tried") or []) == 2,
+      f"tried={res_miss.get('detail', {}).get('tried')}")
 
 # ================================================================
 section("7. 非空转反证：去掉「证据充分性」检查会怎样")

@@ -2880,21 +2880,53 @@ def _eval_condition_inner(kind: str, *, target: str = "", region: str = "",
                 error = str(fi.get("error", ""))[:200]
                 detail = {"instances_ok": False}
         else:
-            ptrs = [x.get("pointer") for x in (fi.get("instances") or [])]
+            # 实例枚举会**连派生类一起返回**（liveness 语义如此：实测
+            # find_instances(Transform) 拿回的全是 RectTransform）。
+            # 用基类的字段偏移去读派生类实例可能读错位置，所以：
+            #   ① 把 `class_name` 与本类**精确匹配**的实例排在前面；
+            #   ② 逐个试（最多 8 个），任何一个命中 `equals` 就算成立。
+            # 原来只取 `ptrs[0]`：派生类排在前面时，明明有实例满足条件
+            # 却判成不成立 —— 那是**假阴性**，会让 Agent 去改一个没坏的 Mod。
+            want_short = (name or "").split(".")[-1].lower()
+            insts = list(fi.get("instances") or [])
+            exact = [x for x in insts
+                     if str(x.get("class_name") or "").split(".")[-1].lower()
+                     == want_short]
+            ordered = exact + [x for x in insts if x not in exact]
+            ptrs = [x.get("pointer") for x in ordered if x.get("pointer")]
+
             if not ptrs:
                 detail = {"count": 0}
             else:
-                rf = RAW_TOOLS["read_field_value"](
-                    instance=ptrs[0], name=name, field=field,
-                    namespace=namespace, image=image)
-                if rf.get("ok"):
+                tried: list[dict] = []
+                for p in ptrs[:8]:
+                    rf = RAW_TOOLS["read_field_value"](
+                        instance=p, name=name, field=field,
+                        namespace=namespace, image=image)
+                    if not rf.get("ok"):
+                        tried.append({"pointer": p, "read_ok": False,
+                                      "error": str(rf.get("error", ""))[:120]})
+                        continue
                     got = _field_value_as_text(rf)
-                    detail = {"field": field, "actual": got, "expected": equals,
-                              "pointer": ptrs[0]}
-                    hit = _values_equal(got, equals, rf)
-                else:
-                    error = str(rf.get("error", ""))[:200]
-                    detail = {"read_ok": False}
+                    tried.append({"pointer": p, "actual": got})
+                    if _values_equal(got, equals, rf):
+                        # 命中：如实说明是在第几个实例上命中的
+                        detail = {"field": field, "actual": got,
+                                  "expected": equals, "pointer": p,
+                                  "instance_index": len(tried) - 1,
+                                  "instances_tried": len(tried),
+                                  "exact_class_count": len(exact)}
+                        hit = True
+                        break
+                if not hit:
+                    # 一个都没命中：给出**每个**实例的实测值，便于区分
+                    # 「值确实不对」与「读的是别的派生类实例」
+                    detail = {"field": field, "expected": equals,
+                              "instances_tried": len(tried),
+                              "exact_class_count": len(exact),
+                              "tried": tried}
+                    if tried and all(t.get("read_ok") is False for t in tried):
+                        error = str(tried[0].get("error") or "")[:200]
 
     elif kind == "ocr":
         o = RAW_TOOLS["ocr"](region=region, window=window, expected=target,
@@ -2993,7 +3025,7 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
         name/namespace/image: `field` / `instances` 的类定位参数。
         field:       `field` 用：字段名。
         equals:      `field` 用：期望值（按字段类型比较）。
-        pattern:     `log` 用：日志正则。**必须同时给 `path`**。
+        pattern:     `log` 用：日志正则。**必须同时给 `target`**（日志路径）。
         timeout_ms:  总超时（默认 20000）。
         interval_ms: 轮询间隔（默认 500）。别设太小 —— 徒增开销。
         min_count:   `instances` 用的实例数下限（默认 1）。
@@ -3093,7 +3125,7 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
 
     参数 `checks` 怎么传
     ----------------------------------------------------------------
-    逗号分隔的条目，每条形如 `kind:参数`，与 `wait_for` 共用同一套条件语义
+    逗号分隔的条目，每条形如 `kind=参数`，与 `wait_for` 共用同一套条件语义
     （`_eval_condition`，所以两处结论必然一致）：
 
     | 写法 | 含义 |
@@ -3112,12 +3144,17 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
     返回
     ----------------------------------------------------------------
     · `verdict` —— `pass` / `fail` / **`unverifiable`**（三态，与 `wait_for` 同源）
-      - `pass` 要求：**成立的条件数 >= require_independent**（默认 2）
+      - `pass` 要求：**成立条数 >= require_independent**，且这些成立的条目
+        来自 **>= require_independent 条不同的信号通道**
       - 全部条件都成立但只有 1 条 → 判 **`fail`** 并说明「证据不足」，
         **不是** pass —— 这正是「单条证据不得静默提升」
+      - 多条成立但**全是同一条通道**（如两条 `ocr=`）→ 同样判 `fail`，
+        并说明「同源，缺独立第 2 通道」—— 同一张截图上的两条断言会一起
+        对、也会一起错，不是「互相独立」的证据
     · `evidence` —— 每条断言各自的 `{check, hit, detail}`
-    · `independent_count` / `require_independent`
-    · `verdict_reason` —— **为什么**是这个结论（便于人工复核）
+    · `independent_count` —— 成立的**不同通道数**（按 kind 去重），
+      与 `passed`（成立的条数）**不同**；`independent_kinds` 列出是哪几种
+    · `require_independent` / `verdict_reason` —— 门槛值与判定理由
 
     Args:
         checks: 逗号分隔的断言列表，见上表。
@@ -3138,8 +3175,13 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
     results: list[dict] = []
     for raw in items:
         if "=" not in raw:
+            # 提示必须与**实际校验的写法**一致：这里校验的是 `=`，
+            # 报错却写 `kind:参数` 会把 Agent 引向冒号 —— 那是本工具
+            # 不接受的写法，于是它在「照提示改」与「仍然报错」之间死循环。
             results.append({"check": raw, "hit": False, "kind": "",
-                            "detail": {}, "error": "写法不对：应是 kind:参数"})
+                            "detail": {},
+                            "error": "写法不对：应是 kind=参数（用**等号**，"
+                                     "例如 ocr=开始游戏；不是冒号）"})
             continue
         kind, spec = raw.split("=", 1)
         kind = kind.strip().lower()
@@ -3163,29 +3205,26 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
             elif kind == "window":
                 kw = {"target": spec}
             elif kind == "field":
-                # field=类.字段=期望值
+                # field=<类>.<字段>=<期望值>
                 if "=" not in spec or "." not in spec.split("=", 1)[0]:
                     raise ValueError("field 写法应是 field=<类>.<字段>=<期望值>")
                 lhs, want = spec.split("=", 1)
                 cls, fname = lhs.rsplit(".", 1)
-                # 类名可能带命名空间：最后一段是短名，前面是 namespace
-                if "." in cls:
-                    ns, short = cls.rsplit(".", 1)
-                else:
-                    ns, short = "", cls
-                kw = {"name": short, "namespace": ns, "field": fname,
+                # 类名整体交给探针的 resolveClass 解析，**不要**在这里按
+                # 最后一个点号切成 (namespace, name)：
+                # 嵌套类型（`Outer.Inner`）的 namespace 在静态索引里是**空**的、
+                # 只有短名，切成 namespace="Outer" / name="Inner" 会解析失败。
+                # 探针的 resolveClass 已经能同时处理「顶层类（可带命名空间）」
+                # 与「完整嵌套名」两种写法（与 runtime_class_info 同一套规则）。
+                kw = {"name": cls.strip(), "namespace": "", "field": fname,
                       "equals": want.strip()}
             elif kind == "instances":
                 # instances=类>=个数
                 if ">=" not in spec:
                     raise ValueError("instances 写法应是 instances=<类>>=<个数>")
                 cls, n = spec.split(">=", 1)
-                cls = cls.strip()
-                if "." in cls:
-                    ns, short = cls.rsplit(".", 1)
-                else:
-                    ns, short = "", cls
-                kw = {"name": short, "namespace": ns,
+                # 与 field 分支同理：完整类名（含 `Outer.Inner`）直接给 name
+                kw = {"name": cls.strip(), "namespace": "",
                       "min_count": max(1, int(n.strip()))}
         except Exception as exc:                              # noqa: BLE001
             results.append({"check": raw, "hit": False, "kind": kind,
@@ -3214,10 +3253,33 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
     unver = sum(1 for r in results if r.get("unverifiable"))
     total = len(results)
 
+    #: 成立的条件来自几个**不同种类**的信号源。
+    #:
+    #: 为什么不能用 `passed` 当独立证据数：两条 `ocr=` 断言虽然在列表里是
+    #: 两条，但它们走的是**同一条通道**（同一张截图、同一个 OCR 引擎），
+    #: 一起错也一起对 —— 比如界面没加载完，两条同时不成立；而 OCR 把文字
+    #: 认错时，两条也可能同时"成立"。把这种同源重复算成 2 条独立证据，
+    #: 正是本工具存在的理由（「单条证据不得静默提升」）被架空的方式。
+    #: 契约要的是「1 静态 + 1 动态」那种**互相独立**，所以按 kind 去重计数。
+    hit_kinds = {r.get("kind") for r in results if r["hit"] and r.get("kind")}
+    independent_count = len(hit_kinds)
+
     # ---- 三态判定（与 wait_for 同源的纪律）
-    if passed >= require:
+    if passed >= require and independent_count >= require:
         verdict = "pass"
-        reason = f"{passed}/{total} 条成立，达到要求的 {require} 条独立证据"
+        reason = (f"{passed}/{total} 条成立，来自 {independent_count} 条"
+                  f"**互相独立**的信号通道"
+                  f"（{', '.join(sorted(hit_kinds))}），"
+                  f"达到要求的 {require} 条独立证据")
+    elif passed >= require:
+        # 条数够了，但全是同一条通道 —— **不许**提升为 pass
+        verdict = "fail"
+        reason = (f"虽然 {passed} 条成立，但只来自 {independent_count} 条"
+                  f"**同源**通道（{', '.join(sorted(hit_kinds))}）—— "
+                  f"缺独立第 2 通道。同通道的断言会一起对、也会一起错"
+                  f"（例如同一张截图上的两条 ocr），"
+                  f"不构成「互相独立」的证据。"
+                  f"请再加一条**不同来源**的（如日志 + OCR、或字段 + OCR）。")
     elif unver >= 1 and passed + unver == total:
         # 没有一条明确不成立，但至少有没法判的 → 「没法判」而非「没通过」
         verdict = "unverifiable"
@@ -3240,7 +3302,8 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
         "verdict_reason": reason,
         "passed": passed,
         "total": total,
-        "independent_count": passed,
+        "independent_count": independent_count,
+        "independent_kinds": sorted(hit_kinds),
         "require_independent": require,
         "unverifiable_count": unver,
         "evidence": results,
