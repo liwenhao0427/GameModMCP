@@ -81,6 +81,7 @@ import asyncio
 import functools
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -3042,6 +3043,34 @@ def _parse_region(region: str) -> Any:
     return vals
 
 
+#: 条目切分用的正则：逗号后面**紧跟 `标识符=`** 时才切分。
+#:
+#: 为什么不能用裸 `str(checks).split(",")`：断言里允许出现**正则**，而正则
+#: 里的量词 `{1,3}` 自带逗号 ——
+#:
+#:     log=a.log#金币\s*=\s*\d{1,3},window=X
+#:
+#: 裸切分会把 `3}` 切成独立的一段，那一段既没有 `=` 也不是合法 kind，
+#: 于是一条**完全正确**的输入报出「写法不对：应是 kind=参数」的假错误。
+#: 实测（修复前）：total=3，其中一段的 error 正是「写法不对」。
+#:
+#: 这个模式为什么足够安全：
+#:   · 正则量词 `{1,3}` 的逗号后面是**数字** → 不切；
+#:   · 泛型 `Foo<int, string>` 的逗号后面没有 `=` → 不切；
+#:   · 而任何合法条目都是 `kind=参数`，逗号后面必然是 `标识符=`;
+#:   · 未知 kind（`nope=1`）同样是 `标识符=` 形式 → 照样切出来如实报错。
+_CHECK_SPLIT_RE = re.compile(r",(?=\s*[A-Za-z_][A-Za-z0-9_]*\s*=)")
+
+
+def _split_checks(checks: Any) -> list[str]:
+    """把 `checks` 串切成条目列表（只在其后紧跟 `kind=` 的逗号处切）。
+
+    抽成独立纯函数是为了**可单测**：切分规则本身容易写错，而它的错误
+    表现是「一条正确的输入报假错误」，必须能被纯函数层直接钉住。
+    """
+    return [x.strip() for x in _CHECK_SPLIT_RE.split(str(checks)) if x.strip()]
+
+
 def _eval_condition(kind: str, *, target: str = "", region: str = "",
                     window: str = "", name: str = "", namespace: str = "",
                     image: str = "", field: str = "", equals: str = "",
@@ -3397,7 +3426,7 @@ def verify_state(checks: str, require_independent: int = 2) -> dict:
         return _err("checks 不能为空。写法见工具文档，"
                     "例如 checks=\"log=D:\\\\x.log#ERROR,ocr=开始游戏\"")
 
-    items = [x.strip() for x in str(checks).split(",") if x.strip()]
+    items = _split_checks(checks)
     require = max(1, int(require_independent))
 
     results: list[dict] = []

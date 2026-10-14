@@ -196,9 +196,57 @@ def probe(tag: str, meta_path: Path, cache: Path, is_il2cpp: bool) -> None:
         check("Mono 不建表 —— 明确记录而不是假装也优化了", True,
               "1,387 类型，实测净增落在噪声里")
 
-    # ---------------------------------------------- 4. 走到工具层
+    # ---------------------------------------------- 5. image_of_type 二分 == 线性
+    #
+    # `image_of_type` 从线性扫描改成 `bisect`（建索引时对**每个**类型都要问
+    # 一次，而映像有上百个）。优化的最大风险是「快是快了，结果悄悄变了」，
+    # 所以这里拿**旧的线性实现**当真值，对**全表**逐条比对。
+    #
+    # 只对 IL2CPP 跑：Mono 是「一个 .dll = 一个映像」，`image_of_type` 直接
+    # 返回 `self.module_name`，根本没有按 type_start 归属这回事
+    # （`mono_meta.ImageDef` 也没有 type_start 字段）。
+    if not is_il2cpp:
+        print()
+        print("  -- 5. image_of_type 二分：Mono 不适用 --")
+        print("     （Mono 一个 dll 一个映像，image_of_type 直接返回 module_name）")
+        check("Mono 侧明确记录「不适用」而不是假装验证了", True,
+              "本次改动只触及 il2cpp_meta.image_of_type")
+    else:
+        print()
+        print("  -- 5. `image_of_type` 二分结果 == 旧线性扫描（全表逐条）--")
+
+        def image_of_type_linear(t) -> str:
+            """旧实现（真值）：线性扫描 self.images。"""
+            for img in meta.images:
+                if img.type_start <= t.index < img.type_start + img.type_count:
+                    return img.name
+            return ""
+
+        fast = [meta.image_of_type(t) for t in meta.types]
+        slow = [image_of_type_linear(t) for t in meta.types]
+        diff = [t.index for t, a, b in zip(meta.types, fast, slow) if a != b]
+        print(f"     类型 {len(meta.types):,} 个，差异 {len(diff)} 条")
+        check("全表逐条与线性扫描完全一致", not diff,
+              f"差异下标前 5 个：{diff[:5]}" if diff else
+              f"{len(meta.types):,} 条全部相同")
+        # 非空转反证：线性实现确实解出了**非空**的映像名（否则「一致」可能
+        # 只是两边都返回空串，那样这条断言毫无价值）。
+        nonempty = sum(1 for x in slow if x)
+        check("反证：线性真值本身给出了非空映像名（断言不是空转）",
+              nonempty > 0, f"{nonempty:,}/{len(meta.types):,} 条非空")
+        # 区间必须单调：bisect 方案的成立前提。实测样本已升序无重叠，
+        # 但那是**样本性质**而不是我们能控制的，所以显式断言排序后不重叠。
+        starts = [im.type_start for im in meta._images_sorted]
+        check("二分索引按 type_start 升序", starts == sorted(starts))
+        overlap = sum(1 for a, b in zip(meta._images_sorted,
+                                        meta._images_sorted[1:])
+                      if a.type_start + a.type_count > b.type_start)
+        check("排序后的映像区间互不重叠（bisect 定位的前提）", overlap == 0,
+              f"重叠 {overlap} 对")
+
+    # ---------------------------------------------- 6. 走到工具层
     print()
-    print("  -- 4. `search_classes(subtype_of=...)` 的 total 与真值一致 --")
+    print("  -- 6. `search_classes(subtype_of=...)` 的 total 与真值一致 --")
     for base in ("UnityEngine.MonoBehaviour", "System.Object"):
         r = idx.search_classes("", limit=5, subtype_of=base)
         # 真值要套用与 SQL 相同的排除规则（编译期生成的名字）

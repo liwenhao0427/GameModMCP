@@ -947,52 +947,34 @@ class Index:
 
     # ------------------------------------------------------ 跨引擎解析收口
     #
-    # 下面三个方法把「同一个语义在不同引擎下的不同解析方式」收在一处。
-    # 上层查询代码只调它们，不再直接碰 meta.resolve_il2cpp_type 之类的
+    # 下面这个方法把「同一个语义在不同引擎下的不同解析方式」收在一处。
+    # 上层查询代码只调它，不再直接碰 meta.resolve_il2cpp_type 之类的
     # 引擎专有接口。
     #
     # 背景：IL2CPP 的 returnType / paramTypeIndex / parentIndex 都是
     # Il2CppType 索引，用同一个 resolve 就行；Mono 的这三者分别是
     # 签名 blob、签名内顺序、TypeDefOrRef 编码值，需要分开处理。
-
-    def _resolve_param(self, method_idx: int, param_row: sqlite3.Row
-                       ) -> str | None:
-        """解析参数类型。
-
-        IL2CPP 可以逐参数用 typeIndex 解；
-        Mono 的 Param 表没有类型，必须从**所属方法**的签名里按顺序取。
-
-        注意 `m = self.meta` 这行**必须在 try 之外**：`self.meta` 是惰性属性，
-        第一次访问会真的去载入/解析元数据，而那是可能失败的
-        （文件被截断、版本不认识、内存不够）。失败必须**抛出去** ——
-        `server.py` 每个工具都包了 `try/except → ok:false`，所以抛出去
-        客户端会看到诚实的错误。若把它放进 try 里，元数据载入失败就会被
-        降级成「这个参数没有类型」，整份结果照旧 `ok: true`。
-        这正是本项目最忌讳的「假成功」，而且**实测发生过**：
-        验证脚本里故意让 `_load_meta` 抛错，`search_classes` 曾经返回
-        `ok: true` + 200 行 `parent: null`（见 `devtools/verify_lazy_meta.py` §5）。
-
-        try 只负责「这一条参数解不出来」（下标越界等）这种**预期内**的降级，
-        与 `adapt.py` 里「解析不出来就给 None、不猜」的政策一致。
-        """
-        m = self.meta
-        if adapt.engine_of(m) == adapt.ENGINE_IL2CPP:
-            return adapt.resolve_method_return(m, param_row["type_index"])
-        # Mono：用方法签名里的参数类型列表按 sequence 取
-        try:
-            types = adapt.resolve_param_types(m, m.methods[method_idx])
-            idx = param_row["sequence"] - 1   # sequence 是 1 基
-            if 0 <= idx < len(types):
-                return types[idx]
-        except Exception:
-            pass
-        return None
+    #
+    # 注意：这里**曾经**还有一个 `_resolve_param`，但全仓库已无任何调用点
+    # （参数解析在 `class_detail` 里走 `adapt.resolve_param_types`），
+    # 且它读的 `parameters.sequence` 列**并不存在**（表只有
+    # idx/name/type_index 三列），一旦调用必抛 IndexError 并被
+    # `except Exception` 静默吞成 None。按 AGENTS.md §3「没有出口的函数是
+    # 死代码，应删除」已移除，避免留一个坏函数误导后续维护者。
 
     def _resolve_parent(self, type_idx: int) -> str | None:
         """解析类型的基类名。
 
-        `m = self.meta` 同样必须在 try 之外（理由见 `_resolve_param`）：
-        元数据载入失败**不许**被降级成「这个类没有基类」。
+        `m = self.meta` 必须在 try 之外：元数据载入失败**不许**被降级成
+        「这个类没有基类」。`self.meta` 是惰性属性，第一次访问会真的去
+        载入/解析元数据，而那是可能失败的（文件被截断、版本不认识、
+        内存不够）。失败必须**抛出去** —— `server.py` 每个工具都包了
+        `try/except → ok:false`，客户端会看到诚实的错误；若放进 try 里，
+        就会降级成「这些类都没有基类」，整份结果照旧 `ok: true`。
+
+        这正是本项目最忌讳的「假成功」，而且**实测发生过**：
+        验证脚本里故意让 `_load_meta` 抛错，`search_classes` 曾经返回
+        `ok: true` + 200 行 `parent: null`（见 `devtools/verify_lazy_meta.py` §5）。
         """
         m = self.meta
         try:

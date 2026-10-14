@@ -253,11 +253,70 @@ def test_load_failure(game: Path, meta_path: Path, cache: Path) -> None:
           f"parent 样例：{parents[:3]}")
 
 
+def offline_dead_code_checks() -> None:
+    """§0：死代码清理（**不需要样本**，所以放在样本闸门之前）。
+
+    为什么单独成节：本节验的是「`Index._resolve_param` 已被删除」，
+    而它**不需要任何游戏样本**。若塞进 `main()` 的样本闸门之后，
+    本机（规范样本不在）就整节跳过 —— 一条永远不跑的门禁等于没有门禁。
+
+    那个方法为什么该删：
+      · 全仓库 0 处调用（参数解析在 `class_detail` 走 `adapt.resolve_param_types`）；
+      · 它读的 `parameters.sequence` 列**不存在**（表只有 idx/name/type_index
+        三列），一旦调用必抛 `IndexError`，还会被 `except Exception` 静默
+        吞成 `None` —— 留着一个坏函数误导后续维护者。
+    按 AGENTS.md §3「`agent.js` 里无出口的函数是死代码」的同一原则（引擎层
+    同理）删除。
+    """
+    section("0. 死代码：`Index._resolve_param` 必须已删除（无需样本）")
+    src = (samples.SRC / "gamemod_mcp" / "engine" / "index.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(src)
+    _index_methods: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Index":
+            for fn in node.body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _index_methods.add(fn.name)
+    print(f"     Index 的方法数：{len(_index_methods)}")
+    check("反证：AST 确实解析到了 Index 的方法（断言不是空转）",
+          len(_index_methods) > 10, f"{len(_index_methods)} 个方法")
+    check("Index._resolve_param 已删除（死代码 + 读不存在的列）",
+          "_resolve_param" not in _index_methods,
+          "全仓库 0 调用，且读的 parameters.sequence 列不存在")
+    check("Index._resolve_parent 仍在（活代码，不许误删）",
+          "_resolve_parent" in _index_methods,
+          "search_classes / class_detail 等三处在用")
+    # 全文扫描：注释里提到名字是可以的（那是解释为什么删），
+    # 但不许再有 `def _resolve_param` 或 `self._resolve_param(`。
+    check("index.py 里不再有 _resolve_param 的定义或调用",
+          "def _resolve_param" not in src
+          and "self._resolve_param(" not in src,
+          "注释里解释「为什么删」是允许的")
+    # 跨模块反证：确认这个删除不是「把调用点一起删了」
+    # —— 参数解析必须仍然有实现（走 adapt）。
+    adapt_src = (samples.SRC / "gamemod_mcp" / "engine" / "adapt.py"
+                 ).read_text(encoding="utf-8")
+    check("参数解析能力仍在（走 adapt.resolve_param_types，不是被删没了）",
+          "def resolve_param_types" in adapt_src)
+
+
 def main() -> int:
+    # 不需要样本的先跑（否则本机样本缺失时整节被跳过 = 没有门禁）
+    offline_dead_code_checks()
+
     game = samples.find_il2cpp()
     if not samples.require(game, "IL2CPP (Garden of Witches)"):
         print("\n（本脚本需要一个 IL2CPP 样本；样本不在时记为「无法验证」）")
-        return 0
+        print()
+        print("=" * 78)
+        if FAIL:
+            print(f"\u274c 通过 {PASS} 项，失败 {FAIL} 项（警告 {WARN}）")
+        else:
+            print(f"\u2705 通过 {PASS} 项，失败 0 项"
+                  + (f"（警告 {WARN}）" if WARN else ""))
+        print("=" * 78)
+        return 1 if FAIL else 0
     meta_path = (game / "Garden of Witches_Data" / "il2cpp_data"
                  / "Metadata" / "global-metadata.dat")
     cache = ix.default_cache_dir()

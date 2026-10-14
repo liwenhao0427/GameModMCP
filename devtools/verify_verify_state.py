@@ -495,6 +495,87 @@ check("同一条件在 require=1 下能 pass（证明 fail 是证据数不够，
       r5.get("verdict") == "pass" and r1.get("verdict") == "fail")
 
 # ================================================================
+section("8. 条目切分：正则量词里的逗号不许把一条断言切成两条")
+
+# 缺陷现场：切分用的是裸 `str(checks).split(",")`，于是**正则里的逗号**
+# 会被当成条目分隔符：
+#     log=a.log#金币\s*=\s*\d{1,3},window=X
+# 被切成 3 段（多出一段 "3}"），那一段既没有 `=` 也不是合法 kind，
+# 于是一条**完全正确的输入**报出「写法不对：应是 kind=参数」的假错误。
+# 实测确认（修复前）：total=3，其中一段 error 是「写法不对」。
+#
+# 修法：逗号后面**紧跟 `标识符=`** 才切分。正则量词 `{1,3}` 的逗号后面是
+# 数字，泛型 `Foo<A, B>` 的逗号后面没有 `=` —— 都不会被误切。
+
+_regex_checks = f"log={log_hit}#精核\\s*=\\s*\\d{{1,3}},window=SomeWindow"
+print(f"  含正则量词的输入：{_regex_checks}")
+
+# 先确定地展示「裸 split 确实会切坏」——这是本节的立论依据
+_naive = [x.strip() for x in _regex_checks.split(",") if x.strip()]
+print(f"  裸 split(',') 切成 {len(_naive)} 段：{_naive}")
+check("反证：裸 split(',') 确实把 {1,3} 切坏（多出一段）",
+      len(_naive) == 3 and any(x.startswith("3}") for x in _naive),
+      f"{_naive}")
+
+_fake_win = _make_fake_screen(True, False)
+S._screen_mod = lambda: _fake_win
+try:
+    r_regex = _RAW(checks=_regex_checks, require_independent=2)
+finally:
+    if _orig_screen_mod is not None:
+        S._screen_mod = _orig_screen_mod
+
+check("含正则量词的输入被切成 **2** 条（不是 3 条）",
+      r_regex.get("total") == 2, f"total={r_regex.get('total')}")
+check("两条都成立 → verdict=pass",
+      r_regex.get("verdict") == "pass", f"verdict={r_regex.get('verdict')!r}")
+check("没有条目报「写法不对」的假错误",
+      not any(e.get("error") for e in (r_regex.get("evidence") or [])),
+      f"{[e.get('error') for e in (r_regex.get('evidence') or [])]}")
+
+# ---- 未知 kind 仍要能被切出来并如实报「未知的 kind」
+# （切分收紧后最容易误伤的正是这一类：`nope=1` 也是 `标识符=` 形式）
+r_unknown = _RAW(checks="nope=1,ocr=x", require_independent=1)
+check("未知 kind + 合法 kind 仍被切成 2 条",
+      r_unknown.get("total") == 2, f"total={r_unknown.get('total')}")
+check("未知 kind 被如实报为「未知的 kind」（不是切丢了）",
+      any("未知的 kind" in str(e.get("error", ""))
+          for e in (r_unknown.get("evidence") or [])),
+      f"{[e.get('error') for e in (r_unknown.get('evidence') or [])]}")
+
+# ---- 泛型类名里的逗号也不许被切成两条
+# `Foo<A, B>` 的逗号后面是空格 + 大写字母（没有 `=`），不该切分。
+r_generic = _RAW(checks="instances=Dictionary<int, string>>=1", require_independent=1)
+check("泛型参数里的逗号没被当成条目分隔符（只切出 1 条）",
+      r_generic.get("total") == 1, f"total={r_generic.get('total')}")
+
+# ---- 反证：旧的裸 split 逻辑对同一输入确实会多切一条
+_old_items = [x.strip() for x in _regex_checks.split(",") if x.strip()]
+check("反证：旧逻辑切出的段数（3）!= 新逻辑的条目数（2）",
+      len(_old_items) == 3 and r_regex.get("total") == 2,
+      f"旧 {len(_old_items)} 段 / 新 {r_regex.get('total')} 条")
+
+# ---- 切分器本身是纯函数，单独钉住它的行为（不依赖屏幕/探针）
+_split = getattr(S, "_split_checks", None)
+check("新增了纯函数 _split_checks（切分逻辑可单测）", callable(_split))
+if callable(_split):
+    _cases = [
+        ("a=1,b=2", 2),
+        ("log=x#\\d{1,3},window=y", 2),
+        ("instances=Foo<int, string>>=1", 1),
+        ("nope=1,ocr=x", 2),
+        ("  a=1 ,  b=2  ", 2),
+        ("only=1", 1),
+        ("", 0),
+    ]
+    _bad = [(src, _split(src)) for src, want in _cases
+            if len(_split(src)) != want]
+    check("_split_checks 在 7 组用例上段数全部正确", not _bad, f"{_bad}")
+    check("_split_checks 会去掉每段两侧空白",
+          _split("  a=1 ,  b=2  ") == ["a=1", "b=2"],
+          f"{_split('  a=1 ,  b=2  ')}")
+
+# ================================================================
 print()
 print("=" * 78)
 print(f"通过 {PASS} 项，失败 {FAIL} 项" + (f"，警告 {WARN} 项" if WARN else ""))
