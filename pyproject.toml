@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools>=77 是 PEP 639 的要求：`license` 用 SPDX 字符串（下面那行）
+# 与 `license-files` 字段都是 77.0.0 才认识的。低版本会直接构建失败。
+# 这是**构建期**要求，不是运行期依赖，所以不影响「运行只依赖 mcp + frida」。
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +11,19 @@ version = "1.0.0"
 description = "游戏 Mod 开发 MCP 服务器：元数据优先定位 Hook 落点，支持 IL2CPP / Mono / Unreal"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+# PEP 639 的 SPDX 表达式写法（旧式 `license = { text = "MIT" }` 已弃用）。
+# 与根目录 LICENSE 文件、README「## 许可」段是同一份许可，改一处必须改三处。
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["mcp", "game-mod", "il2cpp", "mono", "unreal", "frida", "reverse-engineering"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: Microsoft :: Windows",
     "Topic :: Software Development :: Debuggers",
 ]
+# 注意：PEP 639 起 `license` 用 SPDX 表达式后，**不许**再写
+# `License :: OSI Approved :: ...` 这类 classifier（setuptools 会报错，
+# 因为许可证信息已由 SPDX 表达式单一表达）。
 
 # 只依赖 MCP 协议库与 Frida。
 # 引擎解析（PE / IL2CPP / Mono / UE）全部手写，只用标准库，不引入 pefile / lief。

@@ -716,9 +716,13 @@ GameModMCP-share/
 └── wheels/required|optional   ← 依赖 wheel（离线可装，必需约 63 MB）
 ```
 
-打包后**自检 38 项**，其中最关键的一条是**用包内源码真起一次服务器**
+打包后**自检 44 项**，其中最关键的一条是**用包内源码真起一次服务器**
 数工具数 —— 它能抓到「拷漏了文件」「依赖装错版本」这类只有对方才会踩到的
 问题（实测就是靠它发现 `mcp>=1.0.0` 会装到 2.x 导致起不来）。
+另有 6 项专门盯许可：`LICENSE` 在不在、是不是完整的 MIT 文本、有没有版权行，
+以及 README 与 `pyproject.toml` 是否和它说同一件事 —— 因为分享包会分发
+`src/`，而 `COPY_FILES` 里文件名写错时是**静默跳过**的，包照样打得出来、
+照样能装，只是**没有许可**。
 
 > **为什么入口是 Python 而不是 .ps1**：Windows 自带的 PowerShell 5.1
 > 读**无 BOM 的 UTF-8** 中文脚本会按 GBK 解码、直接语法报错，而 `pwsh`
@@ -728,5 +732,14 @@ GameModMCP-share/
 
 ## 许可
 
-MIT
+[MIT](LICENSE) © 2026 liwenhao0427
+
+可自由使用、修改、再分发（含商用），只需保留版权与许可声明。
+完整授权文本见 [LICENSE](LICENSE) —— 它与 `pyproject.toml` 的
+`license` 字段是同一份许可，改动时必须同步。
+
+> **为什么之前只有这一行字、没有文件**：README 与 `pyproject.toml` 都声明了
+> MIT，但根目录一直没有 `LICENSE`，GitHub 因此把本仓库识别成 `license: null`
+> —— 「声明了许可却没有授权文本」。分享包会分发 `src/`，所以许可文本必须
+> 随源码一起走（见 `devtools/build_share.py` 的 `COPY_FILES`）。
 

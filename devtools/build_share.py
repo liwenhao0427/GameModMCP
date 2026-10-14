@@ -97,8 +97,10 @@ OPTIONAL = [
 #: 要拷进包的目录（源 → 包内相对路径）
 COPY_DIRS = ["src", "skills", "mcp-config", "devtools", "docs"]
 #: 要拷进包的单文件（**不带 install.sh** —— 本项目只支持 Windows）
-COPY_FILES = ["README.md", "install.py", "install.ps1", "requirements.txt",
-              "AGENTS.md"]
+#: LICENSE 必须在列：包里分发 `src/`（源码），不带授权文本是不合规的
+#: —— 「分发源码却不附许可」比「没有许可文件」更糟。
+COPY_FILES = ["LICENSE", "README.md", "install.py", "install.ps1",
+              "requirements.txt", "AGENTS.md"]
 
 #: 不拷进包的（体积/无意义/本机产物）
 SKIP_NAMES = {"__pycache__", ".git", ".cache", ".cache-test",
@@ -607,12 +609,60 @@ def verify_share(pkg: Path) -> tuple[int, int]:
     #:  · 安装脚本主推 `install.py`；`install.ps1` 是给已有 pwsh 7 的备选；
     #:  · **没有 `install.sh`** —— 本项目只支持 Windows。
     must = ["安装说明.md", "README.md", "install.py", "install.ps1",
-            "requirements.txt", "src/gamemod_mcp/server.py",
+            "requirements.txt", "LICENSE",
+            "src/gamemod_mcp/server.py",
             "src/gamemod_mcp/runtime/agent.js",
             "skills/gamemod-mod/SKILL.md",
             "mcp-config/README.md", "mcp-config/claude-code.mcp.json"]
     for m in must:
         check(f"存在 {m}", (pkg / m).is_file())
+
+    # 许可：分发 `src/` 就必须附授权文本。为什么单独这几条断言 ——
+    # `COPY_FILES` 里文件名写错时是**静默跳过**的（`if s.is_file()`），
+    # 包照样打得出来、照样能装，只是**没有许可**。上面 `must` 那条能抓到
+    # 「文件不在」，这里再加「文件内容真的是那份许可」，因为一个空的
+    # LICENSE 也能让上一条通过。
+    lic = (pkg / "LICENSE")
+    if lic.is_file():
+        lt = lic.read_text(encoding="utf-8")
+        check("LICENSE 是完整的 MIT 授权文本",
+              "MIT License" in lt
+              and "Permission is hereby granted" in lt
+              and "WITHOUT WARRANTY OF ANY KIND" in lt,
+              f"{len(lt)} 字符")
+        check("LICENSE 有版权行（MIT 要求保留版权声明）",
+              "Copyright (c)" in lt and "liwenhao0427" in lt)
+        # 三处必须说同一件事：LICENSE 文件、README「## 许可」段、pyproject。
+        #
+        # ⚠️ 只许看「## 许可」段的**首行声明**，不能整段找 MIT、更不能全文找。
+        # 两轮实测都栽在这里：
+        #   · 全文找：匹配到正文别处的 "MIT"，把许可行改成 GPL-3.0 仍 [OK]；
+        #   · 整段找：许可段里的**解释文字**本身就写着「都声明了 MIT」，
+        #     于是改掉首行声明后它**还是** [OK]（358 字符那次）。
+        # 断言范围写宽就退化成恒真 —— 与 AGENTS.md §4「说了话但不干活」同源。
+        # 所以切出该段、再只看**第一条非空行**（那行才是许可声明本身）。
+        rdt = (pkg / "README.md").read_text(encoding="utf-8")
+        _look = rdt.find("## 许可")
+        _sect = rdt[_look:] if _look >= 0 else ""
+        _nxt = _sect.find("\n## ", 3)          # 到下一个二级标题为止
+        if _nxt > 0:
+            _sect = _sect[:_nxt]
+        _first = next((ln.strip() for ln in _sect.splitlines()[1:] if ln.strip()), "")
+        check("README 的许可段首行声明 MIT 并指向 LICENSE",
+              "MIT" in _first and "LICENSE" in _first,
+              _first or "找不到「## 许可」")
+        check("README 的许可段没有残留别的许可名（GPL/Apache/BSD）",
+              not any(w in _sect for w in ("GPL", "Apache", "BSD")),
+              _sect.strip().splitlines()[0] if _sect.strip() else "")
+        # ⚠️ `pyproject.toml` **故意不随包分发**（对方用 install.py 装，
+        # 不发它），所以这里读的是**仓库根**的那份，不是 pkg 里的。
+        # 早先写成 `(pkg / "pyproject.toml").is_file()` 的话，它永远为假
+        # —— 一条恒不执行的断言就是「说了话但不干活」。
+        rpyp = ROOT / "pyproject.toml"
+        if rpyp.is_file():
+            pt = rpyp.read_text(encoding="utf-8")
+            check("pyproject.toml 声明 MIT 且带 license-files",
+                  'license = "MIT"' in pt and "license-files" in pt)
 
     # 只支持 Windows：不该带 macOS/Linux 的安装脚本
     check("不含 install.sh（本项目只支持 Windows）",
