@@ -556,6 +556,67 @@ def _field_read_width(type_name: Any) -> int:
     return _FIELD_WIDTH.get(str(type_name).strip(), 8)
 
 
+#: 枚举没有显式底层类型时的默认宽度来源。
+#:
+#: C# 枚举的默认底层类型就是 `int`（System.Int32，4 字节）——
+#: 这是语言规范定的，不是我们猜的。显式声明 `: byte` / `: long` 的枚举
+#: 由探针的 `enum_base_type` 给出真值，走不到这个默认值。
+_ENUM_DEFAULT_BASE = "System.Int32"
+
+
+def _resolve_enum_underlying(st: Any, ftype: Any, hit: dict) -> str | None:
+    """字段如果是**枚举**，返回它的底层整型类型名；否则返回 `None`。
+
+    为什么需要它：字段枚举 API 只给类型名字符串，**枚举字段给的是枚举类名**
+    （如 `EasingType`），与普通类名长得一模一样。于是 `_field_read_width`
+    查不到表，按默认的 8 字节读 —— 4 字节的枚举会把**相邻字段**的 4 字节
+    一起读进来（`as_int64` 是两个字段拼出来的数）；`set_field_value` 更糟，
+    它会因为「宽度 8 且类型名认不出」把枚举误判成**引用类型**而直接拒绝写入。
+
+    两条来源，按可信度排序：
+
+      1. **运行时探针**（`hit["is_enum"]`）—— 最可靠，直接问过
+         `il2cpp_class_is_enum` / `mono_class_is_enum`，且能给出显式底层类型
+         （`enum_base_type`）。只有探针版本支持这几个导出时才有这个键。
+      2. **静态索引**（`is_enum` 列）—— 探针给不出判定时兜底。
+         按 `nested_name` / `full_name` / `name` 三写法查（与
+         `_match_type_ids` 同口径，嵌套类型必须用完整名）。
+
+    两条都拿不到时返回 `None` —— **不猜**。猜错的代价是「按 8 字节读一个
+    4 字节字段」，那正是这个函数要修的缺陷本身。
+    """
+    # ① 运行时探针的判定（首选）
+    if hit.get("is_enum") is True:
+        base = hit.get("enum_base_type")
+        return str(base).strip() if base else _ENUM_DEFAULT_BASE
+    if hit.get("is_enum") is False:
+        return None
+
+    # ② 静态索引兜底（探针没给 is_enum 键时）
+    name = str(ftype).strip() if ftype else ""
+    if not name:
+        return None
+    if name in _FIELD_WIDTH:
+        return None                       # 基础类型，本来就不需要兜底
+    try:
+        if not st.has_index():
+            return None
+        idx = st.index
+        if idx is None:
+            return None
+        row = idx.conn.execute(
+            "SELECT is_enum FROM types "
+            "WHERE nested_name = ? OR full_name = ? OR name = ? "
+            "ORDER BY (nested_name = ?) DESC, (full_name = ?) DESC LIMIT 1",
+            (name, name, name, name, name),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - 兜底失败不该让读写字段整个失败
+        return None
+    if row and row["is_enum"]:
+        return _ENUM_DEFAULT_BASE
+    return None
+
+
 #: 字段类型名 → 写值时的「解释方式」。与 `_FIELD_WIDTH` 同一张表的口径，
 #: 但**必须区分有符号/无符号/浮点**：同样 4 字节，写成 int 还是 float
 #: 得到的字节完全不同，而 `as_int32` 与 `as_float` 在读取时会同时给出，
@@ -2221,7 +2282,10 @@ def read_field_value(
 
         # 按字段类型决定读几个字节：只读这个字段自己的字节，
         # 不把相邻字段的内容一起读进来（见 _field_read_width 的说明）。
-        read_width = _field_read_width(hit.get("type"))
+        # 枚举字段的类型名是**枚举类名**，直接查表会落到默认的 8 字节 ——
+        # 所以先把它折成底层整型类型（见 _resolve_enum_underlying）。
+        enum_base = _resolve_enum_underlying(st, hit.get("type"), hit)
+        read_width = _field_read_width(enum_base or hit.get("type"))
         raw = st.runtime.read_memory(hex(field_addr), read_width)
         if not raw.get("ok"):
             return _err(raw.get("error", "读取内存失败"),
@@ -2239,6 +2303,10 @@ def read_field_value(
             "field_type": hit.get("type"),
             "read_width": read_width,
         }
+        if enum_base:
+            # 如实标注：宽度是按**枚举底层类型**算的，而不是拿枚举类名瞎猜
+            out["is_enum"] = True
+            out["enum_base_type"] = enum_base
         # 按**实际读到的宽度**给解释，不给这个宽度下没有意义的解释：
         # 4 字节字段的 as_int64 是「本字段 + 下一个字段」拼出来的数，读它必然误判。
         import struct as _struct
@@ -2347,11 +2415,17 @@ def set_field_value(
             return _err(f"instance 不是合法的十六进制地址：{instance}")
 
         ftype = hit.get("type")
-        width = _field_read_width(ftype)
-        kind = _field_write_kind(ftype, width)
+        # 枚举字段：类型名是枚举类名，查 `_FIELD_WIDTH` 会落到默认 8 字节，
+        # 于是下面的「宽度 8 且类型认不出」护栏会把它误判成**引用类型**并拒绝
+        # 写入 —— 而枚举本来就是可以安全写整数的。先折成底层类型再算宽度。
+        enum_base = _resolve_enum_underlying(st, ftype, hit)
+        width_type = enum_base or ftype
+        width = _field_read_width(width_type)
+        kind = _field_write_kind(width_type, width)
 
         # 宽度 8 且类型认不出来 = 多半是引用类型。写指针会改逻辑，明确拒绝。
-        if kind == "long" and (not ftype or str(ftype).strip() not in _FIELD_WRITE_KIND):
+        if kind == "long" and (not width_type
+                               or str(width_type).strip() not in _FIELD_WRITE_KIND):
             return _err(
                 f"字段 {field} 的类型 {ftype!r} 认不出（宽度 8），"
                 f"疑似**引用类型**。写入指针属于改逻辑，请改用 eval_script / Hook；"
@@ -2377,6 +2451,10 @@ def set_field_value(
             "write_kind": kind,
             "wrote_hex": blob.hex(),
         }
+        if enum_base:
+            # 如实标注：宽度与解释方式都是按**枚举底层类型**定的
+            out["is_enum"] = True
+            out["enum_base_type"] = enum_base
 
         # 先读原值：既给回滚依据，也让「写前后有差别」这件事可核查
         before = st.runtime.read_memory(hex(field_addr), width)

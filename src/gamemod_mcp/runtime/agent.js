@@ -72,6 +72,14 @@
         'il2cpp_class_instance_size',
         'il2cpp_class_value_size',
         'il2cpp_class_is_enum',
+        // Type* → Il2CppClass*（判定字段类型是否枚举用）。
+        // 三个名字都登记：`il2cpp_class_from_il2cpp_type` 是本版主要导出，
+        // 另两个是不同版本上的等价物（实测 Dave the Diver 三个都在）。
+        'il2cpp_class_from_il2cpp_type',
+        'il2cpp_class_from_type',
+        'il2cpp_type_get_class_or_element_class',
+        // 枚举的底层整型类型（System.Int32 等）
+        'il2cpp_class_enum_basetype',
         'il2cpp_class_is_valuetype',
         'il2cpp_class_is_interface',
         'il2cpp_class_is_abstract',
@@ -199,6 +207,11 @@
         'mono_class_num_fields',
         'mono_class_num_methods',
         'mono_class_is_enum',
+        // MonoType* → MonoClass*（判定字段类型是否枚举用）
+        'mono_class_from_mono_type',
+        // 枚举的底层整型类型
+        'mono_class_enum_basetype',
+        'mono_type_get_underlying_type',
         'mono_class_is_valuetype',
         'mono_class_get_interfaces',
         // 字段
@@ -533,6 +546,11 @@
             il2cpp_class_instance_size: ['pointer', ['pointer']],
             il2cpp_class_value_size: ['pointer', ['pointer', 'pointer']],
             il2cpp_class_is_enum: ['pointer', ['pointer']],
+            // Type* → Il2CppClass*：枚举字段判定必需（见 enumInfoOfField）
+            il2cpp_class_from_il2cpp_type: ['pointer', ['pointer']],
+            il2cpp_class_from_type: ['pointer', ['pointer']],
+            il2cpp_type_get_class_or_element_class: ['pointer', ['pointer']],
+            il2cpp_class_enum_basetype: ['pointer', ['pointer']],
             il2cpp_class_is_valuetype: ['pointer', ['pointer']],
             il2cpp_class_is_interface: ['pointer', ['pointer']],
             il2cpp_class_is_abstract: ['pointer', ['pointer']],
@@ -995,9 +1013,96 @@
         }
     }
 
+    /**
+     * 判定一个字段的类型是不是**枚举**，并给出它的**底层整型类型**。
+     *
+     * 为什么必须有这一层：字段枚举 API 只给一个类型名字符串
+     * （`il2cpp_field_get_type` → `typeName`），枚举字段给出的是**枚举类名**
+     * （如 `EasingType`），看起来跟一个普通类没有区别。宿主侧因此查不到
+     * `_FIELD_WIDTH`，只能按默认的 8 字节读 —— 4 字节的枚举会把**相邻字段**
+     * 的 4 字节一起读进来（`read_field_value` 给出拼出来的错值），
+     * 而 `set_field_value` 会因为「宽度 8 且类型名认不出」把它误判成
+     * **引用类型**直接拒绝写入。两者都是「看起来合理、实际是错的」。
+     *
+     * 所以判定必须在这里做（只有探针拿得到 `Il2CppClass*` / `MonoClass*`）。
+     * 拿不到就**不给 `is_enum` 字段**（而不是给 `false`）：宿主据此区分
+     * 「确认不是枚举」与「本版本探针判不了」，后者仍走原有兜底。
+     *
+     * @returns {{is_enum: boolean, enum_base_type: (string|null)}|null}
+     */
+    function enumInfoOfFieldIL2CPP(fieldInfo) {
+        if (!funcs.il2cpp_field_get_type || !funcs.il2cpp_class_is_enum) {
+            return null;
+        }
+        var typePtr = null;
+        try { typePtr = funcs.il2cpp_field_get_type(fieldInfo); } catch (e) { return null; }
+        if (!typePtr || typePtr.isNull()) { return null; }
+
+        // Type* → Il2CppClass*：三个等价导出按可用性回退
+        var klass = null;
+        var conv = funcs.il2cpp_class_from_il2cpp_type
+            || funcs.il2cpp_class_from_type
+            || funcs.il2cpp_type_get_class_or_element_class;
+        if (!conv) { return null; }
+        try { klass = conv(typePtr); } catch (e) { return null; }
+        if (!klass || klass.isNull()) { return null; }
+
+        var isEnum = false;
+        try { isEnum = funcs.il2cpp_class_is_enum(klass).toInt32() !== 0; }
+        catch (e) { return null; }
+        if (!isEnum) { return { is_enum: false, enum_base_type: null }; }
+
+        // 底层类型：il2cpp_class_enum_basetype 返回 Il2CppType*，可直接取名
+        var baseName = null;
+        if (funcs.il2cpp_class_enum_basetype) {
+            try {
+                var bt = funcs.il2cpp_class_enum_basetype(klass);
+                if (bt && !bt.isNull()) { baseName = typeName(bt); }
+            } catch (e) { baseName = null; }
+        }
+        return { is_enum: true, enum_base_type: baseName };
+    }
+
+    /**
+     * Mono 版的枚举判定（与 IL2CPP 版同形，走 `mono_*` 那套）。
+     *
+     * `mono_class_enum_basetype` 与 `mono_type_get_underlying_type` 二选一 ——
+     * 实测 Archon Soul 的 mono-2.0-bdwgc.dll 两个都有，但不同版本可能只给一个。
+     */
+    function enumInfoOfFieldMono(fieldInfo) {
+        if (!monoFuncs.mono_field_get_type || !monoFuncs.mono_class_from_mono_type
+            || !monoFuncs.mono_class_is_enum) {
+            return null;
+        }
+        var typePtr = null;
+        try { typePtr = monoFuncs.mono_field_get_type(fieldInfo); } catch (e) { return null; }
+        if (!typePtr || typePtr.isNull()) { return null; }
+
+        var klass = null;
+        try { klass = monoFuncs.mono_class_from_mono_type(typePtr); } catch (e) { return null; }
+        if (!klass || klass.isNull()) { return null; }
+
+        var isEnum = false;
+        try { isEnum = monoFuncs.mono_class_is_enum(klass).toInt32() !== 0; }
+        catch (e) { return null; }
+        if (!isEnum) { return { is_enum: false, enum_base_type: null }; }
+
+        var baseName = null;
+        try {
+            if (monoFuncs.mono_class_enum_basetype) {
+                var bt = monoFuncs.mono_class_enum_basetype(klass);
+                if (bt && !bt.isNull()) { baseName = monoTypeName(bt); }
+            }
+            if (!baseName && monoFuncs.mono_type_get_underlying_type) {
+                var ut = monoFuncs.mono_type_get_underlying_type(typePtr);
+                if (ut && !ut.isNull()) { baseName = monoTypeName(ut); }
+            }
+        } catch (e) { baseName = null; }
+        return { is_enum: true, enum_base_type: baseName };
+    }
+
     /** 枚举类的字段，带运行时偏移与类型名。 */
-    function fieldsOf(klass, wantStatic) {
-        if (!funcs.il2cpp_class_get_fields) { return []; }
+    function fieldsOf(klass, wantStatic) {        if (!funcs.il2cpp_class_get_fields) { return []; }
         var iter = Memory.alloc(Process.pointerSize);
         iter.writePointer(NULL);
         var out = [];
@@ -1015,6 +1120,15 @@
             var off = fieldOffset(f);
             rec.offset = off.offset;
             rec.offset_via = off.via;
+            // 枚举判定：让宿主能按**底层整型**定宽度，而不是把 4 字节枚举
+            // 当成 8 字节引用类型（见 enumInfoOfFieldIL2CPP 的说明）。
+            // 判定不出来时**不加** is_enum 键 —— 宿主据此区分「确认不是」
+            // 与「探针判不了」，不拿 false 冒充一个测量结果。
+            var ei = enumInfoOfFieldIL2CPP(f);
+            if (ei) {
+                rec.is_enum = ei.is_enum;
+                if (ei.enum_base_type) { rec.enum_base_type = ei.enum_base_type; }
+            }
             if (funcs.il2cpp_field_get_flags) {
                 rec.flags = hex32(funcs.il2cpp_field_get_flags(f).toUInt32());
             }
@@ -1394,6 +1508,10 @@
         mono_class_num_fields: ['pointer', ['pointer']],
         mono_class_num_methods: ['pointer', ['pointer']],
         mono_class_is_enum: ['pointer', ['pointer']],
+        // MonoType* → MonoClass*：枚举字段判定必需（见 enumInfoOfField）
+        mono_class_from_mono_type: ['pointer', ['pointer']],
+        mono_class_enum_basetype: ['pointer', ['pointer']],
+        mono_type_get_underlying_type: ['pointer', ['pointer']],
         mono_class_is_valuetype: ['pointer', ['pointer']],
         mono_class_get_interfaces: ['pointer', ['pointer', 'pointer']],
         // 实例枚举（签名逐字对照 mono/metadata/mono-gc.h）：
@@ -2082,6 +2200,13 @@
                 flags: (flags !== null) ? hex32(flags) : null,
                 is_static: isStatic
             };
+            // 枚举判定（与 IL2CPP 版同形）：Mono 上同样拿不到就会把 4 字节
+            // 枚举按 8 字节读、并在写入时被误判成引用类型。
+            var mei = enumInfoOfFieldMono(f);
+            if (mei) {
+                rec.is_enum = mei.is_enum;
+                if (mei.enum_base_type) { rec.enum_base_type = mei.enum_base_type; }
+            }
             if (monoFuncs.mono_field_get_offset) {
                 try {
                     rec.offset = monoFuncs.mono_field_get_offset(f).toInt32();

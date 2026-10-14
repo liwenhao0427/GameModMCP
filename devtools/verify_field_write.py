@@ -204,7 +204,117 @@ for tname in ["System.String", "Some.Game.Manager", None]:
           f"kind={k} key={key!r}")
 
 # ================================================================
-section("6. 非空转反证：把实现改回旧写法，断言必须报红")
+section("6. 枚举字段：按**底层整型**定宽度，不误读 8 字节、不误拒写入")
+
+# 枚举字段的类型名是**枚举类名**（EasingType），与普通类名长得一样，
+# 所以 `_FIELD_WIDTH` 查不到 → 默认 8 字节。两个后果都很隐蔽：
+#   · read：把相邻字段的 4 字节一起读进来，`as_int64` 是拼出来的数；
+#   · write：宽 8 + 类型认不出 ⇒ 被当成**引用类型**直接拒绝（枚举本该可写）。
+# `_resolve_enum_underlying` 负责折成底层类型。这里不需要游戏：
+# 它读的是字段记录里的 `is_enum` / `enum_base_type`（探针给的），
+# 以及静态索引的 `is_enum` 列（兜底）。
+
+
+class _StubIndex:
+    """假索引：只回答 `_resolve_enum_underlying` 会话那一条 SQL。"""
+
+    class _Row(dict):
+        def __getitem__(self, k):
+            return dict.__getitem__(self, k)
+
+    def __init__(self, enums):
+        self._enums = set(enums)               # 这些名字是枚举
+
+    @property
+    def conn(self):
+        outer = self
+
+        class _Conn:
+            def execute(self, sql, params):
+                name = params[0]
+                hit = name in outer._enums
+
+                class _Cur:
+                    def fetchone(self_inner):
+                        return _StubIndex._Row(is_enum=1 if hit else 0)
+                return _Cur()
+        return _Conn()
+
+
+class _StubState:
+    def __init__(self, index=None):
+        self._index = index
+
+    def has_index(self):
+        return self._index is not None
+
+    @property
+    def index(self):
+        return self._index
+
+
+# ① 探针判定（首选来源）：is_enum=True + 显式底层类型
+st_none = _StubState(None)
+check("探针说 is_enum=True 且给了 enum_base_type → 用底层类型",
+      S._resolve_enum_underlying(
+          st_none, "EasingType",
+          {"is_enum": True, "enum_base_type": "System.Byte"}) == "System.Byte")
+check("探针说 is_enum=True 但没给底层类型 → 默认 System.Int32（C# 规范）",
+      S._resolve_enum_underlying(
+          st_none, "EasingType", {"is_enum": True}) == "System.Int32")
+check("探针明确说 is_enum=False → 不当作枚举（不猜）",
+      S._resolve_enum_underlying(
+          st_none, "MyClass", {"is_enum": False}) is None)
+
+# ② 无探针判定时走静态索引兜底
+st_idx = _StubState(_StubIndex({"EasingType", "Game.State"}))
+check("探针没给判定 + 索引说它是枚举 → 兜底按 System.Int32",
+      S._resolve_enum_underlying(st_idx, "EasingType", {}) == "System.Int32")
+check("索引说它不是枚举 → 仍然返回 None（引用类型照旧被拒）",
+      S._resolve_enum_underlying(st_idx, "MyManager", {}) is None)
+check("基础类型根本不需要兜底（索引都不查）",
+      S._resolve_enum_underlying(st_idx, "System.Int32", {}) is None)
+check("没有索引可用时不猜（返回 None）",
+      S._resolve_enum_underlying(st_none, "EasingType", {}) is None)
+
+# ③ 折成底层类型之后，宽度与写入方式都要对
+for base, want_w, want_k in [("System.Int32", 4, "int"),
+                             ("System.Byte", 1, "uint"),
+                             ("System.Int16", 2, "int"),
+                             ("System.Int64", 8, "long")]:
+    w = S._field_read_width(base)
+    k = S._field_write_kind(base, w)
+    check(f"枚举底层 {base} → 宽 {want_w} / 写 {want_k}",
+          w == want_w and k == want_k, f"实际 w={w} k={k}")
+
+# ④ 关键对照：不折底层类型（旧写法）会怎样 —— 这正是缺陷本身
+_enum_w_old = S._field_read_width("EasingType")
+_enum_w_new = S._field_read_width(S._resolve_enum_underlying(
+    st_none, "EasingType", {"is_enum": True, "enum_base_type": "System.Int32"}))
+check("旧写法把枚举当 8 字节读（这就是缺陷）", _enum_w_old == 8,
+      f"read_width={_enum_w_old}")
+check("新写法按底层类型得到 4 字节（修复生效）", _enum_w_new == 4,
+      f"read_width={_enum_w_new}")
+check("反证有效：新旧宽度**确实不同**（否则上面两条是空转的）",
+      _enum_w_old != _enum_w_new, f"旧={_enum_w_old} 新={_enum_w_new}")
+
+# 旧写法下 set_field_value 会走到「疑似引用类型」拒绝分支；新写法不会
+_old_kind = S._field_write_kind("EasingType", _enum_w_old)
+_old_would_reject = (_old_kind == "long"
+                     and "EasingType" not in S._FIELD_WRITE_KIND)
+_new_kind = S._field_write_kind("System.Int32", _enum_w_new)
+_new_would_reject = (_new_kind == "long"
+                     and "System.Int32" not in S._FIELD_WRITE_KIND)
+check("旧写法把枚举判成「疑似引用类型」拒绝写入（这就是缺陷）",
+      _old_would_reject, f"kind={_old_kind}")
+check("新写法允许写入（枚举本该可以写整数）", not _new_would_reject,
+      f"kind={_new_kind}")
+check("枚举写入的编码是 4 字节整数",
+      S._encode_field_value(7, 4, "int")[0] == b"\x07\x00\x00\x00",
+      "7 → 07000000")
+
+# ================================================================
+section("7. 非空转反证：把实现改回旧写法，断言必须报红")
 
 # 反证 1：宽度一律 8（旧行为）→ int32 的宽度断言必须不再成立
 orig_read_width = S._field_read_width
