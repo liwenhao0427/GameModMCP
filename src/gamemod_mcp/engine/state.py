@@ -809,6 +809,7 @@ def ensure_runtime(
     spawn: bool = False,
     launcher_exe: str = "",
     preferred_module: str = "",
+    args: list[str] | None = None,
 ) -> dict:
     """保证当前游戏有已注入的运行时会话（必要时注入）。
 
@@ -816,6 +817,11 @@ def ensure_runtime(
         pid         指定进程
         launcher_exe 指定可执行文件（会 spawn 并抢在启动前注入）
         auto_find   都不给时，按当前游戏的主程序名自动找进程
+
+    `args` **只在 `spawn=True` 时有意义**：它是传给游戏进程的命令行参数
+    （`spawn_and_attach` 早就在收这个参数，只是本函数此前没接上，
+    于是 `launch_game(args=...)` 解析出的参数被静默丢弃 —— 调用方看到的
+    返回里有 `argv`，游戏却按**没有参数**启动）。
     """
     from ..runtime import (attach, spawn_and_attach, SessionError,
                            RuntimeUnavailable, probe_available)
@@ -880,6 +886,7 @@ def ensure_runtime(
             try:
                 sess = spawn_and_attach(
                     launcher_exe,
+                    args=args,
                     cwd=str(Path(launcher_exe).parent),
                     preferred_module=preferred_module,
                     # 由本函数统一等待，便于把「等了多久/试了几次」报给 Agent

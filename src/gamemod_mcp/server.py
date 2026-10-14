@@ -1644,7 +1644,7 @@ def launch_game(exe: str = "", args: str = "", preferred_module: str = "") -> di
 
     argv = _split_argv(args) if args else []
     res = ensure_runtime(spawn=True, launcher_exe=target,
-                         preferred_module=preferred_module)
+                         preferred_module=preferred_module, args=argv)
     if not res.get("ok"):
         # 把下层的 hint 一起透传：例如「已有会话，先 close_session」
         # 这类出路信息比单纯的 error 更有用，丢掉会让 Agent 无从下手。

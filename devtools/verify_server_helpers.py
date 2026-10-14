@@ -301,6 +301,81 @@ def main() -> int:
     check("hook_status 抛异常时放行（不把写入变成不可用）",
           S._overlapping_hook(_BoomState(), "0x7ffa2cc4b170", 16) is None)
 
+    section("6. `launch_game(args=...)` 必须把解析出的 argv 透传下去")
+    # 这条原来是「说了话不干活」：`launch_game` 用 `_split_argv` 解析出了 argv、
+    # 还在返回里回传了它，却**没往下传** —— `ensure_runtime` 的签名里根本没有
+    # args，`spawn_and_attach` 却在第 2 个位置早就支持它。于是调用方看到
+    # `argv: [...]`（以为生效了），游戏实际上是**按没有参数**启动的。
+    # 这类缺陷不会被任何异常暴露，只能靠拦截底层调用钉住。
+    import tempfile                                          # noqa: E402
+    import gamemod_mcp.engine.state as _st_mod               # noqa: E402
+
+    captured: dict = {}
+
+    class _FakeRuntime:
+        pid = 424242
+
+    def _fake_ensure_runtime(**kw):
+        captured.clear()
+        captured.update(kw)
+        return {"ok": True, "runtime": {"pid": 424242}}
+
+    # 用一个真实存在的文件当 exe：`launch_game` 会先做 is_file 检查
+    with tempfile.TemporaryDirectory() as td:
+        fake_exe = os.path.join(td, "Game.exe")
+        with open(fake_exe, "wb") as fh:
+            fh.write(b"MZ")                                  # 内容无关，只要存在
+
+        orig = (S.ensure_runtime, S._has_live_session,
+                S._same_named_processes, _st_mod.ensure_runtime)
+        try:
+            S.ensure_runtime = _fake_ensure_runtime
+            S._has_live_session = lambda: False
+            S._same_named_processes = lambda exe: []
+
+            args_text = r'-popupwindow -path "C:\My Game\a.txt"'
+            res = S.launch_game(exe=fake_exe, args=args_text)
+        finally:
+            (S.ensure_runtime, S._has_live_session,
+             S._same_named_processes, _st_mod.ensure_runtime) = orig
+
+        want_argv = ["-popupwindow", "-path", r"C:\My Game\a.txt"]
+        check("launch_game 调通了（返回 ok）", res.get("ok") is True,
+              str(res.get("error", ""))[:80])
+        check("`launch_game` 返回里如实给出 argv",
+              res.get("argv") == want_argv, f"得到 {res.get('argv')!r}")
+        check("argv 被传给了 `ensure_runtime(args=...)`",
+              captured.get("args") == want_argv,
+              f"底层收到 args={captured.get('args')!r}")
+        check("spawn 模式与目标 exe 也照常传下去",
+              captured.get("spawn") is True
+              and captured.get("launcher_exe") == fake_exe,
+              f"spawn={captured.get('spawn')!r} exe={captured.get('launcher_exe')!r}")
+
+        # 非空转反证：把透传去掉（复刻修复前的调用），断言上面那条会失败。
+        # 只留「返回里有 argv」这一半，正是原来的样子 —— 看着对、其实没生效。
+        captured.clear()
+        try:
+            S.ensure_runtime = _fake_ensure_runtime
+            S._has_live_session = lambda: False
+            S._same_named_processes = lambda exe: []
+            S.ensure_runtime(spawn=True, launcher_exe=fake_exe)   # 旧写法：无 args
+        finally:
+            (S.ensure_runtime, S._has_live_session,
+             S._same_named_processes, _st_mod.ensure_runtime) = orig
+        check("反证：不透传时底层拿不到 args（说明上面那条不是空转）",
+              captured.get("args") is None,
+              f"旧写法底层 args={captured.get('args')!r}")
+
+    # `ensure_runtime` 的签名必须真的收这个参数（否则只是 server 侧自说自话）
+    import inspect                                           # noqa: E402
+    sig = inspect.signature(_st_mod.ensure_runtime)
+    check("`ensure_runtime` 签名里有 args 参数",
+          "args" in sig.parameters, str(sig))
+    check("`ensure_runtime` 把 args 转发给 `spawn_and_attach`",
+          "args=args" in inspect.getsource(_st_mod.ensure_runtime),
+          "纯签名检查挡不住「收了但不用」")
+
     print()
     print("=" * 74)
     if FAIL:
