@@ -147,10 +147,73 @@ async def fastmcp_text_size(payload: dict) -> int:
     return len((content[0].text if content else "").encode("utf-8"))
 
 
+def check_context_cost() -> None:
+    """工具 schema 的**固定上下文成本**（**不需要样本**，永远会跑）。
+
+    工具描述 + 入参 schema 是**每次会话都要付**的固定成本（客户端初始化时
+    拉一次 `tools/list`），与单次响应体积是两回事，但同属「别把 Agent 的
+    上下文炸掉」这条线。这里把现状量成数字并**钉住不许明显增长**。
+
+    为什么是「量 + 封顶」而不是「砍」：实测 45 个工具的 docstring 里
+    **几乎没有可无损删除的东西** ——
+      · 同一 docstring 内逐字重复的句子：仅 1 处分隔线；
+      · 跨工具逐字重复的段落：**0 处**；
+      · 与 `instructions`（永远在上下文里）重叠的句子：仅 1 句。
+    也就是说 docstring 里那些「历史故事」是**唯一一份**知识，
+    删掉就是丢信息（AGENTS.md §2.3 不许编造，反过来也不该丢证据）。
+    所以这里是**容量门禁**，不是裁剪任务：超了就说明该考虑拆分/合并工具。
+    """
+    section("4. 工具 schema 的固定上下文成本（不该无界增长）")
+
+    tools = asyncio.run(S.mcp.list_tools())
+
+    def _sz(o: Any) -> int:
+        return len(json.dumps(o, ensure_ascii=False, default=str)
+                   .encode("utf-8"))
+
+    instr = str(getattr(S.mcp, "instructions", "") or "")
+    per_tool = {t.name: _sz({"name": t.name, "description": t.description,
+                             "inputSchema": t.inputSchema}) for t in tools}
+    tools_bytes = sum(per_tool.values())
+    total_bytes = _sz(instr) + tools_bytes
+    desc_chars = sum(len(t.description or "") for t in tools)
+    print(f"  instructions {_sz(instr):,} B ＋ tools/list {tools_bytes:,} B "
+          f"＝ **{total_bytes:,} B ≈ {total_bytes // 1024} KB**")
+    print(f"  （其中 description 共 {desc_chars:,} 字符；"
+          f"{len(tools)} 个工具，平均 {tools_bytes // max(1, len(tools)):,} B/个）")
+    top = sorted(per_tool.items(), key=lambda kv: -kv[1])[:5]
+    print("  最大的 5 个：" + "，".join(f"{n}={v:,}B" for n, v in top))
+
+    # 门禁：固定成本一旦超过 96 KB 就该重新评估（当前实测约 72 KB）。
+    # 这个数不是「目标」，而是「明显异常」的边界 —— 定得太紧会逼着后来的
+    # 人删掉唯一一份知识（上面已说明那种删除是有损的）。
+    check("固定上下文成本仍然在 96 KB 以内（超了说明该拆分/合并工具了）",
+          total_bytes <= 96 * 1024,
+          f"实测 {total_bytes:,} B ≈ {total_bytes // 1024} KB")
+    check("`instructions` 工作流里点到的工具都还存在",
+          all(name in per_tool for name in
+              ("open_game", "class_detail", "runtime_class_info",
+               "hook_method", "drain_events")),
+          "抽查 instructions 工作流里的 5 个工具名都还在")
+
+    # 非空转对照：这些数字不是常量 —— 换一个工具子集就会变
+    check("成本确实随工具集变化（不是恒定的常量）",
+          sum(list(per_tool.values())[:1]) < tools_bytes,
+          "单个工具 < 全部工具，说明上面量的是真值")
+
+
 def main() -> int:
+    # 固定成本那一节**不需要样本**，先跑 —— 否则样本缺失时会被一起跳过。
+    check_context_cost()
+
     game = samples.find_il2cpp()
     if not samples.require(game, "IL2CPP 样本（Garden of Witches）"):
-        return 0
+        print()
+        print("=" * 78)
+        print(f"\u26a0\ufe0f  通过 {PASS} 项，失败 {FAIL} 项（响应体积部分"
+              f"**无法验证**，未假装通过）")
+        print("=" * 78)
+        return 1 if FAIL else 0
     opened = S.open_game(game_dir=str(game))
     if not check("open_game 成功", bool(opened.get("ok")),
                  f"engine={opened.get('engine')} "

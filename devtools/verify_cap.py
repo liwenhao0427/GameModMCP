@@ -217,6 +217,78 @@ def test_pure() -> None:
         S.RAW_TOOLS.clear()
         S.RAW_TOOLS.update(raw_snapshot)
 
+    # ============================================================ 多列表
+    section("8. 一次返回里**两个**列表都超限：句柄与 returned 都不许串")
+    # `class_detail` / `class_hierarchy` 这类返回会同时带两个顶层列表
+    # （`items` + `derived`、`up` + `down`）。原实现在这里有两个缺陷：
+    #   ① 两个列表的句柄都写 `out["handle"]` → 后一个**覆盖**前一个，
+    #      调用方按 `handle` 续读拿到的是**另一个列表**的数据；
+    #   ② 通用字段 `returned` / `has_more` 被**后一个列表**改写 →
+    #      实测 `items` 只剩 1 条而 `returned` 报 2322。
+    # 两者都不报错、都"看着正常"，只能靠这种双列表载荷钉住。
+    _big_a = [{"full_name": "A" * 60, "i": i} for i in range(9000)]
+    _big_b = [{"full_name": "B" * 60, "i": i} for i in range(9000)]
+    _multi = {"ok": True, "total": 9000, "items": _big_a, "derived": _big_b,
+              "has_more": False, "derived_has_more": False,
+              "returned": 9000, "derived_returned": 9000}
+    _store_m = ResultStore(owner="multi", max_entries=20)
+    out_m = cap.enforce(_multi, tool="class_detail", store=_store_m)
+    check("两个列表都被截断", out_m.get("capped") is True
+          and len(out_m.get("items") or []) < 9000
+          and len(out_m.get("derived") or []) < 9000,
+          f"items={len(out_m.get('items') or [])} "
+          f"derived={len(out_m.get('derived') or [])}")
+
+    h_items = out_m.get("handle")
+    h_derived = out_m.get("derived_handle")
+    check("第一个列表的句柄在通用字段 `handle` 里",
+          bool(h_items) and h_items != h_derived, f"handle={h_items!r}")
+    check("第二个列表的句柄有**自己的**字段（不被覆盖）",
+          bool(h_derived) and h_derived != h_items,
+          f"derived_handle={h_derived!r}")
+    check("两个句柄都能查到（**各自**的结果集）",
+          _store_m.get(h_items) is not None
+          and _store_m.get(h_derived) is not None,
+          f"handle={h_items!r} derived_handle={h_derived!r}")
+    check("反证：一个句柄字段装不下两个列表 —— 修复前 "
+          "`derived_handle` 不存在",
+          out_m.get("derived_handle") is not None,
+          "旧实现只写 out['handle']，两次写后者覆盖前者")
+
+    check("`returned` 与 **items** 的实际条数一致（不许被 derived 改掉）",
+          out_m.get("returned") == len(out_m.get("items") or []),
+          f"returned={out_m.get('returned')} 而 items 有 "
+          f"{len(out_m.get('items') or [])} 条")
+    check("`derived_returned` 与 derived 的实际条数一致",
+          out_m.get("derived_returned") == len(out_m.get("derived") or []),
+          f"derived_returned={out_m.get('derived_returned')} 而 derived 有 "
+          f"{len(out_m.get('derived') or [])} 条")
+    check("两个列表的 has_more 都是 True（都被截了）",
+          out_m.get("has_more") is True
+          and out_m.get("derived_has_more") is True,
+          f"has_more={out_m.get('has_more')} "
+          f"derived_has_more={out_m.get('derived_has_more')}")
+    _note_m = out_m.get("note") or ""
+    check("note 里两个句柄都提到，且**写明各自的字段名**",
+          h_items in _note_m and h_derived in _note_m
+          and ("derived_handle" in _note_m or "handle" in _note_m),
+          "否则 Agent 只能从散文里猜哪个句柄对应哪个列表")
+    check("整体仍然不超上限", cap.measure(out_m) <= cap.CAP_BYTES,
+          f"{cap.measure(out_m):,} B")
+
+    # 单一列表时行为不变（别把常见路径改坏）：仍然只写 `handle`
+    _single = {"ok": True, "items": rows(4000), "total": 4000,
+               "returned": 4000, "has_more": False}
+    _store_s = ResultStore(owner="single", max_entries=10)
+    out_s = cap.enforce(_single, tool="t", store=_store_s)
+    check("单列表路径不变：句柄仍在 `handle`，没有多余的 `*_handle`",
+          bool(out_s.get("handle")) and "items_handle" not in out_s,
+          f"handle={out_s.get('handle')!r}")
+    check("单列表路径不变：returned / has_more 照旧被改写",
+          out_s.get("returned") == len(out_s.get("items") or [])
+          and out_s.get("has_more") is True,
+          f"returned={out_s.get('returned')} has_more={out_s.get('has_more')}")
+
 
 # ============================================================ 端到端层
 

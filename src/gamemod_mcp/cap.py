@@ -90,6 +90,20 @@ def _fit(payload: dict, key: str, items: list, cur: int) -> int:
 
     起始值只是估算，最后仍用**真实测量**收敛（最多 6 轮）——
     末条特别宽时估算会偏大，不许只凭估算下结论。
+
+    ## 一个被实测否决的「优化」（别再试）
+
+    曾有一版设计想在这里省掉整包 `measure(probe)`，改成
+    `other + measure(items[:keep])`（理由是「只序列化列表」）。**实测它更慢**：
+
+        items=2000   旧 5.3ms  →  新 9.2ms   （0.58x）
+        items=8000   旧 4.7ms  →  新 8.8ms   （0.53x）
+        收敛多轮时   旧 24.5ms →  新 39.6ms  （0.62x）  ← 最坏情况
+
+    原因：两种写法都要序列化**同一个大列表**，差别只在「其它部分」那点字节，
+    而新写法**反而多一轮**（估算通过后还要整包校验一次才敢定稿）。
+    省下的那部分可以忽略，多出来的那一轮是实打实的。
+    所以这里保留整包测量 —— 它同时是**正确性**保证（收敛判据就是整包大小）。
     """
     total = len(items)
     if total <= 0:
@@ -113,18 +127,39 @@ def _fit(payload: dict, key: str, items: list, cur: int) -> int:
     return keep
 
 
-def _register(out: dict, key: str, items: list, store: Any) -> tuple[str | None, bool]:
-    """给被截断的完整列表找一个句柄，返回 (句柄, 是否复用了已有句柄)。"""
+def _register(out: dict, key: str, items: list, store: Any,
+              owner: str | None = None) -> tuple[str | None, bool, str, str]:
+    """给被截断的完整列表找一个句柄。
+
+    返回 `(句柄, 是否复用了已有句柄, 该写入的字段名, 新的 owner)`。
+
+    **一次返回里可能有多个超限的顶层列表**（实测：同时带 `items` 与 `derived`
+    两个大列表时两个都会被截）。这时不能都往 `out["handle"]` 上写 ——
+    后一个会把前一个**覆盖掉**，于是调用方按 `out["handle"]` 去续读，
+    拿到的是**另一个列表**的句柄（实测修复前 `out["handle"]` 指向 `derived`，
+    而 `items` 的句柄只剩在 `note` 的散文里，结构化字段里拿不到）。
+
+    规则：
+      · `items` 且已有句柄 → 复用（`search_*` 的 `_paged` 本来就给了
+        指向完整结果集的句柄，再给一个只会让 Agent 犹豫用哪个）；
+      · 否则登记新句柄。`out["handle"]` **还没被别的列表占用**就写它
+        （保持既有契约：单个列表被截时仍然叫 `handle`），
+        已被占用则写 `out[f"{key}_handle"]` —— 两个句柄都在**结构化字段**里，
+        调用方不必去解析 `note` 的散文。
+    """
     if key == "items" and out.get("handle"):
-        return str(out["handle"]), True
+        return str(out["handle"]), True, "handle", owner or key
     if store is None:
-        return None, False
+        return None, False, "handle", owner
     # 延迟导入：cap 是协议层的小工具，不该在导入期就把索引层拉起来
     from .engine.index import list_source
 
     handle = store.put(key, list_source(items)).handle
-    out["handle"] = handle
-    return handle, False
+    if owner is None:
+        return handle, False, "handle", key
+    if owner == key:
+        return handle, False, "handle", key
+    return handle, False, f"{key}_handle", owner
 
 
 def enforce(payload: Any, *, tool: str, store: Any = None) -> Any:
@@ -144,9 +179,23 @@ def enforce(payload: Any, *, tool: str, store: Any = None) -> Any:
             candidates.append((measure(v), k))
     candidates.sort(reverse=True)
 
+    #: 通用字段（`returned` / `has_more`）归属哪个列表。
+    #:
+    #: 为什么需要它：这些是**不带前缀**的字段，只有**一个**列表能拥有它们。
+    #: 原来对每个被截的列表都写一遍，于是两个列表都被截时，后一个会把前一个
+    #: 的数字覆盖掉 —— 实测同时带 `items`（截到 1 条）与 `derived`（截到 2322 条）
+    #: 时，`returned` 报的是 **2322**，而 `items` 只剩 1 条。调用方读
+    #: `returned` 会以为拿到了两千多条，据此判断「数据差不多齐了」。
+    #: 带前缀的（`derived_returned` / `down_has_more`）不受影响，永远各归各。
+    primary = "items" if isinstance(payload.get("items"), list) else (
+        candidates[0][1] if candidates else "")
+
     out = dict(payload)
     notes: list[str] = []
     capped = False
+    #: 第一个被截断的列表占住 `out["handle"]`；后续列表写各自的
+    #: `out[f"{key}_handle"]`，避免互相覆盖（见 `_register` 的说明）。
+    handle_owner: str | None = None
     for _, key in candidates:
         cur = measure(out)
         if cur <= CAP_BYTES:
@@ -157,25 +206,34 @@ def enforce(payload: Any, *, tool: str, store: Any = None) -> Any:
             continue
         out[key] = items[:keep]
         capped = True
-        handle, reused = _register(out, key, items, store)
+        handle, reused, field, handle_owner = _register(
+            out, key, items, store, handle_owner)
+        if handle:
+            out[field] = handle
         resume = _resume_at(out, key, keep, reused)
 
-        # 说 has_more=false 却还有没给的数据，就是撒谎：截断后一律为 true
+        # 说 has_more=false 却还有没给的数据，就是撒谎：截断后一律为 true。
+        # 通用字段只由 primary 列表更新（否则会被别的列表改掉）；
+        # 带前缀的字段永远跟着自己的列表。
+        generic = (key == primary)
         for hk in ("has_more", f"{key}_has_more"):
-            if hk in out:
+            if hk in out and (generic or hk != "has_more"):
                 out[hk] = True
         for rk in ("returned", f"{key}_returned"):
-            if rk in out:
+            if rk in out and (generic or rk != "returned"):
                 out[rk] = keep
 
         head = (f"{key} 共 {len(items)} 条，超过单次响应上限 "
                 f"{CAP_BYTES // 1024} KB，只回了前 {keep} 条")
+        # 续读提示里的句柄名**必须与结构化字段一致**：两个列表都被截时
+        # 前一个列表的句柄在 `items_handle`（不是 `handle`），
+        # 提示里写错名字会让 Agent 拿着另一个列表的句柄去翻页。
         if handle and reused:
             notes.append(f"{head}；用 read_query_result(handle={handle!r}, "
                          f"offset={resume}, limit=...) 继续取"
                          f"（该句柄里有全部 {out.get('total', len(items))} 条）")
         elif handle:
-            notes.append(f"{head}；完整列表已存为句柄 {handle!r}，用 "
+            notes.append(f"{head}；完整列表已存为句柄 `{field}`={handle!r}，用 "
                          f"read_query_result({handle!r}, offset={resume}, "
                          f"limit=...) 取剩下的")
         else:

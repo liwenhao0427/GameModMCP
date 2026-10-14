@@ -3017,12 +3017,10 @@ def wait_for(kind: str, target: str = "", region: str = "", window: str = "",
       · `verdict` —— `pass` / `fail` / `unverifiable` 三态。
         `unverifiable` 表示「**没法判**」（例如依赖不可用、探针不上线），
         与 `fail`（判了、没成立）严格区分 —— 把「没法判」说成「没通过」
-        会让 Agent 去修一个根本不存在的缺陷。
+        会让 Agent 去修一个根本不存在的缺陷。**超时如实报 `fail`**。
       · `polls` / `elapsed_ms` / `interval_ms` —— 轮询了几次、花了多久
       · `evidence` —— 每次轮询的实测值（最后若干次），可核查
       · `hint` —— 超时时给出下一步建议
-
-    超时**如实报 `verdict=fail`**，不静默当成通过。
 
     Args:
         kind:        上面五种之一。
