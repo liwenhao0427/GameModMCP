@@ -372,6 +372,58 @@ for _m in ("readStaticRaw", "writeStaticRaw"):
     check(f"BE_IL2CPP 实现了 {_m}", _m in _il2cpp_zone2)
     check(f"BE_MONO 实现了 {_m}", _m in _mono_zone2)
 
+# ---- Batch 7：Mono 实例枚举的 Unity 快路径
+#
+# 缺陷现场：Mono 后端只有 `mono_gc_walk_heap`，而它受官方语义限制
+# （只在 pre-stop-world 回调内有效）→ 从 Frida 线程调用拿不到对象，
+# 工具如实报 unsupported。可 Unity 里 90% 需要找实例的类
+#（MonoBehaviour / Component / GameObject / ScriptableObject / Transform）
+# 都继承自 UnityEngine.Object，Unity 自己也提供了枚举接口。
+print()
+print("  ---- Batch 7：Mono 实例枚举的 Unity 快路径 ----")
+check("agent.js 定义了 monoIsUnityObjectClass（判定是否 Unity 对象）",
+      re.search(r"function\s+monoIsUnityObjectClass\s*\(", text) is not None)
+check("agent.js 定义了 findInstancesMonoUnity（快路径实现）",
+      re.search(r"function\s+findInstancesMonoUnity\s*\(", text) is not None)
+_fi_mono = _agent_slice(r"function findInstancesMono\(", r"\n    // ==+ 静态字段")
+print(f"  findInstancesMono 片段长度：{len(_fi_mono)}")
+check("取到了 findInstancesMono 的函数体（断言不是空转）", len(_fi_mono) > 800)
+check("findInstancesMono 会**先试** Unity 快路径",
+      "monoIsUnityObjectClass" in _fi_mono
+      and _fi_mono.index("monoIsUnityObjectClass")
+      < _fi_mono.index("mono_gc_walk_heap"))
+check("快路径返回时带 via 标注（调用方知道走的哪条路）",
+      "Resources.FindObjectsOfTypeAll" in text)
+check("堆遍历结果也带 via（两条路可区分）",
+      "via: 'mono_gc_walk_heap'" in text)
+# 非空转反证：快路径**不可用**时要继续退到堆遍历，而不是直接放弃。
+check("反证：快路径失败后会退回堆遍历（不是直接放弃）",
+      "fastPathNote" in _fi_mono and "mono_gc_walk_heap" in _fi_mono,
+      "两条路是互补的")
+# 最重要的架构约束：**不许**硬编码 MonoArray 的内部偏移。
+_unity_fn = _agent_slice(r"function findInstancesMonoUnity\(",
+                         r"\n    /\*\*\n     \* 枚举某个类在堆上")
+print(f"  findInstancesMonoUnity 片段长度：{len(_unity_fn)}")
+check("取到了快路径函数体（断言不是空转）", len(_unity_fn) > 800)
+check("★ 快路径不硬编码 MonoArray 内部偏移（用官方导出取长度/元素）",
+      "mono_array_length" in _unity_fn
+      and "mono_array_addr_with_size" in _unity_fn,
+      "本文件开篇禁止硬编码内部结构体布局")
+for _bad_off in ("+ 0x18", "+0x18", "+ 0x20", "+0x20", "add(0x18)", "add(0x20)"):
+    check(f"快路径里没有硬编码偏移 {_bad_off!r}",
+          _bad_off not in _unity_fn,
+          "指导书建议读 +0x18/+0x20，但那是硬编码内部布局，已改为官方导出")
+check("快路径用了 mono_class_get_type + mono_type_get_object 拿 System.Type",
+      "mono_class_get_type" in _unity_fn
+      and "mono_type_get_object" in _unity_fn)
+check("快路径用 mono_runtime_invoke 调静态方法（obj 传 NULL）",
+      "mono_runtime_invoke(method, NULL" in _unity_fn)
+# 新登记的 5 个导出必须成对出现在两张表里（下面 §2 还会在 4 个样本上核实存在）
+for _need in ("mono_class_get_type", "mono_type_get_object",
+              "mono_runtime_invoke", "mono_array_length",
+              "mono_array_addr_with_size"):
+    check(f"登记了快路径所需的导出 {_need}", _need in api_names)
+
 # ---- 探针源码不许被缓存（改了 agent.js 必须立刻生效）
 section("1b. 探针源码读取不许缓存（改了 agent.js 必须立刻生效）")
 tmp = Path(tempfile.mkdtemp(prefix="gamemod-agent-src-"))
@@ -1042,6 +1094,46 @@ else:
     else:
         check("find_instances 可调用（Mono 路径）", False,
               "没有可用类名，跳过", warn_only=True)
+
+    # ---- Batch 7：Unity 对象走快路径，**应当拿到实例**（真机端到端）
+    #
+    # 上面那条只断言「契约」（成功或如实说不可用）—— 那对**纯 C# 类**是
+    # 正确口径。但对 `UnityEngine.Object` 的派生类，本仓库现在有一条官方
+    # 快路径（`Resources.FindObjectsOfTypeAll`），它**不该**落到
+    # 「本时机不可用」：Unity 自己也用这个接口。所以这里单独断言
+    # 「确实拿到了实例」——若哪天快路径断了，这条会报红。
+    _unity_ok = 0
+    for _un, _uns in (("Transform", "UnityEngine"),
+                      ("GameObject", "UnityEngine"),
+                      ("Camera", "UnityEngine")):
+        _ur = S.find_instances(name=_un, namespace=_uns, max_count=5)
+        print(f"     find_instances({_un}): ok={_ur.get('ok')} "
+              f"count={_ur.get('count')} via={_ur.get('via')}")
+        if _ur.get("ok") and (_ur.get("count") or 0) > 0:
+            _unity_ok += 1
+            check(f"{_un} 走 Unity 快路径并拿到实例",
+                  _ur.get("via") == "Resources.FindObjectsOfTypeAll",
+                  f"via={_ur.get('via')!r}")
+        else:
+            check(f"{_un} 走 Unity 快路径并拿到实例", False,
+                  f"ok={_ur.get('ok')} count={_ur.get('count')} "
+                  f"err={str(_ur.get('error'))[:90]}")
+    # 反证：这**不是**「随便什么类都能拿到」，而是快路径在起作用 ——
+    # 至少一类拿到即说明代码路径通了；一个都没有说明快路径没接上。
+    check("反证：至少一类 Unity 对象拿到了实例（快路径确实通了）",
+          _unity_ok > 0, f"{_unity_ok}/3 类拿到")
+    # 拿到的指针必须是**活对象**：用它去解析类信息能成功
+    _pchk = S.find_instances(name="Transform", namespace="UnityEngine",
+                             max_count=1)
+    if _pchk.get("ok") and (_pchk.get("pointers") or []):
+        _ci = S.runtime_class_info(name="Transform", namespace="UnityEngine",
+                                   methods=False)
+        check("拿到的指针可用于后续操作（该类能在运行时解析出字段）",
+              _ci.get("ok") is True and bool(_ci.get("fields") or []),
+              f"ok={_ci.get('ok')} fields={len(_ci.get('fields') or [])}")
+    else:
+        check("拿到的指针可用于后续操作", False,
+              "Transform 未拿到指针", warn_only=True)
 
     # ---- 收尾（含上面 hook_address 可能留下的 hook）
     S.unhook()

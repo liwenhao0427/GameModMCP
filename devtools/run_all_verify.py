@@ -12,6 +12,7 @@
 
 用法：
     python devtools/run_all_verify.py              # 全部 + 覆盖率门禁
+    python devtools/run_all_verify.py --fast       # 只跑离线脚本（秒级自检）
     python devtools/run_all_verify.py --no-cov     # 只跑验收脚本
     python devtools/run_all_verify.py --retries 2  # 崩溃时最多重试几次
 """
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import subprocess
 import sys
@@ -50,6 +52,73 @@ TIMEOUT_CODE = -9
 
 COV_LOG = os.path.join(ROOT, ".cache-test", "tool_calls.jsonl")
 LOCK = os.path.join(ROOT, ".cache-test", "run_all_verify.lock")
+
+#: 「需要真机游戏」的调用名。脚本里出现对这些函数的**真实调用**，
+#: 就说明它会拉起/注入一个游戏进程。
+_LIVE_CALLS = {"spawn_and_attach", "launch_game", "inject_process",
+               "ensure_runtime"}
+
+
+def _is_stub_call(node: ast.AST, tree: ast.AST) -> bool:
+    """这个调用是不是「monkeypatch 的桩」（而非真的去拉游戏）。
+
+    两类桩都要排除，否则 `--fast` 会把纯离线脚本也一起跳过：
+      · 在 `lambda` 体内（如 `S.ensure_runtime = lambda **kw: ...`）；
+      · 出现在**属性/下标的赋值右侧**（如 `S.ensure_runtime = _fake`）。
+    这不是洁癖：`verify_server_helpers.py` 就是这样用桩测 `launch_game(args=)`
+    的参数透传的，它**完全不需要真机**。
+    """
+    for parent in ast.walk(tree):
+        for _field, value in ast.iter_fields(parent):
+            kids = value if isinstance(value, list) else [value]
+            for kid in kids:
+                if not isinstance(kid, ast.AST) or kid is node:
+                    continue
+                if node not in ast.walk(kid):
+                    continue
+                if isinstance(parent, ast.Lambda):
+                    return True
+                if isinstance(parent, (ast.Assign, ast.AnnAssign)):
+                    targets = (parent.targets if isinstance(parent, ast.Assign)
+                               else [parent.target])
+                    if any(isinstance(t, (ast.Attribute, ast.Subscript))
+                           for t in targets):
+                        return True
+    return False
+
+
+def live_game_scripts(scripts: list[str]) -> set[str]:
+    """从源码**推导**出哪些脚本需要真机游戏。
+
+    为什么不维护一份手写名单：AGENTS.md §4 的一条硬教训是「手工维护的清单
+    必然漂移」（README 的验证脚本表曾从 10 漂到 20+）。`--fast` 若靠手写
+    名单，新加的真机脚本会被漏掉 —— 那样 `--fast` 会**悄悄拉起一个游戏**
+    （与「快检」的承诺相反），或反过来把离线脚本也跳过（门禁悄悄变弱）。
+
+    判据用 AST 而不是正则/字符串搜索：正则会把注释、docstring 里的
+    `launch_game` 也算进去（本仓库的文档里到处都在提它），于是一半以上的
+    脚本会被误判成真机脚本 —— 那样 `--fast` 就名存实亡。
+    """
+    out: set[str] = set()
+    for name in scripts:
+        path = os.path.join(HERE, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError):
+            # 读不了/解析不了 → **保守地**当真机脚本（宁慢勿漏）。
+            out.add(name[:-3])
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            fname = (fn.attr if isinstance(fn, ast.Attribute)
+                     else (fn.id if isinstance(fn, ast.Name) else None))
+            if fname in _LIVE_CALLS and not _is_stub_call(node, tree):
+                out.add(name[:-3])
+                break
+    return out
 
 
 def pid_alive(pid: int) -> bool:
@@ -161,6 +230,11 @@ def main() -> int:
                          "verify_x.py）。用于排查单个脚本，"
                          "也让 verify_encoding_console.py 能廉价地"
                          "验证本脚本的汇总打印路径。")
+    ap.add_argument("--fast", action="store_true",
+                    help="**离线快检**：只跑不需要真机游戏的脚本（秒级），"
+                         "跳过需要 launch_game/inject_process 的那些，"
+                         "**并跳过动态覆盖率门禁**（它要求整套跑完才有意义）。"
+                         "结尾会如实打印跳过了哪些 —— 绝不拿 --fast 冒充全量通过。")
     args = ap.parse_args()
 
     scripts = sorted(
@@ -182,6 +256,13 @@ def main() -> int:
             return 2
         scripts = [s for s in scripts if s in wanted]
 
+    # `--fast`：跳掉需要真机游戏的脚本（清单由 AST 推导，见 live_game_scripts）
+    skipped_live: list[str] = []
+    if args.fast:
+        _live = live_game_scripts(scripts)
+        skipped_live = sorted(s[:-3] for s in scripts if s[:-3] in _live)
+        scripts = [s for s in scripts if s[:-3] not in _live]
+
     # 加锁只在「跑整套」时做：`--only` 会被 verify_encoding_console.py
     # 嵌套调用，外层已经拿着锁，内层再抢一次会自己把自己挡住。
     locked = False
@@ -201,7 +282,10 @@ def main() -> int:
     # 以 `--only` 嵌套调用（用来验证汇总打印路径），若嵌套的这次把日志删了，
     # 就会把外层整套跑到一半、已经积累的覆盖率证据抹掉 ——
     # 外层门禁随即报「工具没被调用过」的假失败。
-    if not args.no_cov and not args.only:
+    # `--only` / `--fast` 时**绝不能清**：这两种都会跳过覆盖率门禁，
+    # 却可能被嵌套调用（`verify_encoding_console.py` 会用 --only 调本脚本
+    # 验证汇总打印路径），若把日志删了就会抹掉外层已积累的证据。
+    if not args.no_cov and not args.only and not args.fast:
         try:
             os.remove(COV_LOG)
         except FileNotFoundError:
@@ -260,6 +344,17 @@ def main() -> int:
           f" / {len(scripts)}"
           f"    断言失败 {len(failed)}    进程崩溃 {len(crashed)}"
           f"    超时 {len(timedout)}")
+    if skipped_live:
+        # **如实声明跳过了什么**：把「--fast 已跳过 N 个需启动真机游戏的
+        # 脚本」打出来。绝不拿 --fast 冒充全量通过 —— 那是本仓库最忌讳的
+        # 「假成功」在门禁上的翻版。
+        print()
+        print(f"⏭  --fast 已跳过 {len(skipped_live)} 个**需要真机游戏**的脚本：")
+        print(f"     {', '.join(skipped_live)}")
+        print("   （判据由 AST 推导自源码：脚本里真的调用了 "
+              "launch_game/inject_process/spawn_and_attach/ensure_runtime）")
+        print("   ⚠️  本次结果**不等于全量通过**：提交完整改动前请跑不带 --fast")
+        print("       的全套门禁。")
     if retried:
         print(f"重试后通过（环境抖动）：{', '.join(retried)}")
         print("  ⚠️  出现重试说明本机存在不稳定因素，结论比一次跑通要弱。")
@@ -278,13 +373,18 @@ def main() -> int:
     rc = 1 if (failed or crashed or timedout) else 0
 
     if not args.no_cov:
-        # --only 时**必须**跳过门禁：只跑一两个脚本，不可能覆盖全部工具，
+        # --only / --fast 时**必须**跳过门禁：只跑子集不可能覆盖全部工具，
         # 跑门禁只会得到一个恒假的「未覆盖」结论。这不是放水 ——
         # 覆盖率门禁的意义是「整套跑完后的证据」，只跑子集时它没有意义。
         if args.only:
             print()
             print("已用 --only 指定子集，跳过动态覆盖率门禁"
                   "（子集不可能覆盖全部工具，跑了也没有意义）。")
+        elif args.fast:
+            print()
+            print("已用 --fast 跳过真机脚本，**同时跳过动态覆盖率门禁** ——")
+            print("覆盖率要求「整套跑完」，子集下它只会给出恒假的未覆盖结论。")
+            print("要做覆盖率门禁请跑完整套（不带 --fast）。")
         else:
             print()
             print("动态覆盖率门禁（devtools/report_tool_coverage.py --strict）")

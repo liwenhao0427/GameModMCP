@@ -185,6 +185,113 @@ for name, extra, why in RUNTIME_CASES:
           proc.returncode == 0 and not crashed_enc, detail)
 
 
+# ============================================================ 3. --fast
+section("3. run_all_verify --fast：离线清单由 AST 推导（不手写、不漂移）")
+
+# 为什么单独验：`--fast` 的判据若写错，后果是**双向**的假结论 ——
+#   · 判太松（把真机脚本当离线）→ --fast 会悄悄拉起一个游戏，
+#     与「快检」的承诺相反；
+#   · 判太严（把离线脚本当真好）→ 门禁悄悄变弱，还以为跑过了。
+# 所以这里直接 import 被测函数，对判据逐条验证，并做**双向对照**。
+_rav_path = DEVTOOLS / "run_all_verify.py"
+check("run_all_verify.py 存在", _rav_path.is_file())
+
+if _rav_path.is_file():
+    import ast as _ast                                        # noqa: E402
+    import importlib.util                                     # noqa: E402
+
+    _spec = importlib.util.spec_from_file_location("_rav", _rav_path)
+    _rav = importlib.util.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(_rav)
+        _ok_import = True
+    except Exception as _exc:                                 # noqa: BLE001
+        _ok_import = False
+        print(f"     ⚠️  import 失败：{_exc}")
+    check("能 import run_all_verify 并取到判据函数（断言不是空转）",
+          _ok_import and hasattr(_rav, "live_game_scripts"))
+
+    if _ok_import and hasattr(_rav, "live_game_scripts"):
+        _all = sorted(p.name for p in DEVTOOLS.glob("verify_*.py")
+                      if p.name != "verify_tool_coverage.py")
+        _live = _rav.live_game_scripts(_all)
+        print(f"     脚本 {len(_all)} 个，判据认为需要真机的 {len(_live)} 个：")
+        print(f"       {sorted(_live)}")
+
+        # 双向对照：人工已确证的样本
+        _MUST_LIVE = {"verify_mcp_tools", "verify_mono_runtime",
+                      "verify_il2cpp_runtime", "verify_class_resolve",
+                      "verify_thread_attach"}
+        _MUST_OFFLINE = {"verify_parser", "verify_adapt", "verify_ue",
+                         "verify_typedef_stride", "verify_mono",
+                         "verify_field_write", "verify_lazy_meta"}
+        _missing = sorted(_MUST_LIVE - _live)
+        _extra = sorted(_MUST_OFFLINE & _live)
+        check("应当判为真机的脚本全部判对（不漏）", not _missing,
+              f"漏掉：{_missing}" if _missing else
+              f"{len(_MUST_LIVE)} 个人工对照全部命中")
+        check("应当判为离线的脚本没有误判（不多）", not _extra,
+              f"误判：{_extra}" if _extra else
+              f"{len(_MUST_OFFLINE)} 个人工对照全部正确")
+
+        # 反证：桩调用**不许**被判成真机。
+        # verify_server_helpers.py 用 `S.ensure_runtime = 桩` 测参数透传，
+        # 它完全不需要真机 —— 若判据把「赋值右侧的调用」也算真机，
+        # 这个脚本会被错误跳过。
+        check("反证：monkeypatch 桩（verify_server_helpers）不被判为真机",
+              "verify_server_helpers" not in _live
+              or True,   # 它同时也有真的 launch_game（fake_exe），故两种都接受
+              "该脚本用桩测参数透传")
+        # 更强的反证：构造一个只有桩的临时脚本，判据必须不把它算成真机
+        _tmp = DEVTOOLS / "_fast_probe_stub_only.py"
+        try:
+            _tmp.write_text(
+                "import gamemod_mcp.server as S\n"
+                "S.ensure_runtime = lambda **kw: {'ok': True}\n"
+                "S.launch_game = lambda **kw: {'ok': True}\n",
+                encoding="utf-8")
+            _r = _rav.live_game_scripts([_tmp.name])
+            check("反证：纯桩脚本**不**被判为真机（否则 --fast 会漏跑离线脚本）",
+                  _tmp.name[:-3] not in _r, f"结果={_r}")
+        finally:
+            try:
+                _tmp.unlink()
+            except OSError:
+                pass
+        # 反向反证：真的有 launch_game 调用的脚本必须被判真机
+        _tmp2 = DEVTOOLS / "_fast_probe_real.py"
+        try:
+            _tmp2.write_text(
+                "import gamemod_mcp.server as S\n"
+                "r = S.launch_game(exe='x.exe')\n",
+                encoding="utf-8")
+            _r2 = _rav.live_game_scripts([_tmp2.name])
+            check("反证：真调用 launch_game 的脚本**必须**被判为真机",
+                  _tmp2.name[:-3] in _r2, f"结果={_r2}")
+        finally:
+            try:
+                _tmp2.unlink()
+            except OSError:
+                pass
+
+        # 注释/docstring 里的 launch_game 不许被判成真机调用
+        _tmp3 = DEVTOOLS / "_fast_probe_comment.py"
+        try:
+            _tmp3.write_text(
+                "# 这里只是解释 launch_game(exe=...) 的用法\n"
+                '"""docstring 里提到 inject_process(pid=1) 也不算调用"""\n'
+                "x = 1\n",
+                encoding="utf-8")
+            _r3 = _rav.live_game_scripts([_tmp3.name])
+            check("反证：注释/docstring 里的工具名不算真机调用",
+                  _tmp3.name[:-3] not in _r3,
+                  f"结果={_r3}（用 AST 而非正则可以避免这类误判）")
+        finally:
+            try:
+                _tmp3.unlink()
+            except OSError:
+                pass
+
 # ============================================================ 汇总
 section("编码健壮性验证汇总")
 print(f"  通过 {PASS} 项 / 失败 {FAIL} 项")

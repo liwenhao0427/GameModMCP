@@ -510,6 +510,19 @@ python devtools\run_all_verify.py
 python devtools\run_all_verify.py --only verify_lazy_handles
 ```
 
+改纯函数/解析逻辑时用 `--fast`（**离线快检**，不拉起任何游戏，约 3 分钟）：
+
+```powershell
+python devtools\run_all_verify.py --fast
+```
+
+> `--fast` 跳过的是「**真的会调用** `launch_game` / `inject_process` /
+> `spawn_and_attach` / `ensure_runtime`」的脚本，清单由 **AST 从源码推导**
+> （不是手写名单 —— 手写清单必然漂移，正是本仓库反复吃亏的地方）。
+> 它同时跳过动态覆盖率门禁（覆盖率要求整套跑完才有意义），
+> 并在结尾**如实列出跳过了哪些**。
+> **`--fast` 全绿 ≠ 全量通过**：提交完整改动前请跑不带 `--fast` 的那条。
+
 > `verify_mcp_tools.py` 会**真的启动一个游戏**并在结束时结束它。
 > 它需要 Frida 与一个 IL2CPP 样本（如 Garden of Witches）。
 > **不需要管理员权限** —— 实测普通用户权限即可（见下方「权限」一节）。

@@ -7,9 +7,20 @@
 
 ```powershell
 python devtools\run_all_verify.py          # ← 推荐：全部 + 动态覆盖率门禁 + 崩溃重试
+python devtools\run_all_verify.py --fast   # 离线快检：跳过需真机游戏的脚本（约 3 分钟）
 python devtools\samples.py                 # 只看本机样本可用性（不跑测试）
 python devtools\debug_ui.py                # 起人工调试前端（不是验收，见下）
 ```
+
+> `--fast` 跳过的脚本清单由 **AST 从源码推导**（判据：脚本里**真的调用了**
+> `launch_game` / `inject_process` / `spawn_and_attach` / `ensure_runtime`），
+> **不是**手写名单 —— 手写清单必然漂移，而漂移的后果是双向的假结论：
+> 判太松会让「快检」悄悄拉起一个游戏，判太严会让门禁悄悄变弱。
+> 它同时跳过动态覆盖率门禁（覆盖率要求整套跑完才有意义），
+> 并在结尾**如实列出跳过了哪些**。
+> **`--fast` 全绿 ≠ 全量通过**：提交完整改动前请跑不带 `--fast` 的那条。
+> 判据本身由 `verify_encoding_console.py` §3 双向钉住（含「纯桩脚本不许被判
+> 成真机」「注释里的工具名不算调用」两条反证）。
 
 > `debug_ui.py` 是**人工调试工具**，不是 `verify_*` 验收脚本，
 > 也不进 `run_all_verify.py`：它起来后等人点。用途与约束见 README

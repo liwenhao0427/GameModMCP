@@ -212,6 +212,21 @@
         'mono_class_is_enum',
         // MonoType* → MonoClass*（判定字段类型是否枚举用）
         'mono_class_from_mono_type',
+        // 运行时枚举 Mono 实例的 **Unity 快路径**（见 findInstancesMono）：
+        //   mono_class_get_type   → 类的 MonoType*
+        //   mono_type_get_object  → 该类型的 System.Type 托管对象
+        //   mono_runtime_invoke   → 调 UnityEngine.Resources.FindObjectsOfTypeAll
+        //   mono_array_length     → 读返回的 MonoArray* 长度
+        // 为什么走这条路而不是读 MonoArray 的内部偏移（+0x18/+0x20）：
+        //   本文件开篇就写明「不硬编码内部结构体布局，硬编码是崩溃与错值的
+        //   根源」。`mono_array_length` 是官方导出，**在 4 个 Mono 样本上
+        //   实测 4/4 都存在**（见 verify_mono_runtime.py §2 的真值核实）；
+        //   数组元素用 `mono_array_addr_with_size` 取，同样不碰内部布局。
+        'mono_class_get_type',
+        'mono_type_get_object',
+        'mono_runtime_invoke',
+        'mono_array_length',
+        'mono_array_addr_with_size',
         // 枚举的底层整型类型
         'mono_class_enum_basetype',
         'mono_type_get_underlying_type',
@@ -1737,6 +1752,15 @@
         mono_class_is_enum: ['pointer', ['pointer']],
         // MonoType* → MonoClass*：枚举字段判定必需（见 enumInfoOfField）
         mono_class_from_mono_type: ['pointer', ['pointer']],
+        // Unity 实例枚举快路径（见 findInstancesMono 的说明）。
+        // 数值返回统一登记为 pointer，调用方用 .toInt32() 截断 ——
+        // 这是本文件既有规矩（历史上非 pointer 的数值返回类型崩过一次）。
+        mono_class_get_type: ['pointer', ['pointer']],
+        mono_type_get_object: ['pointer', ['pointer', 'pointer']],
+        mono_runtime_invoke: ['pointer', ['pointer', 'pointer', 'pointer',
+                                          'pointer']],
+        mono_array_length: ['pointer', ['pointer']],
+        mono_array_addr_with_size: ['pointer', ['pointer', 'int', 'uint32']],
         mono_class_enum_basetype: ['pointer', ['pointer']],
         mono_type_get_underlying_type: ['pointer', ['pointer']],
         mono_class_is_valuetype: ['pointer', ['pointer']],
@@ -2774,6 +2798,143 @@
     // ================================================================ 实例枚举
 
     /**
+     * 判断一个 MonoClass 是否继承自 `UnityEngine.Object`（含自身）。
+     *
+     * 为什么要这个判定：Unity 里需要找实例的类（MonoBehaviour / Component /
+     * GameObject / ScriptableObject / Transform）**全部**继承自
+     * `UnityEngine.Object`，而这类对象有一条官方快路径可枚举（见下）。
+     * 纯 C# 类不走那条路（它们不在 Unity 的对象表里）。
+     *
+     * 用 `mono_class_get_name` + `mono_class_get_namespace` 逐层比对，
+     * **不硬编码**任何结构体偏移。
+     */
+    function monoIsUnityObjectClass(startKlass) {
+        var cur = startKlass;
+        var depth = 0;
+        while (cur && !cur.isNull() && depth < 64) {
+            try {
+                var n = cstr(monoFuncs.mono_class_get_name(cur));
+                var ns = monoFuncs.mono_class_get_namespace
+                    ? cstr(monoFuncs.mono_class_get_namespace(cur)) : '';
+                if (n === 'Object' && ns === 'UnityEngine') { return true; }
+            } catch (e) { return false; }
+            if (!monoFuncs.mono_class_get_parent) { return false; }
+            try { cur = monoFuncs.mono_class_get_parent(cur); }
+            catch (e) { return false; }
+            depth++;
+        }
+        return false;
+    }
+
+    /**
+     * Unity 快路径：`UnityEngine.Resources.FindObjectsOfTypeAll(System.Type)`。
+     *
+     * 为什么需要它（这是 Mono 实例枚举的主要出路）
+     * ------------------------------------------------------------
+     * `mono_gc_walk_heap` 受官方语义限制（只在 pre-stop-world 回调内有效），
+     * 从 Frida 线程调用实测拿不到对象 —— 工具会如实报 `unsupported`。
+     * 但对 Unity 游戏里 **90% 需要找实例的类**，Unity 自己提供了
+     * `Resources.FindObjectsOfTypeAll(Type)`，它返回一个 `Object[]`。
+     *
+     * 走法（全部用官方导出，**不碰任何结构体偏移**）：
+     *   1. `mono_class_get_type(klass)`          → MonoType*
+     *   2. `mono_type_get_object(domain, type)`  → System.Type 托管对象
+     *   3. 从 UnityEngine.CoreModule 里取
+     *      `UnityEngine.Resources` 的 `FindObjectsOfTypeAll` 方法并调它
+     *   4. `mono_array_length` 取长度、
+     *      `mono_array_addr_with_size` 取元素地址
+     *
+     * 为什么不用指导书里写的「长度在 +0x18、元素从 +0x20 起」：
+     * 本文件开篇写明「优先走引擎官方导出的稳定接口，**不硬编码内部结构体
+     * 布局** —— 内部布局随版本变化，硬编码是崩溃与错值的根源」。而
+     * `mono_array_length` / `mono_array_addr_with_size` 这两个官方导出
+     * **在 4 个 Mono 样本上实测 4/4 都存在**（见 verify_mono_runtime §2）。
+     *
+     * @returns {{ok:boolean, matches?:Array, unsupported?:boolean,
+     *            reason?:string, via?:string}}
+     */
+    function findInstancesMonoUnity(target, maxCount) {
+        var need = ['mono_class_get_type', 'mono_type_get_object',
+                    'mono_runtime_invoke', 'mono_array_length',
+                    'mono_array_addr_with_size', 'mono_class_from_name',
+                    'mono_class_get_method_from_name'];
+        var miss = [];
+        for (var i = 0; i < need.length; i++) {
+            if (!monoFuncs[need[i]]) { miss.push(need[i]); }
+        }
+        if (miss.length) {
+            return { ok: false, unsupported: true,
+                     reason: 'Unity 快路径缺导出：' + miss.join(' / ') };
+        }
+        // 取 UnityEngine.Resources（框架程序集，静态索引里没有，必须运行时查）
+        var img = monoFuncs.mono_image_loaded
+            ? monoFuncs.mono_image_loaded(Memory.allocUtf8String('UnityEngine.CoreModule'))
+            : null;
+        if (!img || img.isNull()) {
+            return { ok: false, unsupported: true,
+                     reason: 'UnityEngine.CoreModule 尚未加载' };
+        }
+        var resCls = monoFuncs.mono_class_from_name(
+            img, Memory.allocUtf8String('UnityEngine'),
+            Memory.allocUtf8String('Resources'));
+        if (!resCls || resCls.isNull()) {
+            return { ok: false, unsupported: true,
+                     reason: '找不到 UnityEngine.Resources' };
+        }
+        var method = monoFuncs.mono_class_get_method_from_name(
+            resCls, Memory.allocUtf8String('FindObjectsOfTypeAll'), 1);
+        if (!method || method.isNull()) {
+            return { ok: false, unsupported: true,
+                     reason: 'UnityEngine.Resources 里没有 FindObjectsOfTypeAll(Type)' };
+        }
+
+        // 目标类型的 System.Type 对象
+        var mtype = monoFuncs.mono_class_get_type(target);
+        if (!mtype || mtype.isNull()) {
+            return { ok: false, unsupported: false, reason: 'mono_class_get_type 返回空' };
+        }
+        var typeObj = monoFuncs.mono_type_get_object(monoDomain, mtype);
+        if (!typeObj || typeObj.isNull()) {
+            return { ok: false, unsupported: false, reason: 'mono_type_get_object 返回空' };
+        }
+
+        var argsBuf = Memory.alloc(Process.pointerSize);
+        argsBuf.writePointer(typeObj);
+        var exc = Memory.alloc(Process.pointerSize);
+        exc.writePointer(NULL);
+        var arr = null;
+        try {
+            // mono_runtime_invoke(method, obj=NULL(静态), params, exc)
+            arr = monoFuncs.mono_runtime_invoke(method, NULL, argsBuf, exc);
+        } catch (e) {
+            return { ok: false, unsupported: false,
+                     reason: 'FindObjectsOfTypeAll 调用失败：' + (e.message || e) };
+        }
+        if (exc.readPointer && !exc.readPointer().isNull()) {
+            return { ok: false, unsupported: false,
+                     reason: 'FindObjectsOfTypeAll 抛出了托管异常' };
+        }
+        if (!arr || arr.isNull()) {
+            // 返回 null 是合法结果（该类当前没有实例）——但**要区分**于
+            // 「调用没成功」。Array 为空与 null 都由长度 0 表达。
+            return { ok: true, matches: [], via: 'Resources.FindObjectsOfTypeAll' };
+        }
+        var n = monoFuncs.mono_array_length(arr).toInt32();
+        var matches = [];
+        var overflow = false;
+        var elemSize = Process.pointerSize;
+        for (var k = 0; k < n; k++) {
+            if (matches.length >= maxCount) { overflow = true; break; }
+            var slot = monoFuncs.mono_array_addr_with_size(arr, elemSize, k);
+            if (!slot || slot.isNull()) { continue; }
+            var obj = slot.readPointer();
+            if (obj && !obj.isNull()) { matches.push(obj); }
+        }
+        return { ok: true, matches: matches, overflow: overflow,
+                 total: n, via: 'Resources.FindObjectsOfTypeAll' };
+    }
+
+    /**
      * 枚举某个类在堆上的**活对象实例**（Mono）。
      *
      * 与 IL2CPP 不同：Mono **没有**「按类枚举实例」的 liveness 导出。
@@ -2787,6 +2948,12 @@
      * 这里如实实现并返回真实结果 —— 能拿到就报数，拿不到就明确说
      * 「本运行时/本时机不可用」，**不假装成功**，也不拿空列表冒充「没有实例」。
      *
+     * **Unity 对象走快路径**（见 findInstancesMonoUnity）：继承自
+     * `UnityEngine.Object` 的类用官方的 `Resources.FindObjectsOfTypeAll`
+     * 枚举 —— 那覆盖了 Unity 游戏里绝大多数「需要找实例」的场景
+     * （MonoBehaviour / Component / GameObject / ScriptableObject / Transform）。
+     * 纯 C# 类仍走下面的堆遍历（拿不到时如实报 unsupported）。
+     *
      * 回调签名（mono-gc.h）：
      *     typedef int (*MonoGCReferences)(MonoObject *obj, MonoClass *klass,
      *         uintptr_t size, uintptr_t num, MonoObject **refs,
@@ -2794,11 +2961,27 @@
      * 返回非 0 继续遍历，返回 0 停止。
      */
     function findInstancesMono(klass, maxCount) {
+        var fastPathNote = null;
+        // ---- ① Unity 对象：先走官方快路径
+        if (monoIsUnityObjectClass(klass)) {
+            var uni = findInstancesMonoUnity(klass, maxCount);
+            if (uni.ok) {
+                return { ok: true, engine: 'mono', count: uni.matches.length,
+                         pointers: uni.matches.map(function (p) { return p.toString(); }),
+                         overflow: !!uni.overflow, via: uni.via,
+                         total_from_engine: uni.total };
+            }
+            // 快路径不可用（框架程序集没加载等）**继续**试堆遍历，
+            // 而不是直接放弃 —— 两条路是互补的。
+            var fastPathNote = uni.reason;
+        }
+
         if (!monoFuncs.mono_gc_walk_heap) {
             return fail('本版 Mono 运行时没有 mono_gc_walk_heap 导出，' +
                         '无法枚举实例（这是**版本差异**，不是探针缺陷）。' +
                         '替代路径：Hook 一个会经过该对象的方法，从 args[0] 取实例',
-                        { engine: 'mono', unsupported: true });
+                        { engine: 'mono', unsupported: true,
+                          unity_path_note: fastPathNote });
         }
         if (!monoFuncs.mono_object_get_class) {
             return fail('缺少 mono_object_get_class，无法按类过滤实例',
@@ -2849,7 +3032,8 @@
                         '**不能**据此断定该实例不存在。' +
                         '替代路径：Hook 会经过该对象的方法，从 args[0] 取实例',
                         { engine: 'mono', unsupported: true, rc: rc,
-                          scanned: scanned });
+                          scanned: scanned,
+                          unity_path_note: fastPathNote });
         }
 
         var out = {
@@ -2858,8 +3042,10 @@
             count: matches.length,
             scanned_objects: scanned,
             pointers: matches.map(function (p) { return p.toString(); }),
-            overflow: overflow
+            overflow: overflow,
+            via: 'mono_gc_walk_heap'
         };
+        if (fastPathNote) { out.unity_path_note = fastPathNote; }
         if (cbError) { out.callback_error = cbError; }
         return out;
     }
