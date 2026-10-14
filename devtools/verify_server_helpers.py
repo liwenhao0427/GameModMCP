@@ -253,6 +253,49 @@ def main() -> int:
           len({_sess._retval_spec_for(t) for t, _ in RETVAL_CASES}) >= 5,
           str(sorted({_sess._retval_spec_for(t) for t, _ in RETVAL_CASES})))
 
+    # ---- 短名 / CIL 名也要认（Mono 运行时走的就是这条路）----
+    # `mono_type_get_name` 给的是**短名**（agent.js 的 monoTypeName 注释写明
+    # 「Mono 给的是短名（int / string）」，而静态元数据给的是 `System.Single`）。
+    # 只认长名的话，Mono 上 float 返回值会落到默认的 ptr —— 那正是这张表
+    # 本来要防的缺陷（按 ptr 读 XFloat 会给出无意义的整数），在 Mono 上照旧。
+    SHORT_RETVAL_CASES = [
+        ("float", "float"), ("single", "float"), ("Single", "float"),
+        ("System.Single", "float"),
+        ("double", "double"), ("Double", "double"),
+        ("bool", "bool"), ("boolean", "bool"), ("Boolean", "bool"),
+        ("int", "int"), ("int32", "int"), ("Int32", "int"),
+        ("uint", "uint"), ("uint32", "uint"),
+        ("int16", "int"), ("short", "int"), ("uint16", "uint"),
+        ("ushort", "uint"), ("byte", "uint"), ("sbyte", "int"),
+        ("char", "uint"),
+        ("long", "long"), ("int64", "long"),
+        ("ulong", "ulong"), ("uint64", "ulong"),
+        ("string", "string"), ("String", "string"),
+        # `System.` 前缀的短名也要认（两种 Mono 版本都可能给这种写法）
+        ("System.Int32", "int"), ("System.String", "string"),
+        # 认不出来的照旧给 ptr
+        ("Vector3", "ptr"), ("MyGame.SomeClass", "ptr"),
+        ("MyCompany.Int", "ptr"),
+    ]
+    bads: list[str] = []
+    for tname, want in SHORT_RETVAL_CASES:
+        got_s = _sess._retval_spec_for(tname)
+        if got_s != want:
+            bads.append(f"{tname!r} -> {got_s}（期望 {want}）")
+    check(f"{len(SHORT_RETVAL_CASES)} 条短名/长名返回类型映射全部正确", not bads,
+          f"不符 {len(bads)} 条：{bads[:3]}" if bads else
+          "C# 短名 / CIL 名 / System.* 长名三种写法都认")
+    check("短名 float 不再退化成 ptr（这就是 Mono 上的那个缺陷）",
+          _sess._retval_spec_for("float") == "float"
+          and _sess._retval_spec_for("single") == "float",
+          "按 ptr 读 RAX 会给出无意义的整数")
+    # 短名兜底**不能**把用户自定义类型也吞进去：`MyCompany.Int` 若按短名
+    # 命中 int，就会把一个引用当 4 字节整数读 —— 比给 ptr 危险得多。
+    check("带非 System 命名空间的类型不按短名猜（一律 ptr）",
+          _sess._retval_spec_for("MyCompany.Int") == "ptr"
+          and _sess._retval_spec_for("UnityEngine.Vector3") == "ptr",
+          "短名兜底只对「无命名空间」或「System.*」生效")
+
     section("5. `_overlapping_hook()` —— write_memory 的护栏")
     # 实测：写已被 Hook 的函数入口（哪怕写回刚读到的同样字节）会让游戏
     # 在数秒内崩在 0xc0000005；同一操作写在模块头（base）上则完全无害。

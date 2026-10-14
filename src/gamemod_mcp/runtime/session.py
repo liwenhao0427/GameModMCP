@@ -136,16 +136,62 @@ _RETVAL_SPECS = {
     "System.String": "string",
 }
 
+#: 短名 / CIL 名 → 探针读值规格。
+#:
+#: 为什么需要第二张表：上面那张是**静态元数据**（IL2CPP 的 `typeName`、
+#: Mono 程序集里的 `System.Single`）的口径，而 **Mono 运行时**走的是
+#: `mono_type_get_name`，它给的是短名 —— `agent.js` 的 `monoTypeName` 注释
+#: 写明了这条差异（「Mono 给的是短名（int / string）」）。
+#: 只认长名的话，Mono 上 `float` 返回值会落到默认的 `ptr`，
+#: 按 ptr 读 XMM0 之外的东西 → 给出毫无意义的整数（正是这张表原本要防的缺陷）。
+#:
+#: 语义与上表**逐项对齐**（Int16→int、Byte→uint、Char→uint 等），
+#: 不是另立一套口径。
+_RETVAL_SPECS_SHORT: dict[str, str] = {
+    "single": "float", "float": "float",
+    "double": "double",
+    "bool": "bool", "boolean": "bool",
+    "int": "int", "int32": "int",
+    "uint": "uint", "uint32": "uint",
+    "int16": "int", "short": "int",
+    "uint16": "uint", "ushort": "uint",
+    "sbyte": "int", "int8": "int",
+    "byte": "uint", "uint8": "uint",
+    "char": "uint",
+    "int64": "long", "long": "long",
+    "uint64": "ulong", "ulong": "ulong",
+    "string": "string",
+}
+
 
 def _retval_spec_for(return_type: Any) -> str:
     """把 .NET 返回类型名映射成探针的读值规格；认不出来就给 `ptr`。
 
     认不出来时给 `ptr` 而不是猜：`ptr` 至少是「原样给出寄存器值」这个
     不含糊的语义，调用方可以自己判断。
+
+    匹配顺序（**先精确后短名**）：
+      1. 与 `_RETVAL_SPECS` 的全名做**大小写不敏感**比对（静态元数据路径）；
+      2. 没命中且「不带命名空间」或「命名空间就是 `System`」时，按短名查
+         `_RETVAL_SPECS_SHORT`（Mono 运行时路径）。
+    第 2 步的命名空间限制是**故意的**：否则 `MyCompany.Int` 这类
+    用户自定义类型会被短名 `Int` 命中，按 4 字节整数去读一个引用 ——
+    那正是本表要防的「看着有值、其实是错值」。带其它命名空间一律给 `ptr`。
     """
     if not return_type:
         return "ptr"
-    return _RETVAL_SPECS.get(str(return_type).strip(), "ptr")
+    raw = str(return_type).strip()
+    if not raw:
+        return "ptr"
+
+    for long_name, spec in _RETVAL_SPECS.items():
+        if long_name.lower() == raw.lower():
+            return spec
+
+    head, _, tail = raw.rpartition(".")
+    if head and head.lower() != "system":
+        return "ptr"           # 有别的命名空间 → 不按短名猜，交给调用方判断
+    return _RETVAL_SPECS_SHORT.get((tail or raw).lower(), "ptr")
 
 
 def _norm_token(tok: Any) -> str:

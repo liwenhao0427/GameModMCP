@@ -172,6 +172,87 @@ try:
     check("agent.js 里与 Hook 内联重复的 backtraceHere 已删除",
           "backtraceHere" not in _agent_full)
 
+    # ---- Mono 侧初始化幂等 + 卸载摘线程（与 IL2CPP 侧对称）----
+    # 这两条都是「另一个后端有、Mono 后端漏了」的对称性缺陷：
+    #   · IL2CPP 的 ensureReady 首行有 `if (attached) return already`，
+    #     Mono 的 monoEnsureReady 没有 → 每次 RPC 都重跑 monoBind()（重建
+    #     56 个 NativeFunction）、重复 attach、重复探字符串布局。
+    #   · IL2CPP 卸载前调 releaseDomain()，Mono 侧从不调 mono_thread_detach
+    #     → 域里留悬空线程记录（IL2CPP 那条正是 0xc0000005 崩溃的根因）。
+    def _fn_body(name: str, src_text: str) -> str:
+        """粗取一个函数的函数体（按大括号配平）。
+
+        两种写法都要认：`function foo(...) {...}`（普通函数）与
+        `foo: function (...) {...}`（挂在 `rpc.exports` / 后端对象上的方法）。
+        """
+        m = re.search(rf"(?:function\s+{re.escape(name)}\s*\(|\b{re.escape(name)}\s*:\s*function\s*\()",
+                      src_text)
+        if not m:
+            return ""
+        i = src_text.find("{", m.end())
+        if i < 0:
+            return ""
+        depth, j = 0, i
+        while j < len(src_text):
+            if src_text[j] == "{":
+                depth += 1
+            elif src_text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src_text[i:j + 1]
+            j += 1
+        return src_text[i:]
+
+    _mono_ready = _fn_body("monoEnsureReady", _agent_full)
+    _il2cpp_ready = _fn_body("ensureReady", _agent_full)
+    check("取到了两个后端的 ensureReady 函数体（断言不是空转）",
+          bool(_mono_ready) and bool(_il2cpp_ready),
+          f"mono={len(_mono_ready)} 字节 il2cpp={len(_il2cpp_ready)} 字节")
+    check("Mono 的 monoEnsureReady 有 `attached` 幂等守卫",
+          "if (attached" in _mono_ready,
+          "没有它每次 RPC 都会重跑 monoBind()")
+    check("两个后端的幂等守卫写法一致（对称）",
+          "if (attached" in _il2cpp_ready and "if (attached" in _mono_ready,
+          "IL2CPP 一直有，Mono 之前漏了")
+
+    check("agent.js 定义了 monoReleaseDomain（卸载前摘 Mono 线程）",
+          re.search(r"function\s+monoReleaseDomain\s*\(", _agent_full) is not None)
+    _mono_rel = _fn_body("monoReleaseDomain", _agent_full)
+    check("monoReleaseDomain 调用了 mono_thread_detach",
+          "mono_thread_detach" in _mono_rel,
+          "只定义了不用等于没修")
+    _dispose = _fn_body("dispose", _agent_full)
+    check("取到了 dispose 的函数体（断言不是空转）", bool(_dispose),
+          f"{len(_dispose)} 字节")
+    check("dispose 对 Mono 后端也调用了摘域",
+          "monoReleaseDomain" in _dispose,
+          "原来只在 BE.kind === 'il2cpp' 时调 releaseDomain()")
+    check("dispose 会恢复被暂停的 GC（防止卸载后内存持续增长）",
+          "gcDisabled" in _dispose and "gcControl" in _dispose,
+          "走 BE.gcControl(false) 而不是直接调 il2cpp_*（引擎差异只在后端里）")
+    check("dispose 里恢复 GC 也走后端对象（不直连 IL2CPP 导出）",
+          "funcs.il2cpp_" not in _dispose,
+          "RPC 层直接调 il2cpp_* 是架构违规，verify_mono_runtime 会报红")
+
+    # ---- 死代码：定义了但全文没有其它引用点的局部 function ----
+    # 契约 §3：agent.js 里的能力必须有 MCP 出口；没有出口的函数是死代码。
+    # `paramNames` 就是这样一个函数（定义了、从没被调用过），已删除。
+    # 判定方式：把该函数的**声明**逐个抹掉，再看标识符是否还在别处出现。
+    # 这样引用点写成 `foo(...)`、`BE.foo`、`x: foo` 都能算到。
+    _decls = re.findall(r"^\s*function\s+(\w+)\s*\(", _agent_full, re.M)
+    _dead = []
+    for _n in sorted(set(_decls)):
+        _rest = re.sub(rf"function\s+{re.escape(_n)}\s*\(", "function __decl__(",
+                       _agent_full)
+        if not re.search(rf"\b{re.escape(_n)}\b", _rest):
+            _dead.append(_n)
+    check("agent.js 没有「定义了但从不引用」的局部函数",
+          not _dead, f"死函数={_dead}" if _dead else
+          f"{len(set(_decls))} 个局部函数都有引用点")
+    check("反证：paramNames 确实已不在 agent.js 里（它原来是死函数）",
+          not re.search(r"function\s+paramNames\s*\(", _agent_full),
+          "定义了但全文 0 处调用")
+
     script.unload()
     print("  ✅ 脚本已卸载")
 finally:

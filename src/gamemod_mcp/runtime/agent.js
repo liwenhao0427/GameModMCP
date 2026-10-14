@@ -270,6 +270,8 @@
     var monoKeep = [];           // 必须长期存活的 Frida 回调（被 GC 回收后再调用会崩）
     var monoStringLayout = null; // {field, offset} —— 初始化时查出来，不硬编码
     var monoTypeNameAllocates = null; // mono_type_get_name 是否堆分配（实测确认后决定是否 free）
+    //: 上一次 monoEnsureReady 成功时的完整返回值，供幂等守卫原样回给宿主
+    var monoReadyInfo = null;
 
     // ---------------------------------------------------------------- 基础工具
 
@@ -711,6 +713,34 @@
         }
     }
 
+    /**
+     * 把探针线程从 **Mono 域**摘出去 —— 与 IL2CPP 的 `releaseDomain` 对称。
+     *
+     * 为什么必须有：IL2CPP 侧的 `releaseDomain` 修的是「域里留着指向已释放
+     * agent 内存的线程记录 → 下一次 GC 崩在 0xc0000005」。Mono 侧是同一个
+     * 结构性问题：`mono_thread_attach` 也会在 Mono 的线程表里登记本线程，
+     * 脚本卸载后那条记录同样悬空。既然已经绑定了 `mono_thread_detach`
+     * 这个导出，就该在卸载前用掉它；不摘等于两侧只修了一半。
+     *
+     * 失败不抛：卸载路径上宁可少摘一次，也不要因为摘失败而让 close 报错。
+     *
+     * @returns {{ok: boolean, detached: boolean, error?: string}}
+     */
+    function monoReleaseDomain() {
+        if (!monoDomain || !monoFuncs.mono_thread_detach) {
+            return { ok: true, detached: false };
+        }
+        try {
+            monoFuncs.mono_thread_detach(monoDomain);
+            monoDomain = null;
+            attached = false;
+            monoReadyInfo = null;
+            return { ok: true, detached: true };
+        } catch (e) {
+            return { ok: false, detached: false, error: e.message };
+        }
+    }
+
     function allImages() {
         var domain = funcs.il2cpp_domain_get();
         var countPtr = Memory.alloc(Process.pointerSize);
@@ -1045,19 +1075,6 @@
                 rec.note = '方法未获得原生代码地址（可能是泛型定义或抽象方法）';
             }
             out.push(rec);
-        }
-        return out;
-    }
-
-    /** 参数名列表（失败返回空数组，不抛异常）。 */
-    function paramNames(methodInfo) {
-        if (!funcs.il2cpp_method_get_param_name || !funcs.il2cpp_method_get_param_count) {
-            return [];
-        }
-        var n = funcs.il2cpp_method_get_param_count(methodInfo).toInt32();
-        var out = [];
-        for (var i = 0; i < n; i++) {
-            out.push(cstr(funcs.il2cpp_method_get_param_name(methodInfo, i)));
         }
         return out;
     }
@@ -1507,6 +1524,32 @@
     }
 
     function monoEnsureReady(preferredModule) {
+        // **幂等守卫**（与 IL2CPP 侧 `ensureReady` 的首行对称）：
+        // 没有它的话，**每一次** RPC（runtimeInfo/classInfo/methodTarget/
+        // classFields/findInstances…）都会重跑下面的 monoBind() —— 重建 56 个
+        // NativeFunction、再 mono_thread_attach 一次、再探一遍字符串布局。
+        // 这不只是慢：重复创建 NativeFunction 会持续占用 Frida 的句柄/内存，
+        // 而重复 attach 同一个线程在部分 Mono 版本上会累积线程记录。
+        // 状态判断与 IL2CPP 一致用 `attached`，并额外要求 monoMod/monoDomain
+        // 仍在（后端可能被换掉过）。
+        // **幂等守卫**（与 IL2CPP 侧 `ensureReady` 的首行对称）：
+        // 没有它的话，**每一次** RPC（runtimeInfo/classInfo/methodTarget/
+        // classFields/findInstances…）都会重跑下面的 monoBind() —— 重建 56 个
+        // NativeFunction、再 mono_thread_attach 一次、再探一遍字符串布局。
+        // 这不只是慢：重复创建 NativeFunction 会持续占用 Frida 的句柄/内存，
+        // 而重复 attach 同一个线程在部分 Mono 版本上会累积线程记录。
+        // 状态判断与 IL2CPP 一致用 `attached`，并额外要求 monoMod/monoDomain
+        // 仍在（后端可能被换掉过）。
+        if (attached && monoMod && monoDomain) {
+            // 返回**上一次成功时的完整信息**（而不是光一个 already 标志）：
+            // 宿主会重复调 init（inject_process 二次调用、wait_ready 重试），
+            // 丢掉 module / api_available 会让后一次返回看起来「信息变少了」。
+            var cached = monoReadyInfo || {};
+            var again = { ok: true, already: true, engine: 'mono' };
+            for (var ck in cached) { again[ck] = cached[ck]; }
+            return again;
+        }
+
         monoMod = monoResolveModule(preferredModule);
         if (!monoMod) {
             return fail('未找到 Mono 运行时模块（尝试过：' +
@@ -1515,6 +1558,10 @@
         }
         mod = monoMod;
         var missing = monoBind();
+        // 重新绑定导出之后，之前按旧的 mono_* 函数指针建的类索引必须作废
+        // ——与 IL2CPP 侧 `classIndex = null;` 同样的理由。
+        monoImagesCache = null;
+        monoTypeIndexCache = null;
         apiMissing = missing;
         fallbacks = [];
 
@@ -1601,7 +1648,7 @@
         }
 
         attached = true;
-        return {
+        monoReadyInfo = {
             ok: true,
             engine: 'mono',
             module: monoMod.name,
@@ -1616,6 +1663,7 @@
                     via: monoStringLayout.via }
                 : null
         };
+        return monoReadyInfo;
     }
 
     /**
@@ -2631,6 +2679,27 @@
             var out = { ok: true, engine: BE ? BE.kind : null };
             if (BE && BE.kind === 'il2cpp') {
                 out.il2cpp = releaseDomain();
+            } else if (BE && BE.kind === 'mono') {
+                // Mono 也附着过线程，同样要在卸载前摘掉（见 monoReleaseDomain）
+                out.mono = monoReleaseDomain();
+            }
+            // GC 被暂停时必须恢复：留着 `gc_disable` 的效果跨过卸载，
+            // 游戏会一直不回收内存直到崩（实测症状是内存持续增长）。
+            // 探针自己不在了，就再没有别的东西会去 enable 它。
+            //
+            // 走 `BE.gcControl(false)` 而不是直连 IL2CPP 的 gc_enable 导出：
+            // 引擎差异只允许出现在后端对象里（RPC 层直接调 il2cpp_* 是架构
+            // 违规，`verify_mono_runtime.py` 会报红）。这里本来也只有 IL2CPP
+            // 能让 gcDisabled 变 true（Mono 没有 gc_disable 导出）。
+            if (gcDisabled && BE) {
+                out.gc_restore = BE.gcControl(false);
+                if (out.gc_restore && out.gc_restore.ok) {
+                    out.gc_reenabled = true;
+                } else {
+                    out.gc_reenabled = false;
+                    out.gc_reenable_error =
+                        (out.gc_restore && out.gc_restore.error) || '未知原因';
+                }
             }
             return out;
         },
