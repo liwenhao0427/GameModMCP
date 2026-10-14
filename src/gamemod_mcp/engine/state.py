@@ -95,6 +95,38 @@ class SessionState:
     def has_runtime(self) -> bool:
         return self.runtime is not None and getattr(self.runtime, "alive", False)
 
+    def live_runtime(self):
+        """在锁内**原子**取出当前活着的 RuntimeSession；没有或已失效则 None。
+
+        为什么必须有这个方法（这是一个真实的并发缺陷修复）
+        ------------------------------------------------------------
+        `server.py` 已经把同步工具丢进线程池并发执行（见
+        `_install_event_loop_guard`），而运行时工具原来的写法是：
+
+            st = state.state()
+            if not st.has_runtime():        # ← 检查
+                return _err(...)
+            res = st.runtime.runtime_info() # ← 使用（中间可能被别的线程清空）
+
+        这是典型的 **TOCTOU**（Check-Then-Act）：检查通过之后、使用之前，
+        另一个线程可能调用了 `close_session()` / 切换了目标，把
+        `self.runtime` 置为 `None`，于是这一行抛
+        `AttributeError: 'NoneType' object has no attribute ...` ——
+        一个**与用户操作无关**的随机崩溃。实测（把 GIL 切换间隔压到 1e-6
+        并让两个线程对压）确实复现了该 AttributeError。
+
+        修法：把「检查 + 取引用」收进同一个锁里，调用方拿到的是**局部变量**。
+        之后即便别的线程立刻关掉了会话，那个局部变量仍指向有效的
+        `RuntimeSession` 实例，而它内部的 `_call` 有 `_rpc_lock` 与
+        `_check()` 保护（会话真失效时会给出明确的 SessionError，
+        而不是一个 NoneType 崩溃）。
+        """
+        with self.lock:
+            rt = self.runtime
+            if rt is not None and getattr(rt, "alive", False):
+                return rt
+            return None
+
     def close_runtime(self) -> dict:
         if self.runtime is None:
             return {"ok": True, "already_closed": True}

@@ -488,6 +488,132 @@ def part_candidate_paging() -> None:
               str(c.get("note", ""))[-60:])
 
 
+# ================================================================ §6 TOCTOU
+
+def part_runtime_toctou() -> None:
+    """6. 并发工具调用下 `SessionState.runtime` 的 TOCTOU 竞态。
+
+    缺陷现场（`server.py` 的 16 个运行时工具）：
+        st = state.state()
+        if not st.has_runtime():
+            return _err(...)
+        res = st.runtime.runtime_info()      # ← 另一线程可能已把它置为 None
+
+    `server.py` 已经把同步工具丢进线程池并发执行（见 §1），所以
+    「检查通过」与「使用引用」之间真的可能被另一个线程的 `close_session`
+    插进来 —— 那会抛 `AttributeError: 'NoneType' object has no attribute ...`。
+
+    这一段不需要游戏：用假 RuntimeSession + 两个线程压这个窗口。
+    为了让竞态**可观测**，把 `sys.setswitchinterval` 调到最小
+    （GIL 默认 5ms 才切一次线程，窗口太窄跑不出来）。
+    """
+    section("6. 并发调用：SessionState.runtime 的 TOCTOU 竞态（缺陷 #6）")
+
+    from gamemod_mcp.engine.state import SessionState
+
+    class FakeRuntime:
+        alive = True
+
+        def hook_status(self):
+            return {"ok": True, "hooks": []}
+
+        def close(self):
+            self.alive = False
+            return {"ok": True}
+
+    def old_style(st) -> str:
+        """修复前的写法：先检查、再用（中间可能被别的线程清空）。"""
+        if not st.has_runtime():
+            return "no-runtime"
+        return str(st.runtime.hook_status())    # ← TOCTOU 点
+
+    def new_style(st) -> str:
+        """修复后的写法：锁内原子取引用，之后只用局部变量。"""
+        rt = st.live_runtime()
+        if rt is None:
+            return "no-runtime"
+        return str(rt.hook_status())
+
+    def race(reader) -> list[str]:
+        st = SessionState()
+        errors: list[str] = []
+        done = threading.Event()
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)     # 放大竞态窗口，否则跑不出来
+        try:
+            def a():
+                for _ in range(150000):
+                    if done.is_set():
+                        return
+                    try:
+                        reader(st)
+                    except Exception as exc:              # noqa: BLE001
+                        errors.append(f"{type(exc).__name__}: {exc}")
+                        return
+
+            def b():
+                for _ in range(150000):
+                    st.runtime = FakeRuntime()
+                    st.close_runtime()
+                done.set()
+
+            ta = threading.Thread(target=a)
+            tb = threading.Thread(target=b)
+            ta.start(); tb.start(); ta.join(); tb.join()
+        finally:
+            sys.setswitchinterval(old_interval)
+        return errors
+
+    # ---- 新写法：必须 0 异常
+    errs_new = race(new_style)
+    check("新写法（live_runtime 原子取引用）在切换穿插下 0 异常",
+          not errs_new, f"{errs_new[:1]}" if errs_new else "150,000 轮无异常")
+
+    # ---- 反证：旧写法必须真的会炸（否则这条断言是恒真的、没有价值）
+    errs_old = race(old_style)
+    check("反证：旧的「先 has_runtime() 再读 st.runtime」确实会抛 NoneType",
+          bool(errs_old), f"{errs_old[:1]}" if errs_old else "本次未复现")
+
+    # ---- live_runtime 的语义（纯逻辑，不依赖竞态是否复现）
+    st2 = SessionState()
+    check("没有会话时 live_runtime() 返回 None",
+          st2.live_runtime() is None)
+    fake = FakeRuntime()
+    st2.runtime = fake
+    check("有活会话时 live_runtime() 返回该实例",
+          st2.live_runtime() is fake)
+    fake.alive = False
+    check("会话已失效（alive=False）时 live_runtime() 返回 None",
+          st2.live_runtime() is None,
+          "has_runtime() 与 live_runtime() 口径必须一致")
+    check("live_runtime() 与 has_runtime() 口径一致（同时为假）",
+          st2.live_runtime() is None and st2.has_runtime() is False)
+
+    # ---- 工具层：全部运行时工具都必须走原子取引用，且不再出现
+    #      「has_runtime() 之后直接 st.runtime.xxx」这一模式
+    import gamemod_mcp.server as S
+    src = (Path(S.__file__)).read_text(encoding="utf-8")
+    check("server.py 定义了 _need_runtime（与 _need_index 对称）",
+          "def _need_runtime(" in src)
+    # 统计「检查后紧接着用 st.runtime.」的危险写法
+    lines = src.split("\n")
+    unsafe = []
+    for i, ln in enumerate(lines):
+        if "has_runtime()" in ln:
+            for follow in lines[i + 1:i + 5]:
+                if "st.runtime." in follow:
+                    unsafe.append(i + 1)
+                    break
+    check("server.py 里不再有「has_runtime() 之后直接用 st.runtime.」",
+          not unsafe, f"残留行号：{unsafe}")
+    check("live_runtime 真的被工具层用上了（不只是定义了）",
+          src.count("_need_runtime(") >= 15,
+          f"_need_runtime( 出现 {src.count('_need_runtime(')} 次")
+    check("反证：has_runtime() 本身仍保留（会话状态查询还要用它，没被删）",
+          "def has_runtime(" in (Path(S.__file__).parent / "engine"
+                                / "state.py").read_text(encoding="utf-8"))
+
+
 def main() -> int:
     print("验收：重启验证报告 §4 的 5 个缺陷修复")
     print(f"样本根: {[str(p) for p in samples.SAMPLE_ROOTS]}")
@@ -496,6 +622,7 @@ def main() -> int:
     part_failed_call_side_effect()
     part_ue_manifest()
     part_candidate_paging()
+    part_runtime_toctou()
     print()
     print("=" * 74)
     if FAIL:

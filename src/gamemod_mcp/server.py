@@ -440,6 +440,30 @@ def _need_index() -> tuple[Any, dict | None]:
     return st.index, None
 
 
+def _need_runtime(hint: str = "请先调用 inject_process 或 launch_game。"
+                  ) -> tuple[Any, dict | None]:
+    """取当前**活着的**运行时会话；没有就返回错误响应。
+
+    为什么返回实例而不是「检查一下就好」（与 `_need_index` 对称）
+    ------------------------------------------------------------
+    `server.py` 已经把同步工具丢进线程池并发执行（见
+    `_install_event_loop_guard`），所以「检查有没有会话」与「用这个会话」
+    之间可能被另一个线程的 `close_session()` 插进来 —— 那种写法是
+    TOCTOU，会抛出 `AttributeError: 'NoneType' object has no attribute ...`。
+
+    这里用 `st.live_runtime()` 在锁内**原子**取出引用，调用方拿到的局部变量
+    即便在下一毫秒被关闭也仍然有效（会话内部的 `_check()` 会给出明确的
+    SessionError，而不是一个 NoneType 崩溃）。
+
+    实测：把 GIL 切换间隔压到 1e-6 让两个线程对压，旧写法确实复现了
+    NoneType 崩溃，新写法 15 万轮 0 异常（见 `verify_report_fixes.py` §6）。
+    """
+    rt = state.state().live_runtime()
+    if rt is None:
+        return None, _err(f"当前没有已注入的运行时会话。{hint}".rstrip())
+    return rt, None
+
+
 def _index_query(res: dict | None, what: str, **extra: Any) -> dict:
     """统一收口索引层查询结果。
 
@@ -1743,11 +1767,11 @@ def runtime_info() -> dict:
     不吻合说明探针挂到的可能不是同一个游戏实例，需要排查。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        ri = st.runtime.runtime_info()
+        ri = rt.runtime_info()
     except Exception as exc:
         return _err(f"查询失败：{exc}")
     out = dict(ri)
@@ -1806,11 +1830,11 @@ def runtime_class_info(
          methods: [{name, token, pointer, rva_hex, in_module, param_count}]}
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.class_info(
+        res = rt.class_info(
             namespace=namespace, name=name, image=image,
             fields=fields, methods=methods, method_filter=method_filter,
         )
@@ -1880,11 +1904,11 @@ def find_instances(
         或 `warning`（恢复 GC world 失败，游戏可能卡住）。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.find_instances(
+        res = rt.find_instances(
             namespace=namespace, name=name, image=image,
             max_count=max_count,
         )
@@ -1928,12 +1952,12 @@ def find_hook_target(name: str, method: str, namespace: str = "",
         image:     程序集名。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.method_target(namespace=namespace, name=name,
-                                       method=method, image=image)
+        res = rt.method_target(namespace=namespace, name=name,
+                              method=method, image=image)
         if not res.get("ok"):
             return _err(res.get("error", "未找到"), **{
                 k: v for k, v in res.items() if k not in ("ok", "error")
@@ -2004,16 +2028,16 @@ def hook_method(
         失败时 {ok: false, error, candidates: [...]}。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
         specs = _parse_arg_specs(args_type)
         rv = _parse_retval_type(retval_type)
     except ValueError as exc:
         return _err(str(exc))
     try:
-        res = st.runtime.hook_method(
+        res = rt.hook_method(
             namespace=namespace, name=name, method=method, image=image,
             args=specs, label=label, max_calls=max_calls, backtrace=backtrace,
             token=token, param_count=param_count, retval_type=rv,
@@ -2049,16 +2073,16 @@ def hook_address(
         backtrace:  是否记录调用栈。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process "
-                    "或 launch_game。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
         specs = _parse_arg_specs(args_type)
         rv = _parse_retval_type(retval_type) or "ptr"
     except ValueError as exc:
         return _err(str(exc))
     try:
-        res = st.runtime.hook(address=address, args=specs, label=label,
+        res = rt.hook(address=address, args=specs, label=label,
                               max_calls=max_calls, backtrace=backtrace,
                               retval_type=rv)
         if not res.get("ok"):
@@ -2085,13 +2109,14 @@ def unhook(hook_id: str = "") -> dict:
     卸载后游戏行为恢复原状。收尾时务必调用（或用 close_session）。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
         if hook_id:
-            res = st.runtime.unhook(hook_id)
+            res = rt.unhook(hook_id)
         else:
-            res = st.runtime.unhook_all()
+            res = rt.unhook_all()
         return res if res.get("ok") else _err(res.get("error", "卸载失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
         })
@@ -2108,10 +2133,11 @@ def hook_status() -> dict:
     如果挂的是每帧调用的方法却始终 0 次，多半是落点不对。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        return _ok(**st.runtime.hook_status())
+        return _ok(**rt.hook_status())
     except Exception as exc:
         return _err(f"查询失败：{exc}")
 
@@ -2141,10 +2167,11 @@ def drain_events(limit: int = 200, kind: str = "") -> dict:
                   from, args, retval}
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        return _ok(**st.runtime.drain_events(limit=limit, kind=kind))
+        return _ok(**rt.drain_events(limit=limit, kind=kind))
     except Exception as exc:
         return _err(f"读取失败：{exc}")
 
@@ -2161,10 +2188,11 @@ def read_memory(address: str, size: int = 16) -> dict:
         size:    读取字节数（上限 16 MB）。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.read_memory(address, size)
+        res = rt.read_memory(address, size)
         return res if res.get("ok") else _err(res.get("error", "读取失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
         })
@@ -2195,8 +2223,9 @@ def write_memory(address: str, hex_data: str, force: bool = False) -> dict:
         force:    明知目标被 Hook 覆盖仍要写（默认 False = 拒绝）。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     size = len(hex_data.strip()) // 2
     if not force:
         hit = _overlapping_hook(st, address, size)
@@ -2210,7 +2239,7 @@ def write_memory(address: str, hex_data: str, force: bool = False) -> dict:
                 hook=hit,
             )
     try:
-        res = st.runtime.write_memory(address, hex_data)
+        res = rt.write_memory(address, hex_data)
         return res if res.get("ok") else _err(res.get("error", "写入失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
         })
@@ -2259,8 +2288,9 @@ def read_field_value(
         image:     程序集名。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process。")
+    rt, err = _need_runtime()
+    if err:
+        return err
 
     # ---------------- 静态字段：`instance="static"`（或空串）
     #
@@ -2279,7 +2309,7 @@ def read_field_value(
                                   namespace=namespace, image=image)
 
     try:
-        ci = st.runtime.class_fields(namespace=namespace, name=name,
+        ci = rt.class_fields(namespace=namespace, name=name,
                                      image=image, instance_only=True)
         if not ci.get("ok"):
             return _err(ci.get("error", "未找到类"), **{
@@ -2312,7 +2342,7 @@ def read_field_value(
         # 所以先把它折成底层整型类型（见 _resolve_enum_underlying）。
         enum_base = _resolve_enum_underlying(st, hit.get("type"), hit)
         read_width = _field_read_width(enum_base or hit.get("type"))
-        raw = st.runtime.read_memory(hex(field_addr), read_width)
+        raw = rt.read_memory(hex(field_addr), read_width)
         if not raw.get("ok"):
             return _err(raw.get("error", "读取内存失败"),
                         field_address=hex(field_addr),
@@ -2416,8 +2446,9 @@ def set_field_value(
          write_width, write_kind, value_before?, read_back?...}
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。请先调用 inject_process。")
+    rt, err = _need_runtime()
+    if err:
+        return err
 
     # ---------------- 静态字段：`instance="static"`（或空串）
     # 与 `read_field_value` 对称的入口（见那边的说明）。静态字段**没有实例
@@ -2428,7 +2459,7 @@ def set_field_value(
                                    verify=verify)
 
     try:
-        ci = st.runtime.class_fields(namespace=namespace, name=name,
+        ci = rt.class_fields(namespace=namespace, name=name,
                                      image=image, instance_only=True)
         if not ci.get("ok"):
             return _err(ci.get("error", "未找到类"), **{
@@ -2500,18 +2531,18 @@ def set_field_value(
             out["enum_base_type"] = enum_base
 
         # 先读原值：既给回滚依据，也让「写前后有差别」这件事可核查
-        before = st.runtime.read_memory(hex(field_addr), width)
+        before = rt.read_memory(hex(field_addr), width)
         if before.get("ok"):
             out["value_before_hex"] = before.get("hex")
             out["value_before"] = _explain_bytes(before.get("hex") or "")
 
-        wr = st.runtime.write_memory(hex(field_addr), blob.hex())
+        wr = rt.write_memory(hex(field_addr), blob.hex())
         if not wr.get("ok"):
             return _err(wr.get("error", "写入内存失败"),
                         field_address=hex(field_addr), wrote_hex=blob.hex())
 
         if verify:
-            after = st.runtime.read_memory(hex(field_addr), width)
+            after = rt.read_memory(hex(field_addr), width)
             if after.get("ok"):
                 out["read_back_hex"] = after.get("hex")
                 out["read_back"] = _explain_bytes(after.get("hex") or "")
@@ -2760,10 +2791,11 @@ def scan_pattern(pattern: str, module: str = "", max_results: int = 32) -> dict:
         max_results: 最多返回多少个命中。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.scan_pattern(pattern, module=module,
+        res = rt.scan_pattern(pattern, module=module,
                                       max_results=max_results)
         return res if res.get("ok") else _err(res.get("error", "扫描失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
@@ -2798,10 +2830,11 @@ def eval_script(code: str) -> dict:
         code: JS 表达式或语句块。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.eval_js(code)
+        res = rt.eval_js(code)
         return res if res.get("ok") else _err(res.get("error", "执行失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
         })
@@ -2828,10 +2861,11 @@ def gc_control(disable: bool = True) -> dict:
         disable: True 暂停 GC，False 恢复。
     """
     st = state.state()
-    if not st.has_runtime():
-        return _err("当前没有已注入的运行时会话。")
+    rt, err = _need_runtime()
+    if err:
+        return err
     try:
-        res = st.runtime.gc_control(disable=disable)
+        res = rt.gc_control(disable=disable)
         return res if res.get("ok") else _err(res.get("error", "GC 控制失败"))
     except Exception as exc:
         return _err(f"GC 控制失败：{exc}")
