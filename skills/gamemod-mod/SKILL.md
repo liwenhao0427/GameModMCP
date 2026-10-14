@@ -439,14 +439,29 @@ read_field_value(instance="0x...", name="UserData", field="gold")
 
 ### 配方 2：拦截一个函数、修改它的返回值
 
+**首选 `override_retval=`**（受探针统一监管，别手写 JS）：
+
 ```python
 find_hook_target(name="UserData_Service", method="get_storeStatSync")
 # 记下返回的 token，去静态那边比对，确认是同一个方法
 hook_method(name="UserData_Service", method="get_storeStatSync",
             namespace="TeamTapas.ProjectR.UserDatas.Service",
-            args_type="")
-drain_events()          # 看 retval
-# 要改返回值需要在下发 JS 里操作 —— 用 eval_script 装一个自定义 Hook
+            args_type="",
+            retval_type="int",         # 留空则按静态返回类型自动推断
+            override_retval="9999")    # ← 受控覆写：返回值改成 9999
+hook_status()   # 确认这项带着 override_retval
+drain_events()  # leave 里有 original_retval（改前值）
+unhook()        # 卸掉后恢复原状
+```
+
+它进探针的 `hooks` 表，所以比 `eval_script` 手写 `Interceptor` 多三样：
+`hook_status()` 看得见、`unhook()` 卸得掉、`write_memory` 的重叠护栏也管得到。
+支持 `int`/`uint`/`long`/`ulong`/`bool`/`ptr`/`float`/`double`；
+**浮点返回值同样可覆写**（走「整体换 XMM0 的 ArrayBuffer」—— 实测
+`retval.replace` 对浮点**无效**，它改的是 RAX）。`string`/`cstring` 会被
+拒绝：那要换托管对象引用，属改逻辑，用 `eval_script` 兜底：
+
+```python
 eval_script("""
 (function(){
   var target = ptr('0x...');            // 上一步拿到的 pointer

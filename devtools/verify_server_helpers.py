@@ -503,6 +503,96 @@ def main() -> int:
           "_eval_condition" in _defined,
           "去掉它会让 monkeypatch 失效（见上面两条注入断言）")
 
+    # ================================================================
+    # 9. `override_retval`：受控返回值覆写的参数相容性（不需要游戏）
+    print()
+    print("=" * 74)
+    print("9. override_retval：参数相容性校验（不假成功）")
+    print("=" * 74)
+
+    # 空串是**默认值**，表示「只观察不改」——必须 100% 兼容旧调用。
+    _v, _e = S._parse_override_retval("", "int")
+    check("override_retval 留空 = 不覆写（保持原行为）",
+          _v == "" and _e is None, f"value={_v!r} err={_e!r}")
+
+    # 可覆写的类型逐一放行
+    for _t in ("int", "uint", "long", "ulong", "bool", "ptr", "float", "double"):
+        _v2, _e2 = S._parse_override_retval("123", _t)
+        if _e2 is not None or _v2 != "123":
+            check(f"retval_type={_t} 允许覆写", False, f"err={_e2}")
+            break
+    else:
+        check("8 个可覆写类型（含 float/double）全部放行", True,
+              "int/uint/long/ulong/bool/ptr/float/double")
+
+    # 不支持的类型必须**明确拒绝**并说清替代方案
+    for _bad in ("string", "cstring"):
+        _v3, _e3 = S._parse_override_retval("x", _bad)
+        check(f"retval_type={_bad} 拒绝覆写（要换托管对象引用）",
+              _v3 == "" and _e3 is not None and "eval_script" in str(_e3),
+              str(_e3)[:70])
+
+    # 反证：float **必须**在允许表里。指导书曾断言「浮点返回值不可覆写、
+    # 应当明确拒绝」—— 实测推翻（见 agent.js encodeRetvalOverride 的说明：
+    # 整体换 XMM0 的 ArrayBuffer 有效，实测 3/3 次）。若哪天有人照那份
+    # 指导书把 float 从表里删掉，这条会报红。
+    check("反证：float/double **在**可覆写表里（实测可覆写，不要照旧建议拒绝）",
+          "float" in S._OVERRIDABLE_RETVAL
+          and "double" in S._OVERRIDABLE_RETVAL,
+          "整体赋值新 ArrayBuffer 给 context.xmm0 实测有效")
+    check("string/cstring **不在**可覆写表里（改托管引用属改逻辑）",
+          "string" not in S._OVERRIDABLE_RETVAL
+          and "cstring" not in S._OVERRIDABLE_RETVAL)
+
+    # ---- 探针层：编码函数的源码必须体现那三条实测结论
+    _agent_src = (samples.SRC / "gamemod_mcp" / "runtime" / "agent.js"
+                  ).read_text(encoding="utf-8")
+    check("agent.js 定义了 encodeRetvalOverride（覆写值编码抽成函数）",
+          "function encodeRetvalOverride(" in _agent_src)
+    check("agent.js 定义了 applyRetvalOverride（写回逻辑抽成函数）",
+          "function applyRetvalOverride(" in _agent_src)
+    # 浮点那条路**必须**是「整体赋值新 ArrayBuffer」，不是原地改
+    _apply_start = _agent_src.find("function applyRetvalOverride(")
+    _apply_body = _agent_src[_apply_start:_apply_start + 900]
+    check("浮点覆写走「整体赋值新 ArrayBuffer」（原地改无效，实测）",
+          "ctx['xmm0'] = ab;" in _apply_body,
+          "原地 setFloat32 实测无效：那个 ArrayBuffer 是快照副本")
+    check("非浮点走 retval.replace（整型返回值在 RAX，实测有效）",
+          "retval.replace(" in _apply_body)
+    check("覆写前记录了 original_retval（供改前/改后核查）",
+          "rec.original_retval" in _agent_src,
+          "没有它就无法验收「到底改没改」")
+    check("hookStatus 里带上 override_retval（状态可查）",
+          "row.override_retval" in _agent_src
+          or "override_retval:" in _agent_src.split("hookStatus:")[-1][:2000],
+          "不报出来，调用方只能靠自己记")
+
+    # ---- 会话层与工具层：参数真的被接上了（不是「收了不用」）
+    from gamemod_mcp.runtime import session as _sess2           # noqa: E402
+    check("session.hook 签名收 override_retval",
+          "override_retval" in inspect.signature(_sess2.RuntimeSession.hook
+                                                 ).parameters)
+    check("session.hook_method 签名收 override_retval",
+          "override_retval" in inspect.signature(
+              _sess2.RuntimeSession.hook_method).parameters)
+    check("session.hook 只在非空时才把它放进 spec（空串不下发）",
+          'if override_retval != "":' in inspect.getsource(
+              _sess2.RuntimeSession.hook),
+          "空串下发会让探针多一次无意义解析")
+    _srv_src = (samples.SRC / "gamemod_mcp" / "server.py").read_text(
+        encoding="utf-8")
+    for _tname in ("hook_method", "hook_address"):
+        _fn = S.RAW_TOOLS.get(_tname)
+        check(f"工具 {_tname} 签名收 override_retval",
+              _fn is not None and "override_retval" in inspect.signature(
+                  _fn).parameters)
+    check("server 的 hook_method 把 override_retval 真的传给会话层",
+          "override_retval=override_retval" in _srv_src)
+    check("server 的 hook_address 把 override_retval 真的传给会话层",
+          _srv_src.count("override_retval=override_retval") >= 2,
+          f"出现 {_srv_src.count('override_retval=override_retval')} 次"
+          "（两个工具各一次）")
+
     print()
     print("=" * 74)
     if FAIL:

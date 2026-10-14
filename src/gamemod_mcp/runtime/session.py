@@ -703,11 +703,17 @@ class RuntimeSession:
              label: str = "", max_calls: int = 200,
              backtrace: bool = False, retval: bool = True,
              retval_type: str = "ptr", this_type: str = "",
-             preferred_module: str = "") -> dict:
+             preferred_module: str = "",
+             override_retval: str = "") -> dict:
         """在指定地址装 Hook。
 
         address 可以是绝对地址，也可以由上层用 method_target 得到的 RVA
         加模块基址换算而来。
+
+        `override_retval` 非空时**改写**该函数的返回值（受控覆写，默认不改）。
+        支持 int / uint / long / ulong / bool / ptr / float / double；
+        其余类型会被探针**当场拒绝**（见 `hookAt` 里 `encodeRetvalOverride`
+        的说明：改托管对象引用属于改逻辑，不该由这个参数承担）。
         """
         spec: dict[str, Any] = {
             "address": address,
@@ -720,6 +726,8 @@ class RuntimeSession:
         }
         if this_type:
             spec["this_type"] = this_type
+        if override_retval != "":
+            spec["override_retval"] = override_retval
         return self._call("hook", spec, preferred_module or None)
 
     def hook_method(self, namespace: str, name: str, method: str,
@@ -727,7 +735,8 @@ class RuntimeSession:
                     label: str = "", max_calls: int = 200,
                     backtrace: bool = False, preferred_module: str = "",
                     token: str = "", param_count: int = -1,
-                    retval_type: str = "") -> dict:
+                    retval_type: str = "",
+                    override_retval: str = "") -> dict:
         """便捷入口：按 类+方法名 直接 Hook。
 
         这是「元数据优先」工作流的收口：Agent 用静态元数据查到目标方法，
@@ -747,6 +756,11 @@ class RuntimeSession:
         float / double 返回值在 XMM0 而不在 RAX：按 `ptr` 读会给出一个
         看着像地址、其实毫无意义的整数（实测 `Mathf.Abs(-2.5f)` 得到
         `0x20da0a48360`）。
+
+        **受控覆写**：`override_retval` 非空时改写返回值。它走探针的
+        `hooks` 表，因此能被 `hook_status` 看见、被 `unhook` 卸掉，
+        也受 `write_memory` 的重叠护栏保护（挂 `eval_script` 手写
+        `Interceptor` 就没有这三样）。
         """
         tgt = self.method_target(namespace, name, method, image=image,
                                  preferred_module=preferred_module)
@@ -778,7 +792,8 @@ class RuntimeSession:
         out = self.hook(chosen["pointer"], args=args, label=label or f"{name}.{method}",
                         max_calls=max_calls, backtrace=backtrace,
                         retval_type=rv_type,
-                        preferred_module=preferred_module)
+                        preferred_module=preferred_module,
+                        override_retval=override_retval)
         if out.get("ok"):
             out["class"] = tgt.get("class")
             out["method"] = method
@@ -793,6 +808,8 @@ class RuntimeSession:
             # 读错寄存器会给出看着像地址、其实毫无意义的整数。
             out["retval_type"] = rv_type
             out["return_type"] = chosen.get("return_type")
+            if override_retval != "":
+                out["override_retval"] = override_retval
         return out
 
     def unhook(self, hook_id: str) -> dict:

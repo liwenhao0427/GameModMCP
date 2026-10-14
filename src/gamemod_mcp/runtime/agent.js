@@ -1369,6 +1369,88 @@
         }
     }
 
+    /**
+     * 把「覆写返回值」的文本编码成 onLeave 里可用的东西。
+     *
+     * 为什么需要它（这是 Batch 6 的核心，且有一处**反直觉的实测结论**）
+     * ------------------------------------------------------------
+     * 整型族与浮点族的**写回路径完全不同**，用错会得到一个「ok:true 但没生效」
+     * 的假成功：
+     *
+     *   · 整型 / 指针 / 布尔：返回值在 RAX，`retval.replace(ptr)` 有效。
+     *   · 浮点（float / double）：返回值在 **XMM0**，`retval` 里拿到的是
+     *     `NativePointer`（实测 `Object.getPrototypeOf(retval)` 只有
+     *     `replace` 一个方法）—— 对它调 `replace` 改的是 **RAX**，
+     *     **对浮点返回值毫无作用**（实测：mixed() 原值 4140.5，
+     *     `retval.replace(ptr(0x447a4000))` 后调用方仍拿到 4140.5）。
+     *
+     * 浮点到底怎么改（实测三选一，各跑 3 次全部一致）：
+     *   ✗ `this.context.xmm0` 的原 ArrayBuffer **原地** `setFloat32` → 无效
+     *     （那个 ArrayBuffer 是**快照副本**，写它不影响真实寄存器）
+     *   ✗ `retval.replace(...)` → 无效（改的是 RAX）
+     *   ✓ **整体赋值一个新的 ArrayBuffer** 给 `this.context.xmm0` → **有效**
+     *     （实测 3/3 次调用方都拿到 999.5）
+     *
+     * 所以本函数返回一个**描述对象**，由 `applyRetvalOverride` 按类型分别处理；
+     * 浮点绝不走 `retval.replace`（那会静默失效）。
+     *
+     * @returns {{ok: boolean, kind?: string, error?: string}}
+     */
+    function encodeRetvalOverride(spec, rawVal) {
+        var kind = String(spec || '').trim();
+        if (kind === 'float' || kind === 'double') {
+            var fv = Number(rawVal);
+            if (!isFinite(fv)) {
+                return { ok: false, error: '浮点覆写值不是有限数：' + rawVal };
+            }
+            return { ok: true, kind: kind, value: fv };
+        }
+        if (kind === 'bool') {
+            var s = String(rawVal).trim().toLowerCase();
+            if (s === 'true' || s === '1') { return { ok: true, kind: kind, value: 1 }; }
+            if (s === 'false' || s === '0') { return { ok: true, kind: kind, value: 0 }; }
+            return { ok: false, error: 'bool 覆写值只认 true/false/1/0，收到 ' + rawVal };
+        }
+        if (kind === 'int' || kind === 'uint' || kind === 'long' ||
+            kind === 'ulong' || kind === 'ptr') {
+            var n = null;
+            try {
+                var t = String(rawVal).trim();
+                n = ptr(t);                 // Frida 认 0x 前缀与十进制串
+            } catch (e) {
+                return { ok: false, error: '整数覆写值无法解析：' + rawVal };
+            }
+            if (n === null) {
+                return { ok: false, error: '整数覆写值无法解析：' + rawVal };
+            }
+            return { ok: true, kind: kind, value: n };
+        }
+        // 其余（string / cstring / 未知）一律拒绝：那条路要改托管对象引用，
+        // 属于改逻辑而不是改一个返回值，不该由本参数承担。
+        return { ok: false,
+                 error: '不支持覆写的返回值类型：' + (kind || '(空)') +
+                        '。支持 int/uint/long/ulong/bool/ptr/float/double' };
+    }
+
+    /**
+     * 把编码好的覆写值真正写回去。浮点走「整体换 ArrayBuffer」，其余走 replace。
+     *
+     * @returns {boolean} 是否成功写回（失败由调用方记进事件里，不静默）
+     */
+    function applyRetvalOverride(ctx, retval, enc) {
+        if (enc.kind === 'float' || enc.kind === 'double') {
+            // ★ 必须**整体赋值**新 ArrayBuffer：原地改旧的那个是无效的
+            var ab = new ArrayBuffer(16);
+            var dv = new DataView(ab);
+            if (enc.kind === 'double') { dv.setFloat64(0, enc.value, true); }
+            else { dv.setFloat32(0, enc.value, true); }
+            ctx['xmm0'] = ab;
+            return true;
+        }
+        retval.replace(enc.value);
+        return true;
+    }
+
     function hookAt(spec) {
         var target;
         try {
@@ -1383,6 +1465,20 @@
         var wantBacktrace = !!spec.backtrace;
         var wantRetval = spec.retval !== false;      // 默认捕获返回值
         var retvalSpec = spec.retval_type || 'ptr';
+        // 受控返回值覆写（默认不覆写，行为 100% 兼容旧调用）。
+        // 覆写值在**装 Hook 之前**就编码好并校验：写错规格要当场报失败，
+        // 而不是等到某个调用发生时才发现覆写没生效。
+        var overrideEnc = null;
+        if (spec.override_retval !== undefined && spec.override_retval !== null
+            && String(spec.override_retval) !== '') {
+            overrideEnc = encodeRetvalOverride(retvalSpec, spec.override_retval);
+            if (!overrideEnc.ok) {
+                return fail('override_retval 无法应用：' + overrideEnc.error, {
+                    retval_type: retvalSpec,
+                    override_retval: String(spec.override_retval)
+                });
+            }
+        }
         var counts = { enter: 0, leave: 0 };
         hookCounts[id] = counts;
 
@@ -1478,11 +1574,29 @@
                             rec.retval = readArg(retvalSpec, retval);
                         }
                     }
+                    // 覆写返回值：**先记录原值**（rec.retval 已在上一步读好）
+                    // 再改写 —— original_retval 让调用方能把「改前/改后」
+                    // 放在一起核查，这是覆写功能可验收的关键字段。
+                    if (overrideEnc) {
+                        try {
+                            rec.original_retval = (rec.retval === undefined)
+                                ? null : rec.retval;
+                            applyRetvalOverride(this.context, retval, overrideEnc);
+                            rec.retval_overridden = true;
+                            rec.override_value = (overrideEnc.kind === 'float'
+                                || overrideEnc.kind === 'double')
+                                ? overrideEnc.value : overrideEnc.value.toString();
+                        } catch (e) {
+                            // 覆写失败**如实报告**，绝不静默当成成功
+                            rec.retval_overridden = false;
+                            rec.override_error = '覆写失败：' + (e.message || e);
+                        }
+                    }
                     try { send(rec); } catch (e) { /* 同上 */ }
                 }
             });
             hooks[id] = { listener: listener, spec: spec, target: target };
-            return {
+            var hookOut = {
                 ok: true,
                 hook_id: id,
                 target: target.toString(),
@@ -1492,6 +1606,16 @@
                 label: spec.label || null,
                 note: '事件通过 send() 推送到宿主，用 drain_events 读取'
             };
+            if (overrideEnc) {
+                // 如实回传「这个 Hook 会改返回值」——hookStatus 也报同一件事，
+                // 调用方不必靠记忆去核对。
+                // 这里回传**调用方给的原文**（而不是编码后的指针），
+                // 与 hookStatus 的口径一致：`9999` 回的就是 `"9999"`，
+                // 而不是 `0x270f` —— 否则同一个配置在两处显示成两个值。
+                hookOut.override_retval = String(spec.override_retval);
+                hookOut.retval_type = retvalSpec;
+            }
+            return hookOut;
         } catch (e) {
             return fail('Hook 失败：' + e.message, { address: spec.address });
         }
@@ -3493,14 +3617,24 @@
             var out = [];
             for (var id in hooks) {
                 if (!Object.prototype.hasOwnProperty.call(hooks, id)) { continue; }
-                out.push({
+                var spec = hooks[id].spec || {};
+                var row = {
                     hook_id: id,
-                    label: hooks[id].spec.label || null,
+                    label: spec.label || null,
                     target: hooks[id].target.toString(),
                     target_rva: describeAddress(hooks[id].target),
                     enter_count: hookCounts[id] ? hookCounts[id].enter : 0,
                     leave_count: hookCounts[id] ? hookCounts[id].leave : 0
-                });
+                };
+                // 覆写返回值是**会改变游戏行为**的配置，状态里必须能看见 ——
+                // 否则「这个 Hook 到底改没改返回值」只能靠调用方自己记。
+                if (spec.override_retval !== undefined &&
+                    spec.override_retval !== null &&
+                    String(spec.override_retval) !== '') {
+                    row.override_retval = String(spec.override_retval);
+                    row.retval_type = spec.retval_type || 'ptr';
+                }
+                out.push(row);
             }
             return { ok: true, hooks: out, count: out.length };
         },

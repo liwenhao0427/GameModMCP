@@ -249,6 +249,37 @@ def _parse_retval_type(retval_type: str) -> str:
 #:
 #: Hook 会改写目标入口处的跳转指令（x64 上 5 字节的 `E9 rel32`，Frida 还可能
 #: 用更长的绝对跳转），所以命中判定不能只比首地址。
+#: 可以**覆写返回值**的类型。故意不含 `string` / `cstring`：
+#: 那两种要换一个托管字符串对象引用，属于改逻辑而不是「改一个返回值」，
+#: 应当用 `eval_script`。列在这里的类型都必须能编码成一个寄存器宽度。
+_OVERRIDABLE_RETVAL = ("int", "uint", "long", "ulong", "bool", "ptr",
+                       "float", "double")
+
+
+def _parse_override_retval(override_retval: str, retval_type: str
+                           ) -> tuple[str, str | None]:
+    """校验 `override_retval` 与目标返回类型是否相容。返回 `(值, 错误)`。
+
+    为什么要在**工具层**也校验一遍（探针里同样会校验）：
+    - 探针那份校验发生在**装 Hook 那一刻**，工具层能更早给出可读的错误；
+    - 更重要的是「不假成功」：若只在探针里判而工具层原样透传，
+      调用方拿到的 `ok:false` 会缺少「该传什么」的指引。
+
+    值本身的合法性（浮点是否有限、bool 词表、整数能否解析）**只由探针的
+    `encodeRetvalOverride` 判** —— 那是唯一实现，工具层不重复一遍，
+    免得两处规则漂移。
+    """
+    if override_retval == "":
+        return "", None
+    if retval_type not in _OVERRIDABLE_RETVAL:
+        return "", (
+            f"retval_type={retval_type!r} 不支持覆写返回值。"
+            f"可覆写的类型：{'/'.join(_OVERRIDABLE_RETVAL)}。"
+            f"string/cstring 要换托管对象引用，属于改逻辑，请用 eval_script。"
+        )
+    return override_retval, None
+
+
 _HOOK_ENTRY_SLACK = 16
 
 
@@ -1820,6 +1851,7 @@ def hook_method(
     token: str = "",
     param_count: int = -1,
     retval_type: str = "",
+    override_retval: str = "",
 ) -> dict:
     """在目标方法上安装 Hook，捕获它的调用（参数、调用来源、返回值）。用 `token` 指定重载；多候选未指定则**拒绝**。
 
@@ -1854,6 +1886,16 @@ def hook_method(
                    ptr/string/cstring）。留空 = 按静态返回类型自动推断，
                    这是推荐用法：float/double 的返回值在 XMM0 而不在 RAX，
                    按 ptr 读会给出毫无意义的整数。
+        override_retval: **受控改写返回值**（默认空串 = 只观察不改，与原行为
+                   100% 兼容）。支持 int/uint/long/ulong/bool/ptr/float/double；
+                   其余类型会被**当场拒绝**（不假成功）。
+                   比 `eval_script` 手写 Interceptor 强在三点：它进探针的
+                   `hooks` 表，所以 `hook_status` 看得见、`unhook` 卸得掉、
+                   `write_memory` 的重叠护栏也保护得到。
+                   浮点返回值同样可覆写（实测走「整体换 XMM0 的 ArrayBuffer」，
+                   见 agent.js 的 encodeRetvalOverride）。请配合 hook_status
+                   的 override_retval 字段核对，并用 drain_events 里的
+                   `original_retval` 对比改前/改后。
 
     Returns:
         {ok, hook_id, class, method, chosen: {pointer, rva_hex, token},
@@ -1869,11 +1911,17 @@ def hook_method(
         rv = _parse_retval_type(retval_type)
     except ValueError as exc:
         return _err(str(exc))
+    # `retval_type` 留空 = 由探针按静态返回类型推断，所以这里只能对
+    # **显式给了** 的 retval_type 做相容性校验；显式为空时交给探针判。
+    _ov, _ov_err = _parse_override_retval(override_retval, rv or "ptr")
+    if _ov_err:
+        return _err(_ov_err)
     try:
         res = rt.hook_method(
             namespace=namespace, name=name, method=method, image=image,
             args=specs, label=label, max_calls=max_calls, backtrace=backtrace,
             token=token, param_count=param_count, retval_type=rv,
+            override_retval=override_retval,
         )
         return res if res.get("ok") else _err(res.get("error", "Hook 失败"), **{
             k: v for k, v in res.items() if k not in ("ok", "error")
@@ -1891,6 +1939,7 @@ def hook_address(
     max_calls: int = 200,
     retval_type: str = "ptr",
     backtrace: bool = False,
+    override_retval: str = "",
 ) -> dict:
     """在**任意地址**安装 Hook（不限于托管方法）。适用于原生函数、系统 API、以及「模块基址 + RVA」算出的地址。
 
@@ -1904,6 +1953,10 @@ def hook_address(
         retval_type: 返回值类型（int/uint/float/double/ptr/string/bool）。
         max_calls:  最多记录多少次。
         backtrace:  是否记录调用栈。
+        override_retval: **受控改写返回值**（默认空串 = 只观察不改）。语义与
+                   取值规则同 `hook_method(override_retval=...)`：支持
+                   int/uint/long/ulong/bool/ptr/float/double，其余当场拒绝。
+                   它进探针的 `hooks` 表 → `hook_status` 可见、`unhook` 可卸。
     """
     st = state.state()
     rt, err = _need_runtime()
@@ -1914,10 +1967,14 @@ def hook_address(
         rv = _parse_retval_type(retval_type) or "ptr"
     except ValueError as exc:
         return _err(str(exc))
+    _ov, _ov_err = _parse_override_retval(override_retval, rv)
+    if _ov_err:
+        return _err(_ov_err)
     try:
         res = rt.hook(address=address, args=specs, label=label,
                               max_calls=max_calls, backtrace=backtrace,
-                              retval_type=rv)
+                              retval_type=rv,
+                              override_retval=override_retval)
         if not res.get("ok"):
             return _err(res.get("error", "Hook 失败"), **{
                 k: v for k, v in res.items() if k not in ("ok", "error")

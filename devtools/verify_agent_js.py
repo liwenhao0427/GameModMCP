@@ -434,6 +434,165 @@ try:
           isinstance(_legacy, list) and _legacy != ["0x1000", 2.5, 42],
           f"旧逻辑读到 {_legacy}（真值是 ['0x1000', 2.5, 42]）")
 
+    # ================================================================
+    # Batch 6：受控返回值覆写 `override_retval`（端到端闭环）
+    # ================================================================
+    #
+    # 必须端到端验，不能只做源码扫描 —— 因为「写回去了没有」只有调用方拿到的
+    # 实际返回值能回答。这里造两个真函数（int 与 float），走探针真实的
+    # `hook` RPC + `onLeave` 路径，断言：
+    #   ① 调用方拿到的值真的变了；
+    #   ② leave 事件里同时有 original_retval 与改写后的值（可核查）；
+    #   ③ unhook 之后**恢复原值**（这是「受控」二字的含义）。
+    print()
+    print("-" * 74)
+    print("Batch 6：override_retval 端到端（改得掉、可核查、卸得掉）")
+    print("-" * 74)
+
+    _C6 = ("int gm_i(int x) { return x + 1; } "
+           "float gm_f(float x) { return x * 2.0f; }")
+    _mk = (
+        "(function(){ var cm = new CModule(" + json.dumps(_C6) + ");"
+        " globalThis.__gm_c6 = cm;"
+        " return { i: cm.gm_i.toString(), f: cm.gm_f.toString() }; })()"
+    )
+    _addr = None
+    try:
+        _r6 = script.exports_sync.eval_js(_mk)
+        _addr = _r6.get("value") if isinstance(_r6, dict) else None
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  ⚠️  CModule 创建失败：{exc}")
+    check("造出 int 与 float 两个原生靶子", isinstance(_addr, dict)
+          and bool(_addr.get("i")) and bool(_addr.get("f")), f"{_addr}")
+
+    def _call_i(x):
+        r = script.exports_sync.eval_js(
+            "(function(){ var f = new NativeFunction(ptr("
+            + json.dumps(_addr["i"]) + "), 'int', ['int']);"
+            " return f(" + str(x) + "); })()")
+        return r.get("value") if isinstance(r, dict) else None
+
+    def _call_f(x):
+        r = script.exports_sync.eval_js(
+            "(function(){ var f = new NativeFunction(ptr("
+            + json.dumps(_addr["f"]) + "), 'float', ['float']);"
+            " return f(" + str(x) + "); })()")
+        return r.get("value") if isinstance(r, dict) else None
+
+    if isinstance(_addr, dict) and _addr.get("i"):
+        _base_int = _call_i(10)
+        _base_float = _call_f(3.0)
+        check("基准：gm_i(10)==11 且 gm_f(3.0)==6.0（靶子可用）",
+              _base_int == 11 and _base_float == 6.0,
+              f"int={_base_int} float={_base_float}")
+
+        # ---- ① 整型覆写
+        _hk_i = None
+        try:
+            _hk_i = script.exports_sync.hook({
+                "address": _addr["i"], "args": ["int"], "retval_type": "int",
+                "override_retval": "9999", "label": "c6-int",
+                "max_calls": 10,
+            })
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠️  整型 Hook 失败：{exc}")
+        check("整型覆写：hook 返回 ok 且回传 override_retval",
+              isinstance(_hk_i, dict) and _hk_i.get("ok") is True
+              and str(_hk_i.get("override_retval")) == "9999",
+              f"{_hk_i if not isinstance(_hk_i, dict) else {k: _hk_i.get(k) for k in ('ok', 'override_retval')}}")
+        _after_int = _call_i(10)
+        check("★ 整型覆写生效：调用方拿到 9999（不再是 11）",
+              _after_int == 9999, f"实际 {_after_int}")
+
+        # ---- ② 浮点覆写（指导书说「不可覆写」，实测可）
+        _hk_f = None
+        try:
+            _hk_f = script.exports_sync.hook({
+                "address": _addr["f"], "args": ["float"],
+                "retval_type": "float", "override_retval": "99.5",
+                "label": "c6-float", "max_calls": 10,
+            })
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠️  浮点 Hook 失败：{exc}")
+        check("浮点覆写：hook 返回 ok",
+              isinstance(_hk_f, dict) and _hk_f.get("ok") is True,
+              f"{_hk_f if not isinstance(_hk_f, dict) else _hk_f.get('ok')}")
+        _after_float = _call_f(3.0)
+        check("★ 浮点覆写生效：调用方拿到 99.5（不再是 6.0）",
+              _after_float is not None and abs(_after_float - 99.5) < 0.01,
+              f"实际 {_after_float}"
+              "（指导书曾断言浮点不可覆写，实测推翻）")
+
+        # ---- ③ 事件里带 original_retval（可核查改前/改后）
+        import time as _time6
+        _time6.sleep(0.4)
+        _leaves = [m.get("payload") for m in msgs
+                   if m.get("type") == "send"
+                   and isinstance(m.get("payload"), dict)
+                   and m["payload"].get("phase") == "leave"
+                   and m["payload"].get("label") in ("c6-int", "c6-float")]
+        check("leave 事件带 original_retval（改前值可核查）",
+              bool(_leaves) and all("original_retval" in e for e in _leaves),
+              f"{len(_leaves)} 条 leave")
+        _int_leave = next((e for e in _leaves if e.get("label") == "c6-int"), None)
+        if _int_leave:
+            check("整型 leave：original_retval=11 且 retval_overridden=True",
+                  _int_leave.get("original_retval") == 11
+                  and _int_leave.get("retval_overridden") is True,
+                  f"original={_int_leave.get('original_retval')} "
+                  f"overridden={_int_leave.get('retval_overridden')}")
+        _f_leave = next((e for e in _leaves if e.get("label") == "c6-float"), None)
+        if _f_leave:
+            check("浮点 leave：original_retval=6.0 且 retval_overridden=True",
+                  _f_leave.get("original_retval") == 6.0
+                  and _f_leave.get("retval_overridden") is True,
+                  f"original={_f_leave.get('original_retval')} "
+                  f"overridden={_f_leave.get('retval_overridden')}")
+
+        # ---- ④ hookStatus 里能看见覆写配置
+        _st = None
+        try:
+            _st = script.exports_sync.hook_status()
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠️  hook_status 失败：{exc}")
+        _rows = (_st or {}).get("hooks") or []
+        _row_i = next((r for r in _rows if r.get("label") == "c6-int"), None)
+        check("hookStatus 报出该 Hook 的 override_retval（状态可查）",
+              _row_i is not None and str(_row_i.get("override_retval")) == "9999",
+              f"{_row_i}")
+
+        # ---- ⑤ unhook 后必须恢复原值（「受控」的含义）
+        for _hid in (_hk_i or {}).get("hook_id"), (_hk_f or {}).get("hook_id"):
+            if _hid:
+                try:
+                    script.exports_sync.unhook(_hid)
+                except Exception as exc:                      # noqa: BLE001
+                    print(f"  ⚠️  unhook({_hid}) 失败：{exc}")
+        _restored_int = _call_i(10)
+        _restored_float = _call_f(3.0)
+        check("★ unhook 后整型恢复原值 11（覆写是受控的、可撤销）",
+              _restored_int == 11, f"实际 {_restored_int}")
+        check("★ unhook 后浮点恢复原值 6.0",
+              _restored_float is not None and abs(_restored_float - 6.0) < 0.01,
+              f"实际 {_restored_float}")
+
+        # ---- ⑥ 非法覆写值必须当场拒绝（不假成功）
+        _bad = None
+        try:
+            _bad = script.exports_sync.hook({
+                "address": _addr["i"], "args": ["int"], "retval_type": "int",
+                "override_retval": "not-a-number", "label": "c6-bad",
+            })
+        except Exception as exc:                              # noqa: BLE001
+            _bad = {"ok": False, "error": str(exc)}
+        check("非法覆写值被当场拒绝（ok=False + 说明原因）",
+              isinstance(_bad, dict) and _bad.get("ok") is False
+              and bool(_bad.get("error")),
+              f"{_bad if not isinstance(_bad, dict) else str(_bad.get('error'))[:70]}")
+        # 反证：拒绝之后靶子**必须仍然可调用**（不能因为装 Hook 失败把它弄坏）
+        check("被拒绝后靶子仍返回原值 11（没有留下半装状态的 Hook）",
+              _call_i(10) == 11, f"实际 {_call_i(10)}")
+
     script.unload()
     print("  ✅ 脚本已卸载")
 finally:

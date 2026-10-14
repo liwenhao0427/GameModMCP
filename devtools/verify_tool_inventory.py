@@ -86,6 +86,9 @@ SKILL = ROOT / "skills" / "gamemod-mod" / "SKILL.md"
 NON_TOOL_IDENTIFIERS = {
     # 通用参数 / 返回字段
     "args_type", "retval_type", "max_calls", "backtrace", "hook_id",
+    # Batch 6：hook_method / hook_address 的受控返回值覆写参数。
+    # 它是**参数名**而不是工具名 —— 不加进来会被误判成「引用了不存在的工具」。
+    "override_retval", "original_retval", "retval_overridden",
     "preferred_module", "auto_find", "name_filter", "only_games",
     "include_inherited", "base_full_name", "full_name", "method_name",
     "metadata_path", "cache_dir", "force_rebuild", "game_dir",
