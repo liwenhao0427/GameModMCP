@@ -253,6 +253,187 @@ try:
           not re.search(r"function\s+paramNames\s*\(", _agent_full),
           "定义了但全文 0 处调用")
 
+    # ================================================================
+    # Batch 1：Windows x64 混合参数的寄存器槽位（ABI 缺陷回归）
+    # ================================================================
+    #
+    # 为什么必须有这一节：Windows x64 的前 4 个参数**按位置共享编号**
+    # （第 i 个参数占第 i 号槽：RCX/XMM0、RDX/XMM1、R8/XMM2、R9/XMM3），
+    # 而 System V（Linux/macOS）是整型与浮点**各自独立编号**。
+    # 旧代码对两种 ABI 都套用了 System V 的「双计数器」写法，
+    # 于是在 Windows 上从第 2 个参数起整型与浮点**全部读错槽位**。
+    #
+    # 实测真值（MSVC /O2 编译的真 DLL + MSVC 编译的调用方，
+    # `mixed(void*, float, int)` 传 (0x1000, 2.5, 42)）：
+    #     真值   [0x1000, 2.5, 42]
+    #     旧逻辑 [0x1000, 194415165440, 0x1000]   ← 后两个全错，且不报错
+    #     新逻辑 [0x1000, 2.5, 42]
+    print()
+    print("-" * 74)
+    print("Batch 1：Windows x64 混合参数寄存器槽位（ABI 回归）")
+    print("-" * 74)
+
+    _slot_src = _fn_body("argSlotIndexes", _agent_full)
+    check("agent.js 定义了 argSlotIndexes（槽位计算抽成纯函数）",
+          bool(_slot_src), f"{len(_slot_src)} 字节")
+    # 断言要**收窄到 onEnter 里**：argSlotIndexes 自己的 System V 分支里
+    # 仍然合法地写着 `var intIdx = 0, fpIdx = 0`（那是另一种 ABI 的正确写法），
+    # 全文匹配会把它误判成「还没修」。
+    _hook_at = _fn_body("hookAt", _agent_full)
+    check("取到了 hookAt 的函数体（断言不是空转）", bool(_hook_at),
+          f"{len(_hook_at)} 字节")
+    check("反证：onEnter 里的旧「双计数器」写法已移除",
+          "var intIdx = 0, fpIdx = 0" not in _hook_at,
+          "它对 Windows x64 是错的（System V 才各自编号）")
+    check("onEnter 用 argSlotIndexes 算槽位（不只是定义了没用）",
+          "argSlotIndexes(" in _hook_at,
+          f"hookAt 里出现 {_hook_at.count('argSlotIndexes(')} 次")
+    check("第 5 个及以后的浮点走栈参数（不拿 xmm4/5 冒充）",
+          "stackArgFloat(" in _hook_at and "slotI < 4" in _hook_at,
+          "xmm4/xmm5 实测恒为 0")
+
+    # ---- 纯函数行为：把 agent.js 里**真实的那段源码**取出来跑，不是抄一份
+    #
+    # 注意 `eval_js` 是在 `new Function(...)` 里求值的**新作用域**，
+    # 看不到探针 IIFE 的闭包变量 —— 所以这里用取出的函数体**重建**一个函数，
+    # 而不是直接 `eval_js("argSlotIndexes(...)")`（那样只会得到 ReferenceError）。
+    _slot_value = None
+    try:
+        _code = (
+            "(function(){"
+            " var argSlotIndexes = function (argSpecs, platform, arch) "
+            + _slot_src + ";"
+            " return {"
+            "  win_ptr_float_int: argSlotIndexes(['ptr','float','int'],"
+            "                                    'windows','x64'),"
+            "  win_int_float: argSlotIndexes(['int','float'], 'windows','x64'),"
+            "  win_float_int: argSlotIndexes(['float','int'], 'windows','x64'),"
+            "  win_five: argSlotIndexes(['ptr','float','int','float','int'],"
+            "                           'windows','x64'),"
+            "  sysv_ptr_float_int: argSlotIndexes(['ptr','float','int'],"
+            "                                     'linux','x64')"
+            " }; })()"
+        )
+        _r = script.exports_sync.eval_js(_code)
+        if isinstance(_r, dict) and not _r.get("ok"):
+            print(f"  ⚠️  eval_js 报错：{_r.get('error')}")
+        _slot_value = _r.get("value") if isinstance(_r, dict) else None
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  ⚠️  eval_js 失败：{exc}")
+
+    check("取到了 argSlotIndexes 的实测返回值（断言不是空转）",
+          isinstance(_slot_value, dict), f"{_slot_value}")
+    if isinstance(_slot_value, dict):
+        check("Windows x64：槽位下标 == 参数位置（ptr,float,int → [0,1,2]）",
+              _slot_value.get("win_ptr_float_int") == [0, 1, 2],
+              f"{_slot_value.get('win_ptr_float_int')}")
+        check("Windows x64：(int,float) 的 float 在槽 1（不是 XMM0）",
+              _slot_value.get("win_int_float") == [0, 1],
+              f"{_slot_value.get('win_int_float')}")
+        check("Windows x64：(float,int) 的 int 在槽 1（不是 RCX）",
+              _slot_value.get("win_float_int") == [0, 1],
+              f"{_slot_value.get('win_float_int')}")
+        check("Windows x64：第 5 个参数仍在槽 4（栈参数照样有槽号）",
+              _slot_value.get("win_five") == [0, 1, 2, 3, 4],
+              f"{_slot_value.get('win_five')}")
+        check("System V 仍是整型/浮点各自编号（ptr,float,int → [0,0,1]）",
+              _slot_value.get("sysv_ptr_float_int") == [0, 0, 1],
+              f"{_slot_value.get('sysv_ptr_float_int')}")
+
+    # ---- 端到端：造一个 (void*, float, int) 真函数，走探针自己的 hookAt 路径
+    _C_SRC = ("int gm_abi(void* p, float f, int n) { return n + (int)f; }")
+    _cm_code = (
+        "(function(){ var cm = new CModule(" + json.dumps(_C_SRC) + ");"
+        " globalThis.__gm_abi_cm = cm;"      # 保引用：CModule 被 GC 后调用会崩
+        " return cm.gm_abi.toString(); })()"
+    )
+    _abi_addr = None
+    try:
+        _r2 = script.exports_sync.eval_js(_cm_code)
+        _abi_addr = _r2.get("value") if isinstance(_r2, dict) else None
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  ⚠️  CModule 创建失败：{exc}")
+
+    check("造出了混合签名的原生靶子（(void*, float, int)）",
+          bool(_abi_addr), f"addr={_abi_addr}")
+
+    _enters = []
+    if _abi_addr:
+        try:
+            script.exports_sync.hook({
+                "address": _abi_addr, "args": ["ptr", "float", "int"],
+                "retval_type": "int", "label": "abi-slot-test",
+                "max_calls": 10,
+            })
+            script.exports_sync.eval_js(
+                "(function(){ var f = new NativeFunction(ptr("
+                + json.dumps(_abi_addr) + "), 'int',"
+                " ['pointer','float','int']); return f(ptr('0x1000'), 2.5, 42); })()")
+            import time as _time
+            _time.sleep(0.4)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠️  Hook/触发失败：{exc}")
+
+        _enters = [m.get("payload") for m in msgs
+                   if m.get("type") == "send"
+                   and isinstance(m.get("payload"), dict)
+                   and m["payload"].get("phase") == "enter"
+                   and m["payload"].get("label") == "abi-slot-test"]
+
+    check("探针真实捕获到该函数的 enter 事件", bool(_enters),
+          f"{len(_enters)} 条")
+    if _enters:
+        _got = _enters[0].get("args")
+        check("端到端：args 读作 [0x1000, 2.5, 42]（真值）",
+              _got == ["0x1000", 2.5, 42], f"{_got}")
+        check("端到端：没有 args_error（三个参数全部读到了）",
+              not _enters[0].get("args_error"),
+              f"{_enters[0].get('args_error')}")
+
+    # ---- 非空转反证：把**旧的双计数器逻辑**原样写一遍，看它是否真的读错
+    # 这条是关键：如果旧逻辑也能读对，那上面的断言就是恒真的（没有价值）。
+    _legacy = None
+    if _abi_addr:
+        _legacy_code = (
+            "(function(){"
+            " var addr = ptr(" + json.dumps(_abi_addr) + ");"
+            " var got = null;"
+            " var l = Interceptor.attach(addr, { onEnter: function(args){"
+            "   var specs = ['ptr','float','int'];"
+            "   var intIdx = 0, fpIdx = 0, vals = [];"
+            "   for (var i = 0; i < specs.length; i++) {"
+            "     var s = specs[i];"
+            "     if (s === 'float' || s === 'double') {"
+            "       var reg = this.context['xmm' + fpIdx];"
+            "       var v = null;"
+            "       try { if (reg instanceof ArrayBuffer) {"
+            "         v = new DataView(reg).getFloat32(0, true);"
+            "       } else if (reg && reg.f) { v = reg.f[0]; } } catch (e) {}"
+            "       vals.push(v); fpIdx++;"
+            "     } else {"
+            "       var r = null; try { r = args[intIdx]; } catch (e) {}"
+            "       vals.push(r === undefined || r === null ? null : r.toString());"
+            "       intIdx++;"
+            "     }"
+            "   }"
+            "   got = vals;"
+            " }});"
+            " var f = new NativeFunction(addr, 'int', ['pointer','float','int']);"
+            " f(ptr('0x1000'), 2.5, 42);"
+            " l.detach();"
+            " return got;"
+            "})()"
+        )
+        try:
+            _lr = script.exports_sync.eval_js(_legacy_code)
+            _legacy = _lr.get("value") if isinstance(_lr, dict) else None
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠️  反证脚本失败：{exc}")
+
+    check("反证：旧的「双计数器」逻辑对同一输入**确实读错**",
+          isinstance(_legacy, list) and _legacy != ["0x1000", 2.5, 42],
+          f"旧逻辑读到 {_legacy}（真值是 ['0x1000', 2.5, 42]）")
+
     script.unload()
     print("  ✅ 脚本已卸载")
 finally:

@@ -1257,6 +1257,81 @@
     }
 
     /**
+     * 每个参数该去**第几号寄存器槽**取值。
+     *
+     * 为什么需要这个函数（这是一个真实的 ABI 缺陷修复）
+     * ------------------------------------------------------------
+     * 两套 x64 ABI 的寄存器编号规则**不一样**：
+     *
+     *   · **Windows x64**：前 4 个参数槽位**按参数位置共享编号** ——
+     *     第 i 个参数无论整型还是浮点都占第 i 号槽：
+     *         Slot 0: RCX 或 XMM0    Slot 1: RDX 或 XMM1
+     *         Slot 2: R8  或 XMM2    Slot 3: R9  或 XMM3
+     *     实测（MSVC /O2 编译的真 DLL + MSVC 编译的调用方）：
+     *         `mixed(void*, float, int)` 传 (0x1000, 2.5, 42)
+     *           → p 在 RCX、f 在 **XMM1**、n 在 **R8**
+     *         `sig_a(int, float)`  → float 在 XMM1
+     *         `sig_c(int,int,float,int)` → float 在 XMM2
+     *   · **System V AMD64（Linux/macOS）**：整型与浮点**各自独立编号**
+     *     （第 1 个浮点参数恒在 XMM0，与它排在第几位无关）。
+     *
+     * 旧代码对两种 ABI 都套用了 System V 的「双计数器」写法
+     * （`intIdx` / `fpIdx` 各自递增），于是在 Windows 上从第 2 个参数起
+     * 整型与浮点**全部读错槽位**，而且**不会报错** —— 拿到的是垃圾值。
+     * 实测同一组输入下旧逻辑读到
+     * `[0x1000, 194415165440, 0x1000]`（真值是 `[0x1000, 2.5, 42]`）。
+     *
+     * @param {string[]} argSpecs 参数规格（int/uint/float/double/ptr/...）
+     * @param {string} platform   `Process.platform`
+     * @param {string} arch       `Process.arch`
+     * @returns {number[]} 与 argSpecs 等长，第 i 项是该参数要读的槽号
+     */
+    function argSlotIndexes(argSpecs, platform, arch) {
+        var out = [];
+        var i;
+        var isWin64 = (platform === 'windows' &&
+                       (arch === 'x64' || arch === 'x86_64'));
+        if (isWin64) {
+            // 按位置共享编号：第 i 个参数就是第 i 号槽
+            for (i = 0; i < argSpecs.length; i++) { out.push(i); }
+            return out;
+        }
+        // System V 及其它：整型与浮点各自编号（原行为）
+        var intIdx = 0, fpIdx = 0;
+        for (i = 0; i < argSpecs.length; i++) {
+            var s = argSpecs[i];
+            if (s === 'float' || s === 'double') { out.push(fpIdx); fpIdx++; }
+            else { out.push(intIdx); intIdx++; }
+        }
+        return out;
+    }
+
+    /**
+     * 从**栈上传入**的参数位模式里取出浮点值（Windows x64 第 5 个及以后）。
+     *
+     * 为什么不能用 `xmm4` / `xmm5`：Windows x64 只有 XMM0~XMM3 传参，
+     * 第 5 个及之后的浮点参数**在栈上**，`xmm4`/`xmm5` 实测恒为 0
+     * ——拿它冒充栈参数会得到 0.0 这种「看起来像真值」的假数据。
+     *
+     * 为什么可以直接用 `args[slot]`：实测（libffi 与 MSVC 两种调用方）
+     * Frida 的 `args[]` **把栈参数一并暴露**，且浮点是以位模式给出的
+     * （`sixargs(void*,float,int,float,int,float)` 的 args[5] = 0x40b00000
+     * 正是 5.5f 的位模式）。所以把它按指针写进临时缓冲再按浮点读回即可
+     * ——这样 float/double 都不需要手工拼位，也避免 BigInt 精度问题。
+     */
+    function stackArgFloat(raw, kind) {
+        try {
+            if (!raw) { return null; }
+            var tmp = Memory.alloc(8);
+            tmp.writePointer(raw);
+            return (kind === 'double') ? tmp.readDouble() : tmp.readFloat();
+        } catch (e) {
+            return null;
+        }
+    }
+
+
+    /**
      * 按参数规格从整型寄存器读值。
      * 规格字符串：int / uint / long / ulong / bool / ptr / string / cstring
      *
@@ -1317,27 +1392,35 @@
                         var selfPtr = safeArg(args, 0);
                         if (selfPtr !== null) { rec.this_str = managedStringOf(selfPtr); }
                     }
-                    // 整型参数按 RCX/RDX/R8/R9 顺序取（`this` 占第一个），
-                    // 浮点参数按 XMM0..3 顺序取 —— 两套计数器互不影响，
-                    // 混用签名时不能拿同一个下标去查两处。
+                    // 槽位编号**按 ABI 来**（见 argSlotIndexes）：
+                    // Windows x64 是按参数位置共享编号，System V 才是
+                    // 整型/浮点各自编号。旧代码一律用双计数器，在 Windows 上
+                    // 从第 2 个参数起全部读错寄存器（且不报错）。
                     var vals = [];
-                    var intIdx = 0, fpIdx = 0, argErr = null;
+                    var slots = argSlotIndexes(argSpecs, Process.platform,
+                                               Process.arch);
+                    var argErr = null;
                     for (var i = 0; i < argSpecs.length; i++) {
                         var specI = argSpecs[i];
+                        var slotI = slots[i];
                         if (specI === 'float' || specI === 'double') {
-                            var fv = xmmValue(this.context, fpIdx, specI);
-                            fpIdx++;
+                            // 第 5 个及之后的浮点在**栈上**（xmm4/5 实测恒为 0，
+                            // 不能拿它冒充），Frida 的 args[] 已把栈参数暴露出来。
+                            var fv = (slotI < 4)
+                                ? xmmValue(this.context, slotI, specI)
+                                : stackArgFloat(safeArg(args, slotI), specI);
                             if (fv === null) {
                                 argErr = 'args[' + i + ']（' + specI + '）取不到：'
-                                       + 'xmm' + (fpIdx - 1) + ' 不可读';
+                                       + (slotI < 4
+                                          ? ('xmm' + slotI + ' 不可读')
+                                          : ('栈参数 slot ' + slotI + ' 不可读'));
                                 vals.push(null);
                                 continue;
                             }
                             vals.push(fv);
                             continue;
                         }
-                        var rawI = safeArg(args, intIdx);
-                        intIdx++;
+                        var rawI = safeArg(args, slotI);
                         if (rawI === null) { break; }
                         try {
                             vals.push(readArg(specI, rawI));
