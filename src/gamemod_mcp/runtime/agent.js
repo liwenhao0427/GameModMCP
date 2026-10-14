@@ -289,6 +289,16 @@
     // 只在精确写法查不到时才建（一次约几万次 Mono 调用），所以不放进热路径。
     var monoTypeIndexCache = null;
     var monoKeep = [];           // 必须长期存活的 Frida 回调（被 GC 回收后再调用会崩）
+    //: `mono_assembly_foreach` 的**惰性单例**回调 + 它这一轮用的收集数组。
+    //:
+    //: 为什么必须是单例：原来每次进 `monoImages()` 都 `new NativeCallback(...)`
+    //: 并 push 进 `monoKeep`，而 `pop` 只在 foreach 抛异常时才执行 ——
+    //: 每个 RPC 入口又会把 `monoImagesCache` 清空，于是下一次查类再建一个。
+    //: 一次几百步的 Agent 会话会累积**几百个永不释放**的 NativeCallback。
+    //: 现在回调只建一次（仍放 `monoKeep` 保活，避免被 GC 回收后调用即崩），
+    //: 每轮只把新的收集数组挂到 `monoEnumScratch` 上。
+    var monoAssemblyCallback = null;
+    var monoEnumScratch = null;
     var monoStringLayout = null; // {field, offset} —— 初始化时查出来，不硬编码
     var monoTypeNameAllocates = null; // mono_type_get_name 是否堆分配（实测确认后决定是否 free）
     //: 上一次 monoEnsureReady 成功时的完整返回值，供幂等守卫原样回给宿主
@@ -1900,43 +1910,52 @@
         }
         var out = [];
         var seenImg = {};    // 按 MonoImage* 去重
-        // 回调必须保持引用：NativeCallback 被 GC 回收后再被 C 侧调用会直接崩
-        var cb = new NativeCallback(function (asm, userData) {
-            try {
-                if (out.length > 5000) { return; }
-                var img = monoFuncs.mono_assembly_get_image(asm);
-                if (!img || img.isNull()) { return; }
-                var pk = img.toString();
-                if (seenImg[pk]) { return; }
-                seenImg[pk] = true;
-                var file = null;
-                if (monoFuncs.mono_image_get_filename) {
-                    try { file = cstr(monoFuncs.mono_image_get_filename(img)); }
-                    catch (e) { file = null; }
-                }
-                // 内存加载的程序集（Unity/BepInEx 常见）拿到的不是路径，而是
-                // `data-00000219A9D5A040` 这种合成名（内嵌映像指针）—— 实测。
-                // 那种东西当「路径」显示会误导人，所以只在看着像路径时才带上。
-                if (file && (/^data-/i.test(file) || !/[\\/]/.test(file))) {
-                    file = null;
-                }
-                var rec = { image: img,
-                            name: cstr(monoFuncs.mono_image_get_name(img)) };
-                if (file) { rec.file = file; }
-                if (monoFuncs.mono_image_get_table_rows) {
-                    // TypeDef 表（表号 2）的行数就是类数。
-                    // 实测与静态索引的类型数、微软 System.Reflection.Metadata 的真值三方一致。
-                    rec.class_count = monoFuncs.mono_image_get_table_rows(img, 2).toInt32();
-                }
-                out.push(rec);
-            } catch (e) { /* 单个程序集读失败不影响整体 */ }
-        }, 'void', ['pointer', 'pointer']);
-        monoKeep.push(cb);
+        // 回调**只建一次**（见模块级 monoAssemblyCallback 的说明）：
+        // 每次 RPC 都新建一个会让 monoKeep 无界增长。
+        if (!monoAssemblyCallback) {
+            monoAssemblyCallback = new NativeCallback(function (asm, userData) {
+                var scratchOut = monoEnumScratch;
+                if (!scratchOut) { return; }
+                try {
+                    if (scratchOut.items.length > 5000) { return; }
+                    var img = monoFuncs.mono_assembly_get_image(asm);
+                    if (!img || img.isNull()) { return; }
+                    var pk = img.toString();
+                    if (scratchOut.seen[pk]) { return; }
+                    scratchOut.seen[pk] = true;
+                    var file = null;
+                    if (monoFuncs.mono_image_get_filename) {
+                        try { file = cstr(monoFuncs.mono_image_get_filename(img)); }
+                        catch (e) { file = null; }
+                    }
+                    // 内存加载的程序集（Unity/BepInEx 常见）拿到的不是路径，而是
+                    // `data-00000219A9D5A040` 这种合成名（内嵌映像指针）—— 实测。
+                    // 那种东西当「路径」显示会误导人，所以只在看着像路径时才带上。
+                    if (file && (/^data-/i.test(file) || !/[\\/]/.test(file))) {
+                        file = null;
+                    }
+                    var rec = { image: img,
+                                name: cstr(monoFuncs.mono_image_get_name(img)) };
+                    if (file) { rec.file = file; }
+                    if (monoFuncs.mono_image_get_table_rows) {
+                        // TypeDef 表（表号 2）的行数就是类数。
+                        // 实测与静态索引的类型数、微软 System.Reflection.Metadata 的真值三方一致。
+                        rec.class_count = monoFuncs.mono_image_get_table_rows(img, 2).toInt32();
+                    }
+                    scratchOut.items.push(rec);
+                } catch (e) { /* 单个程序集读失败不影响整体 */ }
+            }, 'void', ['pointer', 'pointer']);
+            // 保活：NativeCallback 被 GC 回收后再被 C 侧调用会直接崩
+            monoKeep.push(monoAssemblyCallback);
+        }
+        monoEnumScratch = { items: out, seen: seenImg };
         try {
-            monoFuncs.mono_assembly_foreach(cb, ptr(0));
+            monoFuncs.mono_assembly_foreach(monoAssemblyCallback, ptr(0));
         } catch (e) {
-            monoKeep.pop();
+            monoEnumScratch = null;
             return [];
+        } finally {
+            monoEnumScratch = null;
         }
         monoImagesCache = out;
         return out;
@@ -2845,30 +2864,10 @@
         }
         var buf = Memory.alloc(size);
         try {
-            if (be.kind === 'il2cpp') {
-                if (!funcs.il2cpp_field_static_get_value) {
-                    return fail('il2cpp_field_static_get_value 不可用', {
-                        engine: 'il2cpp', api_missing: 'il2cpp_field_static_get_value'
-                    });
-                }
-                funcs.il2cpp_field_static_get_value(hit.field, buf);
-            } else {
-                if (!monoFuncs.mono_field_static_get_value || !monoFuncs.mono_class_vtable) {
-                    var miss = [];
-                    if (!monoFuncs.mono_field_static_get_value) {
-                        miss.push('mono_field_static_get_value');
-                    }
-                    if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
-                    return fail('Mono 运行时缺静态字段读所需的导出：' + miss.join(' / '),
-                                { engine: 'mono', api_missing: miss });
-                }
-                var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
-                if (!vt || vt.isNull()) {
-                    return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可读）',
-                                { engine: 'mono', klass: hit.klass.toString() });
-                }
-                monoFuncs.mono_field_static_get_value(vt, hit.field, buf);
-            }
+            // 引擎差异收敛在后端对象里（be.readStaticRaw）——
+            // 这里不再按后端种类分叉。
+            var rr = be.readStaticRaw(hit, buf);
+            if (!rr.ok) { return rr; }
             var raw = buf.readByteArray(size);
             var bytes = new Uint8Array(raw);
             var hex = [];
@@ -2886,8 +2885,7 @@
                 is_static: true,
                 size: size,
                 hex: hex.join(''),
-                via: (be.kind === 'il2cpp' ? 'il2cpp_field_static_get_value'
-                                           : 'mono_field_static_get_value')
+                via: rr.via
             };
         } catch (e) {
             return fail('读静态字段失败：' + (e.message || e),
@@ -2935,32 +2933,10 @@
         }
         var buf = Memory.alloc(Math.max(nbytes, 1));
         try {
-            if (be.kind === 'il2cpp') {
-                if (!funcs.il2cpp_field_static_set_value) {
-                    return fail('il2cpp_field_static_set_value 不可用', {
-                        engine: 'il2cpp', api_missing: 'il2cpp_field_static_set_value'
-                    });
-                }
-                buf.writeByteArray(bytes);
-                funcs.il2cpp_field_static_set_value(hit.field, buf);
-            } else {
-                if (!monoFuncs.mono_field_static_set_value || !monoFuncs.mono_class_vtable) {
-                    var miss = [];
-                    if (!monoFuncs.mono_field_static_set_value) {
-                        miss.push('mono_field_static_set_value');
-                    }
-                    if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
-                    return fail('Mono 运行时缺静态字段写所需的导出：' + miss.join(' / '),
-                                { engine: 'mono', api_missing: miss });
-                }
-                var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
-                if (!vt || vt.isNull()) {
-                    return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可写）',
-                                { engine: 'mono', klass: hit.klass.toString() });
-                }
-                buf.writeByteArray(bytes);
-                monoFuncs.mono_field_static_set_value(vt, hit.field, buf);
-            }
+            buf.writeByteArray(bytes);
+            // 引擎差异收敛在后端对象里（be.writeStaticRaw）
+            var wr = be.writeStaticRaw(hit, buf);
+            if (!wr.ok) { return wr; }
             return {
                 ok: true,
                 engine: be.kind,
@@ -2971,8 +2947,7 @@
                 is_static: true,
                 size: size,
                 wrote_hex: s.toLowerCase(),
-                via: (be.kind === 'il2cpp' ? 'il2cpp_field_static_set_value'
-                                           : 'mono_field_static_set_value')
+                via: wr.via
             };
         } catch (e) {
             return fail('写静态字段失败：' + (e.message || e),
@@ -3056,7 +3031,35 @@
         isHookable: function (c) {
             return !!(c && c.pointer && c.in_module !== false);
         },
-        methodTargetNote: '用 candidates[].pointer 直接 Hook；或静态 RVA + module_base 定位'
+        methodTargetNote: '用 candidates[].pointer 直接 Hook；或静态 RVA + module_base 定位',
+
+        // ---- 静态字段底层读写（引擎差异收敛点）
+        //
+        // 为什么放在后端对象里：`readStaticFieldBytes` / `writeStaticFieldBytes`
+        // 原来在函数体里按后端种类分叉，而本文件的设计是「两个引擎的差异全部
+        // 收敛在 BE_IL2CPP / BE_MONO，RPC 层只调 be.*」。
+        // 分支留在公共函数里等于把收敛点又打散了。
+        readStaticRaw: function (hit, buf) {
+            if (!funcs.il2cpp_field_static_get_value) {
+                return fail('il2cpp_field_static_get_value 不可用', {
+                    engine: 'il2cpp',
+                    api_missing: 'il2cpp_field_static_get_value'
+                });
+            }
+            funcs.il2cpp_field_static_get_value(hit.field, buf);
+            return { ok: true, via: 'il2cpp_field_static_get_value' };
+        },
+
+        writeStaticRaw: function (hit, buf) {
+            if (!funcs.il2cpp_field_static_set_value) {
+                return fail('il2cpp_field_static_set_value 不可用', {
+                    engine: 'il2cpp',
+                    api_missing: 'il2cpp_field_static_set_value'
+                });
+            }
+            funcs.il2cpp_field_static_set_value(hit.field, buf);
+            return { ok: true, via: 'il2cpp_field_static_set_value' };
+        }
     };
 
     var BE_MONO = {
@@ -3088,7 +3091,50 @@
         },
         methodTargetNote: '用 candidates[].pointer 直接 Hook。' +
                           '注意：Mono 是 JIT，代码地址**不在 mono 模块内**，' +
-                          '所以没有 RVA（静态元数据里的 RVA 指向 IL，不是机器码）'
+                          '所以没有 RVA（静态元数据里的 RVA 指向 IL，不是机器码）',
+
+        // ---- 静态字段底层读写（引擎差异收敛点，与 BE_IL2CPP 对称）
+        //
+        // Mono 的 `mono_field_static_*` 需要 (vtable, field, value) 三个参数，
+        // vtable 由 `mono_class_vtable` 取 —— 这是 Mono 与 IL2CPP 在静态字段上
+        // 最实质的差异，正该收在后端对象里而不是留在公共函数里判 kind。
+        readStaticRaw: function (hit, buf) {
+            if (!monoFuncs.mono_field_static_get_value || !monoFuncs.mono_class_vtable) {
+                var miss = [];
+                if (!monoFuncs.mono_field_static_get_value) {
+                    miss.push('mono_field_static_get_value');
+                }
+                if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
+                return fail('Mono 运行时缺静态字段读所需的导出：' + miss.join(' / '),
+                            { engine: 'mono', api_missing: miss });
+            }
+            var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
+            if (!vt || vt.isNull()) {
+                return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可读）',
+                            { engine: 'mono', klass: hit.klass.toString() });
+            }
+            monoFuncs.mono_field_static_get_value(vt, hit.field, buf);
+            return { ok: true, via: 'mono_field_static_get_value' };
+        },
+
+        writeStaticRaw: function (hit, buf) {
+            if (!monoFuncs.mono_field_static_set_value || !monoFuncs.mono_class_vtable) {
+                var miss = [];
+                if (!monoFuncs.mono_field_static_set_value) {
+                    miss.push('mono_field_static_set_value');
+                }
+                if (!monoFuncs.mono_class_vtable) { miss.push('mono_class_vtable'); }
+                return fail('Mono 运行时缺静态字段写所需的导出：' + miss.join(' / '),
+                            { engine: 'mono', api_missing: miss });
+            }
+            var vt = monoFuncs.mono_class_vtable(monoDomain, hit.klass);
+            if (!vt || vt.isNull()) {
+                return fail('取不到 ' + hit.owner + ' 的 MonoVTable（静态区不可写）',
+                            { engine: 'mono', klass: hit.klass.toString() });
+            }
+            monoFuncs.mono_field_static_set_value(vt, hit.field, buf);
+            return { ok: true, via: 'mono_field_static_set_value' };
+        }
     };
 
     /**

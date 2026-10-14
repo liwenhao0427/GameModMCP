@@ -308,6 +308,70 @@ print(f"  IL2CPP 后端片段长度：{len(il2cpp_zone)}，"
 check("IL2CPP 侧确实实现了 GC 暂停（对照，证明 Mono 是真的缺导出）",
       "il2cpp_gc_disable" in il2cpp_zone and "gcSupported: true" in il2cpp_zone)
 
+# ---- Batch 2：程序集枚举回调不许每次 RPC 泄漏一个 NativeCallback
+#
+# 缺陷现场：`monoImages()` 每次调用都 `new NativeCallback(...)` 并
+# `monoKeep.push(cb)`，而 `monoKeep.pop()` 只在 foreach 抛异常时执行。
+# 每个 RPC 入口都会 `monoImagesCache = null`，于是下一次查类又建一个新回调
+# —— 一次几百步的 Agent 会话会累积几百个永不释放的 NativeCallback。
+print()
+print("  ---- Batch 2：mono_assembly_foreach 回调复用（防泄漏）----")
+images_slice = _agent_slice(r"function monoImages\(\)", r"\n    function monoFindImages")
+print(f"  monoImages 片段长度：{len(images_slice)}")
+check("取到了 monoImages 的函数体（断言不是空转）", len(images_slice) > 300,
+      f"{len(images_slice)} 字节")
+check("monoImages 里**不再**每次 push 回调到 monoKeep",
+      images_slice.count("monoKeep.push") <= 1
+      and "if (!monoAssemblyCallback)" in images_slice,
+      f"push 次数={images_slice.count('monoKeep.push')}"
+      "（必须 <=1 次，且包在惰性单例守卫里；原来是每次调用都 push）")
+# 非空转反证：唯一那次 push 必须在 `if (!monoAssemblyCallback)` 之内 ——
+# 只看次数会被「把 push 挪到守卫外面」骗过去（那还是每次调用都 push）。
+_pushed_guarded = False
+if "monoKeep.push" in images_slice and "if (!monoAssemblyCallback)" in images_slice:
+    _guard_at = images_slice.index("if (!monoAssemblyCallback)")
+    _push_at = images_slice.index("monoKeep.push")
+    _pushed_guarded = _push_at > _guard_at
+check("回调只建一次（push 源码位置在惰性单例守卫之后）", _pushed_guarded,
+      "守卫之外 push 等于没修")
+check("monoImages 复用惰性单例回调（monoAssemblyCallback）",
+      "monoAssemblyCallback" in images_slice,
+      "首次创建一次，之后只换收集用的临时数组")
+check("模块级定义了 monoAssemblyCallback 与收集暂存变量",
+      "var monoAssemblyCallback" in text and "var monoEnumScratch" in text)
+# 非空转反证：monoKeep 这个机制**必须**还在用（否则「不 push」可能只是
+# 把整个保活机制删掉了 —— 那会让回调被 GC 回收后调用即崩）。
+check("反证：monoKeep 保活机制本身仍然存在（不是靠删掉它来「防泄漏」）",
+      "var monoKeep" in text and "monoKeep" in text.replace(
+          images_slice, ""),
+      "回调被 GC 回收后再被 C 侧调用会直接崩，保活是必需的")
+
+# ---- Batch 2：静态字段读写不许在函数体里判 `be.kind === 'il2cpp'`
+#
+# 设计初衷（见文件头）：两个引擎的差异**全部收敛在 BE_IL2CPP / BE_MONO**，
+# RPC 层只调 `be.*`。但 `readStaticFieldBytes` / `writeStaticFieldBytes`
+# 里仍写着 `if (be.kind === 'il2cpp') { ... } else { ... }`。
+for _fn in ("readStaticFieldBytes", "writeStaticFieldBytes"):
+    _slice = _agent_slice(rf"function {_fn}\(", r"\n    function ")
+    if len(_slice) < 200:
+        _slice = text[text.index(f"function {_fn}("):][:4000]
+    print(f"  {_fn} 片段长度：{len(_slice)}")
+    check(f"取到了 {_fn} 的函数体（断言不是空转）", len(_slice) > 300)
+    check(f"{_fn} 里不再有 `be.kind ===` 引擎分支（收敛进后端对象）",
+          "be.kind ===" not in _slice,
+          "引擎差异只允许出现在 BE_IL2CPP / BE_MONO 里")
+    check(f"{_fn} 改为调用后端对象的方法（be.readStaticRaw / writeStaticRaw）",
+          "be.readStaticRaw(" in _slice or "be.writeStaticRaw(" in _slice,
+          _slice[:0] + "RPC 层只调 be.*")
+
+# 非空转反证：两个后端**都**必须实现对应方法，否则「收敛」只是把
+# 分支挪到了空实现上（Mono 那条路会静默失效）。
+_il2cpp_zone2 = _agent_slice(r"var BE_IL2CPP = \{", r"\n    var BE_MONO = \{")
+_mono_zone2 = _agent_slice(r"var BE_MONO = \{", r"\n    /\*\*")
+for _m in ("readStaticRaw", "writeStaticRaw"):
+    check(f"BE_IL2CPP 实现了 {_m}", _m in _il2cpp_zone2)
+    check(f"BE_MONO 实现了 {_m}", _m in _mono_zone2)
+
 # ---- 探针源码不许被缓存（改了 agent.js 必须立刻生效）
 section("1b. 探针源码读取不许缓存（改了 agent.js 必须立刻生效）")
 tmp = Path(tempfile.mkdtemp(prefix="gamemod-agent-src-"))
